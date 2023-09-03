@@ -1,2 +1,7 @@
 diffusers==0.20.0
 torch==2.0.1
+torchvision
+transformers
+accelerate
+einops
+opencv-python
