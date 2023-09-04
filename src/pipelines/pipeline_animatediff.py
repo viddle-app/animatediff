@@ -242,7 +242,7 @@ class AnimationPipeline(DiffusionPipeline, FromSingleFileMixin):
         video_length = latents.shape[2]
         latents = 1 / 0.18215 * latents
         latents = rearrange(latents, "b c f h w -> (b f) c h w")
-        # video = self.vae.decode(latents).sample
+
         video = []
         for frame_idx in tqdm(range(latents.shape[0])):
             video.append(self.vae.decode(latents[frame_idx:frame_idx+1]).sample)

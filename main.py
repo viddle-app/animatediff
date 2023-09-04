@@ -1,11 +1,16 @@
+import glob
+import os
 from pathlib import Path
 from src.pipelines.pipeline_animatediff import AnimationPipeline
+from src.pipelines.pipeline_animatediff_controlnet import StableDiffusionControlNetPipeline
 from diffusers import AutoencoderKL, EulerAncestralDiscreteScheduler, DDIMScheduler
 import torch
 from transformers import CLIPTextModel, CLIPTokenizer
 from src.models.unet import UNet3DConditionModel
 import numpy as np
 import cv2
+from diffusers.models.controlnet import ControlNetModel
+from PIL import Image
 
 def tensor_to_video(tensor, output_path, fps=30):
     """
@@ -77,23 +82,44 @@ def run(model,
     },
   }
 
-  tokenizer    = CLIPTokenizer.from_pretrained(model, subfolder="tokenizer")
-  text_encoder = CLIPTextModel.from_pretrained(model, subfolder="text_encoder")
-  vae          = AutoencoderKL.from_pretrained(model, subfolder="vae")            
+  tokenizer    = CLIPTokenizer.from_pretrained(model, subfolder="tokenizer", torch_dtype=dtype)
+  text_encoder = CLIPTextModel.from_pretrained(model, subfolder="text_encoder", torch_dtype=dtype)
+  vae          = AutoencoderKL.from_pretrained(model, subfolder="vae", torch_dtype=dtype)            
   unet         = UNet3DConditionModel.from_pretrained_2d(model, 
                                                         subfolder="unet", 
                                                         unet_additional_kwargs=unet_additional_kwargs)
 
-  pipeline = AnimationPipeline(
+  unet = unet.to(dtype=dtype)
+
+  use_controlnet = True
+
+  if use_controlnet:
+    # controlnet_path = Path("../models/ControlNet-v1-1/control_v11p_sd15_openpose.yaml")
+    controlnet_path = "lllyasviel/control_v11p_sd15_openpose"
+    controlnet = ControlNetModel.from_pretrained(controlnet_path, torch_dtype=dtype)
+
+    pipeline = StableDiffusionControlNetPipeline(
+      vae=vae, 
+      text_encoder=text_encoder, 
+      tokenizer=tokenizer, 
+      unet=unet,
+      scheduler=EulerAncestralDiscreteScheduler(**scheduler_kwargs),
+      controlnet=controlnet,
+      safety_checker=None,
+      feature_extractor=None,
+    ).to(device)
+  else:
+    pipeline = AnimationPipeline(
       vae=vae, 
       text_encoder=text_encoder, 
       tokenizer=tokenizer, 
       unet=unet,
       # scheduler=DDIMScheduler(**scheduler_kwargs),
       scheduler=EulerAncestralDiscreteScheduler(**scheduler_kwargs),
-  ).to(device)
+    ).to(device)
 
-  motion_module_path = "models/mm_sd_v15.ckpt"
+  motion_module_path = "models/mm_sd_v14.ckpt"
+  # motion_module_path = "models/mm_sd_v15.ckpt"
   # motion_module_path = '../ComfyUI/custom_nodes/ComfyUI-AnimateDiff/models/animatediffMotion_v15.ckpt'
   motion_module_state_dict = torch.load(motion_module_path, map_location="cpu")
   missing, unexpected = pipeline.unet.load_state_dict(motion_module_state_dict, strict=False)
@@ -103,8 +129,37 @@ def run(model,
   assert len(unexpected) == 0
   print("missing", len(missing))
 
+  if use_controlnet: 
+    # load 16 frames from the directory
+    open_pose_path = Path("../diffusers-tests/test-data/openpose-2")
 
-  video = pipeline(prompt=prompt, 
+    # get the directory files and sort them using Glob
+    png_files = glob.glob(os.path.join(open_pose_path, '*.png'))
+    
+    # Sort the png files
+    sorted_files = sorted(png_files)
+    
+    # get the first 16 frames
+    sorted_files = sorted_files[:frame_count]
+
+    # load the images as PIL images
+    images = [Image.open(file) for file in sorted_files]
+
+  
+    video = pipeline(prompt=prompt, 
+                  negative_prompt=negative_prompt, 
+                  num_inference_steps=num_inference_steps,
+                  guidance_scale=guidance_scale,
+                  width=width,
+                  height=height,
+                  video_length=frame_count,
+                  image=images,
+                  output_type="pt",
+                  ).images.permute(1, 0, 2, 3)
+
+  
+  else:
+    video = pipeline(prompt=prompt, 
                   negative_prompt=negative_prompt, 
                   num_inference_steps=num_inference_steps,
                   guidance_scale=guidance_scale,
@@ -113,13 +168,13 @@ def run(model,
                     video_length=frame_count).videos[0]
   
   
-  # save the tensor 
-  # torch.save(video, output_path + ".pt")
+    # save the tensor 
+    # torch.save(video, output_path + ".pt")
 
   tensor_to_video(video, output_path, fps=frame_count)
 
 if __name__ == "__main__":
-  run(Path("../models/v1-5"), 
-      prompt="a person walking in the park, motion picture still, 35mm film",
+  run(Path("../models/dreamshaper-6"), 
+      prompt="neon glowing psychedelic woman dancing, photography, award winning, gorgous, highly detailed",
       negative_prompt="ugly, blurry, wrong")
 

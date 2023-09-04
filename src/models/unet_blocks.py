@@ -1,5 +1,6 @@
 # Adapted from https://github.com/huggingface/diffusers/blob/main/src/diffusers/models/unet_2d_blocks.py
 
+from typing import Any, Dict, Optional
 import torch
 from torch import nn
 
@@ -255,10 +256,22 @@ class UNetMidBlock3DCrossAttn(nn.Module):
         self.resnets = nn.ModuleList(resnets)
         self.motion_modules = nn.ModuleList(motion_modules)
 
-    def forward(self, hidden_states, temb=None, encoder_hidden_states=None, attention_mask=None):
+    def forward(self, 
+                hidden_states, 
+                temb=None, 
+                encoder_hidden_states=None, 
+                attention_mask: Optional[torch.FloatTensor] = None,
+                cross_attention_kwargs: Optional[Dict[str, Any]] = None,
+                encoder_attention_mask: Optional[torch.FloatTensor] = None,):
         hidden_states = self.resnets[0](hidden_states, temb)
         for attn, resnet, motion_module in zip(self.attentions, self.resnets[1:], self.motion_modules):
-            hidden_states = attn(hidden_states, encoder_hidden_states=encoder_hidden_states).sample
+            hidden_states = attn(hidden_states, 
+                                 encoder_hidden_states=encoder_hidden_states,
+                                 cross_attention_kwargs=cross_attention_kwargs,
+                                 attention_mask=attention_mask,
+                                 encoder_attention_mask=encoder_attention_mask,
+                                 return_dict=False,
+                                 )[0]
             hidden_states = motion_module(hidden_states, temb, encoder_hidden_states=encoder_hidden_states) if motion_module is not None else hidden_states
             hidden_states = resnet(hidden_states, temb)
 
@@ -363,7 +376,14 @@ class CrossAttnDownBlock3D(nn.Module):
 
         self.gradient_checkpointing = False
 
-    def forward(self, hidden_states, temb=None, encoder_hidden_states=None, attention_mask=None):
+    def forward(self, 
+                hidden_states, 
+                temb=None, 
+                encoder_hidden_states=None, 
+                attention_mask=None,
+                cross_attention_kwargs: Optional[Dict[str, Any]] = None,
+                encoder_attention_mask: Optional[torch.FloatTensor] = None,
+                ):
         output_states = ()
 
         for resnet, attn, motion_module in zip(self.resnets, self.attentions, self.motion_modules):
@@ -385,14 +405,25 @@ class CrossAttnDownBlock3D(nn.Module):
                     encoder_hidden_states,
                 )[0]
                 if motion_module is not None:
-                    hidden_states = torch.utils.checkpoint.checkpoint(create_custom_forward(motion_module), hidden_states.requires_grad_(), temb, encoder_hidden_states)
+                    hidden_states = torch.utils.checkpoint.checkpoint(create_custom_forward(motion_module), 
+                                                                      hidden_states.requires_grad_(), 
+                                                                      temb, 
+                                                                      encoder_hidden_states)
                 
             else:
                 hidden_states = resnet(hidden_states, temb)
-                hidden_states = attn(hidden_states, encoder_hidden_states=encoder_hidden_states).sample
+                hidden_states = attn(hidden_states, 
+                                     encoder_hidden_states=encoder_hidden_states,
+                                     cross_attention_kwargs=cross_attention_kwargs,
+                                     attention_mask=attention_mask,
+                                     encoder_attention_mask=encoder_attention_mask,
+                                     return_dict=False,
+                                     )[0]
                 
                 # add motion module
-                hidden_states = motion_module(hidden_states, temb, encoder_hidden_states=encoder_hidden_states) if motion_module is not None else hidden_states
+                hidden_states = motion_module(hidden_states, 
+                                              temb, 
+                                              encoder_hidden_states=encoder_hidden_states) if motion_module is not None else hidden_states
 
             output_states += (hidden_states,)
 

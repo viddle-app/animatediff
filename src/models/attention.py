@@ -92,7 +92,27 @@ class Transformer3DModel(ModelMixin, ConfigMixin):
         else:
             self.proj_out = nn.Conv2d(inner_dim, in_channels, kernel_size=1, stride=1, padding=0)
 
-    def forward(self, hidden_states, encoder_hidden_states=None, timestep=None, return_dict: bool = True):
+    def forward(self, 
+                hidden_states, 
+                encoder_hidden_states=None, 
+                timestep=None, 
+                cross_attention_kwargs: Dict[str, Any] = None,
+                attention_mask: Optional[torch.Tensor] = None,
+                encoder_attention_mask: Optional[torch.Tensor] = None,
+                return_dict: bool = True):
+        if attention_mask is not None and attention_mask.ndim == 2:
+            # assume that mask is expressed as:
+            #   (1 = keep,      0 = discard)
+            # convert mask into a bias that can be added to attention scores:
+            #       (keep = +0,     discard = -10000.0)
+            attention_mask = (1 - attention_mask.to(hidden_states.dtype)) * -10000.0
+            attention_mask = attention_mask.unsqueeze(1)
+
+        # convert encoder_attention_mask to a bias the same way we do for attention_mask
+        if encoder_attention_mask is not None and encoder_attention_mask.ndim == 2:
+            encoder_attention_mask = (1 - encoder_attention_mask.to(hidden_states.dtype)) * -10000.0
+            encoder_attention_mask = encoder_attention_mask.unsqueeze(1)
+        
         # Input
         assert hidden_states.dim() == 5, f"Expected hidden_states to have ndim=5, but got ndim={hidden_states.dim()}."
         video_length = hidden_states.shape[2]
@@ -116,9 +136,12 @@ class Transformer3DModel(ModelMixin, ConfigMixin):
         for block in self.transformer_blocks:
             hidden_states = block(
                 hidden_states,
+                attention_mask=attention_mask,
                 encoder_hidden_states=encoder_hidden_states,
                 timestep=timestep,
-                video_length=video_length
+                video_length=video_length,
+                encoder_attention_mask=encoder_attention_mask,
+                cross_attention_kwargs=cross_attention_kwargs,
             )
 
         # Output
