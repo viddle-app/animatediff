@@ -118,7 +118,11 @@ def run(model,
       scheduler=EulerAncestralDiscreteScheduler(**scheduler_kwargs),
     ).to(device)
 
-  motion_module_path = "models/mm_sd_v14.ckpt"
+  motion_module_path = "models/mm-baseline-epoch-5.pth"
+  # motion_module_path = "models/mm-Stabilized_high.pth"
+  # motion_module_path = "models/mm-1000.pth"
+  # motion_module_path = "models/motionModel_v03anime.ckpt"
+  # motion_module_path = "models/mm_sd_v14.ckpt"
   # motion_module_path = "models/mm_sd_v15.ckpt"
   # motion_module_path = '../ComfyUI/custom_nodes/ComfyUI-AnimateDiff/models/animatediffMotion_v15.ckpt'
   motion_module_state_dict = torch.load(motion_module_path, map_location="cpu")
@@ -173,8 +177,12 @@ def run(model,
 
   tensor_to_video(video, output_path, fps=frame_count)
 
+# prompt="neon glowing psychedelic man dancing, photography, award winning, gorgous, highly detailed",
+
 if __name__ == "__main__":
   run(Path("../models/dreamshaper-6"), 
-      prompt="neon glowing psychedelic woman dancing, photography, award winning, gorgous, highly detailed",
-      negative_prompt="ugly, blurry, wrong")
+      prompt="neon jellyfish",
+      negative_prompt="ugly, blurry, wrong",
+      height=512,
+      width=512,)
 

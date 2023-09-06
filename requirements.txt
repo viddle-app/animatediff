@@ -5,3 +5,8 @@ transformers
 accelerate
 einops
 opencv-python
+wandb
+omegaconf
+imageio
+decord
+xformers
