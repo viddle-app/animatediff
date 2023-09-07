@@ -398,14 +398,6 @@ class AnimationPipeline(DiffusionPipeline, FromSingleFileMixin):
                                        t, 
                                        encoder_hidden_states=text_embeddings
                                        ).sample.to(dtype=latents_dtype)
-                # noise_pred = []
-                # import pdb
-                # pdb.set_trace()
-                # for batch_idx in range(latent_model_input.shape[0]):
-                #     noise_pred_single = self.unet(latent_model_input[batch_idx:batch_idx+1], t, encoder_hidden_states=text_embeddings[batch_idx:batch_idx+1]).sample.to(dtype=latents_dtype)
-                #     noise_pred.append(noise_pred_single)
-                # noise_pred = torch.cat(noise_pred)
-
                 # perform guidance
                 if do_classifier_free_guidance:
                     noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
