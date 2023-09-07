@@ -1,9 +1,21 @@
 import glob
 import os
 from pathlib import Path
-from src.pipelines.pipeline_animatediff import AnimationPipeline
-from src.pipelines.pipeline_animatediff_controlnet import StableDiffusionControlNetPipeline
-from diffusers import AutoencoderKL, EulerAncestralDiscreteScheduler, DDIMScheduler
+import types
+from typing import Union, Optional, Tuple
+use_temi = True
+if use_temi:
+  from src.pipelines.pipeline_animatediff_temi import AnimationPipeline
+  from src.schedulers.scheduling_euler_ancestral_discrete import EulerAncestralDiscreteScheduler
+else:
+  # from diffusers import EulerAncestralDiscreteScheduler
+  from src.schedulers.scheduling_euler_ancestral_discrete import EulerAncestralDiscreteScheduler
+  from src.pipelines.pipeline_animatediff import AnimationPipeline
+if use_temi: 
+  from src.pipelines.pipeline_animatediff_controlnet_temi import StableDiffusionControlNetPipeline
+else:
+  from src.pipelines.pipeline_animatediff_controlnet import StableDiffusionControlNetPipeline
+from diffusers import AutoencoderKL,  DDIMScheduler
 import torch
 from transformers import CLIPTextModel, CLIPTokenizer
 from src.models.unet import UNet3DConditionModel
@@ -11,6 +23,12 @@ import numpy as np
 import cv2
 from diffusers.models.controlnet import ControlNetModel
 from PIL import Image
+from diffusers.utils import randn_tensor, BaseOutput
+from src.utils.image_utils import tensor_to_image_sequence
+
+
+
+
 
 def tensor_to_video(tensor, output_path, fps=30):
     """
@@ -91,7 +109,9 @@ def run(model,
 
   unet = unet.to(dtype=dtype)
 
-  use_controlnet = True
+  use_controlnet = False
+
+  scheduler = EulerAncestralDiscreteScheduler(**scheduler_kwargs)
 
   if use_controlnet:
     # controlnet_path = Path("../models/ControlNet-v1-1/control_v11p_sd15_openpose.yaml")
@@ -103,7 +123,7 @@ def run(model,
       text_encoder=text_encoder, 
       tokenizer=tokenizer, 
       unet=unet,
-      scheduler=EulerAncestralDiscreteScheduler(**scheduler_kwargs),
+      scheduler=scheduler,
       controlnet=controlnet,
       safety_checker=None,
       feature_extractor=None,
@@ -114,11 +134,11 @@ def run(model,
       text_encoder=text_encoder, 
       tokenizer=tokenizer, 
       unet=unet,
-      # scheduler=DDIMScheduler(**scheduler_kwargs),
-      scheduler=EulerAncestralDiscreteScheduler(**scheduler_kwargs),
+      scheduler=scheduler,
     ).to(device)
 
-  motion_module_path = "models/mm-baseline-epoch-5.pth"
+  motion_module_path = "models/mm-temi-epoch-5.pth"
+  # motion_module_path = "models/mm-baseline-epoch-5.pth"
   # motion_module_path = "models/mm-Stabilized_high.pth"
   # motion_module_path = "models/mm-1000.pth"
   # motion_module_path = "models/motionModel_v03anime.ckpt"
@@ -175,7 +195,8 @@ def run(model,
     # save the tensor 
     # torch.save(video, output_path + ".pt")
 
-  tensor_to_video(video, output_path, fps=frame_count)
+  # tensor_to_video(video, output_path, fps=frame_count)
+  tensor_to_image_sequence(video, output_path)
 
 # prompt="neon glowing psychedelic man dancing, photography, award winning, gorgous, highly detailed",
 
@@ -183,6 +204,8 @@ if __name__ == "__main__":
   run(Path("../models/dreamshaper-6"), 
       prompt="neon jellyfish",
       negative_prompt="ugly, blurry, wrong",
+      output_path="images",
       height=512,
-      width=512,)
+      width=512,
+      frame_count=400)
 

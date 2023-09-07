@@ -160,15 +160,25 @@ class ResnetBlock3D(nn.Module):
             self.conv_shortcut = InflatedConv3d(in_channels, out_channels, kernel_size=1, stride=1, padding=0)
 
     def forward(self, input_tensor, temb):
+        
+        
         hidden_states = input_tensor
 
         hidden_states = self.norm1(hidden_states)
         hidden_states = self.nonlinearity(hidden_states)
 
         hidden_states = self.conv1(hidden_states)
+        
 
         if temb is not None:
-            temb = self.time_emb_proj(self.nonlinearity(temb))[:, :, None, None, None]
+            # need to shape and reshape the temb here to match the frame count
+            if len(temb.shape) == 3:
+                temb = rearrange(temb, "b f c -> (b f) c")
+                temb = self.time_emb_proj(self.nonlinearity(temb))[:, :, None, None]
+                temb = rearrange(temb, "(b f) c h w -> b c f h w", f=hidden_states.shape[2])
+            else:
+                temb = self.time_emb_proj(self.nonlinearity(temb))[:, :, None, None, None]
+        
 
         if temb is not None and self.time_embedding_norm == "default":
             hidden_states = hidden_states + temb

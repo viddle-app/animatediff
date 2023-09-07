@@ -6,6 +6,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import os
 import json
 import pdb
+from einops import rearrange
 
 import torch
 import torch.nn as nn
@@ -486,9 +487,19 @@ class UNet3DConditionModel(ModelMixin, ConfigMixin):
             timesteps = timesteps[None].to(sample.device)
 
         # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
-        timesteps = timesteps.expand(sample.shape[0])
+        print("sample", sample.shape)
+        print("timesteps", timesteps.shape)
+        if len(timesteps.shape) != 2:
+            timesteps = timesteps.expand(sample.shape[0])
 
-        t_emb = self.time_proj(timesteps)
+        # reshape unshape
+        if len(timesteps.shape) == 2:
+            frame_count = sample.shape[2]
+            timesteps = rearrange(timesteps, "b f -> (b f)")
+            t_emb = self.time_proj(timesteps)
+            t_emb = rearrange(t_emb, "(b f) c -> b f c", f=frame_count)
+        else:
+            t_emb = self.time_proj(timesteps)
 
         # timesteps does not contain any weights and will always return f32 tensors
         # but time_embedding might actually be running in fp16. so we need to cast here.
@@ -548,7 +559,7 @@ class UNet3DConditionModel(ModelMixin, ConfigMixin):
                 attention_mask=attention_mask,
                 cross_attention_kwargs=cross_attention_kwargs,
             )
-            
+
         if mid_block_additional_residual is not None:
             sample = sample + mid_block_additional_residual
 

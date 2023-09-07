@@ -46,7 +46,7 @@ validation_data:
 trainable_modules:
   - "motion_modules."
 
-unet_checkpoint_path: "outputs/training-2023-09-05T11-02-35/checkpoints/checkpoint.ckpt"
+unet_checkpoint_path: ""
 
 learning_rate:    1.e-4
 train_batch_size: 4
@@ -54,11 +54,11 @@ gradient_checkpointing: True
 gradient_accumulation_steps: 1
 
 max_train_epoch:      -1
-max_train_steps:      1000000
+max_train_steps:      100000
 checkpointing_epochs: -1
-checkpointing_steps:  10000
+checkpointing_steps:  2500
 
-validation_steps:       5000
+validation_steps:       500
 validation_steps_tuple: []
 
 global_seed: 42

@@ -25,13 +25,13 @@ from diffusers.schedulers import (
     LMSDiscreteScheduler,
     PNDMScheduler,
 )
-from diffusers.utils import deprecate, logging, BaseOutput
+from diffusers.utils import deprecate, logging, BaseOutput, randn_tensor
 
 from einops import rearrange
-from ..utils.image_utils import tensor_to_image_sequence
 
 from ..models.unet import UNet3DConditionModel
-
+from ..utils.timestep_utils import sliding_window
+from src.utils.image_utils import tensor_to_image_sequence
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
@@ -286,8 +286,8 @@ class AnimationPipeline(DiffusionPipeline, FromSingleFileMixin):
                 f" {type(callback_steps)}."
             )
 
-    def prepare_latents(self, batch_size, num_channels_latents, video_length, height, width, dtype, device, generator, latents=None):
-        shape = (batch_size, num_channels_latents, video_length, height // self.vae_scale_factor, width // self.vae_scale_factor)
+    def prepare_latents(self, batch_size, num_channels_latents, height, width, dtype, device, generator, latents=None):
+        shape = (batch_size, num_channels_latents, 1, height // self.vae_scale_factor, width // self.vae_scale_factor)
         if isinstance(generator, list) and len(generator) != batch_size:
             raise ValueError(
                 f"You have passed a list of generators of length {len(generator)}, but requested an effective batch"
@@ -364,6 +364,8 @@ class AnimationPipeline(DiffusionPipeline, FromSingleFileMixin):
             prompt, device, num_videos_per_prompt, do_classifier_free_guidance, negative_prompt
         )
 
+        print("text_embeddings", text_embeddings.shape)
+
         # Prepare timesteps
         self.scheduler.set_timesteps(num_inference_steps, device=device)
         timesteps = self.scheduler.timesteps
@@ -373,7 +375,6 @@ class AnimationPipeline(DiffusionPipeline, FromSingleFileMixin):
         latents = self.prepare_latents(
             batch_size * num_videos_per_prompt,
             num_channels_latents,
-            video_length,
             height,
             width,
             text_embeddings.dtype,
@@ -386,33 +387,52 @@ class AnimationPipeline(DiffusionPipeline, FromSingleFileMixin):
         # Prepare extra step kwargs.
         extra_step_kwargs = self.prepare_extra_step_kwargs(generator, eta)
 
+        print("timesteps", timesteps)
+
+        timesteps = sliding_window(timesteps, video_length)
+
+        tensor_timesteps = []
+        for t in timesteps:
+            tensor_timesteps.append(torch.stack(t))
+
+        print("tensor_timesteps", tensor_timesteps[0].shape)
+        timesteps = tensor_timesteps
+
+        output_latents = []
+
+        timesteps_count = len(timesteps)
+
         # Denoising loop
         num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
-        with self.progress_bar(total=num_inference_steps) as progress_bar:
+        with self.progress_bar(total=timesteps_count) as progress_bar:
             for i, t in enumerate(timesteps):
+                t = t.unsqueeze(0)
+                print("i", i)
+                print("t", t)
                 # expand the latents if we are doing classifier free guidance
                 latent_model_input = torch.cat([latents] * 2) if do_classifier_free_guidance else latents
-                latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
+                t_cfg = torch.cat([t] * 2) if do_classifier_free_guidance else t
+                print("t_cfg", t_cfg)
+                print("latents", latent_model_input.shape)
+                # TODO rearrange to move the frames to batch sizes
+                frame_count = latent_model_input.shape[2]
+                latent_model_input = rearrange(latent_model_input, "b c f h w -> (b f) c h w")
+                reshaped_t = rearrange(t_cfg, "b f -> (b f)")
+                print("latent_model_input before", latent_model_input.dtype)
+                latent_model_input = self.scheduler.scale_model_input(latent_model_input, reshaped_t)
+                latent_model_input = rearrange(latent_model_input, "(b f) c h w -> b c f h w", f=frame_count)
+                print("latent_model_input", latent_model_input.dtype)
 
-                if False:
-                    # decode the latents are write them out
-                    debug_latents = torch.from_numpy(self.decode_latents(latent_model_input))
-                    output_dir = "debug_baseline_" + str(i)
-                    print("debug_latents.shape", debug_latents.shape)
-                    tensor_to_image_sequence(debug_latents[0], output_dir)
+
+                # prompt = text_embeddings[: latents.shape[0]]
+
                 # predict the noise residual
                 noise_pred = self.unet(latent_model_input, 
-                                       t, 
+                                       t_cfg, 
                                        encoder_hidden_states=text_embeddings
                                        ).sample.to(dtype=latents_dtype)
-                # noise_pred = []
-                # import pdb
-                # pdb.set_trace()
-                # for batch_idx in range(latent_model_input.shape[0]):
-                #     noise_pred_single = self.unet(latent_model_input[batch_idx:batch_idx+1], t, encoder_hidden_states=text_embeddings[batch_idx:batch_idx+1]).sample.to(dtype=latents_dtype)
-                #     noise_pred.append(noise_pred_single)
-                # noise_pred = torch.cat(noise_pred)
 
+                # reduce the prompt to the size of the latents
                 # perform guidance
                 if do_classifier_free_guidance:
                     noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
@@ -421,14 +441,54 @@ class AnimationPipeline(DiffusionPipeline, FromSingleFileMixin):
                 # compute the previous noisy sample x_t -> x_t-1
                 latents = self.scheduler.step(noise_pred, t, latents, **extra_step_kwargs).prev_sample
 
+                if False:
+                    # decode the latents are write them out
+                    debug_latents = torch.from_numpy(self.decode_latents(latents))
+                    output_dir = "debug_" + str(i)
+                    print("debug_latents.shape", debug_latents.shape)
+                    tensor_to_image_sequence(debug_latents[0], output_dir)
+
+                if i >= num_inference_steps - 1:
+                    # select the first latent at dimension 2
+                    popped_latent = latents[:, :, 0:1]
+
+                    # remove the first latent at dimension 2
+                    print("latents before", latents.shape)
+                    latents = latents[:, :, 1:]
+                    print("latents after", latents.shape)
+                    output_latents.append(popped_latent)
+                
+                # get the shape of a single frames latent
+                frame_latent_shape = (num_channels_latents, 1, height // self.vae_scale_factor, width // self.vae_scale_factor)
+
+
+
+                if i < timesteps_count - num_inference_steps:
+                    # add a noise sample to the end
+                    new_latent = randn_tensor(frame_latent_shape, 
+                                                generator=generator, 
+                                                device=device, 
+                                                dtype=latents_dtype)
+                    print("new_latent", new_latent.shape)
+                    latents = torch.cat([latents, new_latent.unsqueeze(0)], dim=2)
+
+                progress_bar.update()
+
+
+
+
                 # call the callback, if provided
-                if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
-                    progress_bar.update()
-                    if callback is not None and i % callback_steps == 0:
-                        callback(i, t, latents)
+                # if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
+                #     progress_bar.update()
+                #     if callback is not None and i % callback_steps == 0:
+                #         callback(i, t, latents)
+
+        # convert to the output latents to a tensor
+        output_latents = torch.concat(output_latents, dim=2)
+        print("output_latents", output_latents.shape)
 
         # Post-processing
-        video = self.decode_latents(latents)
+        video = self.decode_latents(output_latents)
 
         # Convert to tensor
         if output_type == "tensor":
