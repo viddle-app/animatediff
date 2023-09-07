@@ -1,6 +1,8 @@
+import glob
 import numpy as np
 import cv2
 import os
+from PIL import Image
 
 def tensor_to_image_sequence(tensor, output_dir):
     """
@@ -33,4 +35,30 @@ def tensor_to_image_sequence(tensor, output_dir):
         frame = tensor[i]
         image_path = os.path.join(output_dir, f"frame_{i:04d}.png")
         cv2.imwrite(image_path, frame)
-        
+
+def create_gif(image_files, output_file, duration=500, loop=0):
+    """
+    Creates a looping GIF from a sequence of images.
+    
+    Parameters:
+        image_files (list of str): List of paths to the image files.
+        output_file (str): Path to save the output GIF.
+        duration (int): Duration each frame lasts in the GIF in milliseconds. Default is 500ms.
+        loop (int): Number of times the GIF should loop. 0 for infinite looping.
+    """
+    
+    # Load all the images using PIL
+    images = [Image.open(image_file) for image_file in image_files]
+    
+    # Save the sequence as a GIF
+    images[0].save(output_file, save_all=True, 
+                   append_images=images[1:], 
+                   loop=loop, 
+                   duration=duration, 
+                   optimize=False, quality=100)
+    print(f"Saved gif to {output_file}")
+
+if __name__ == "__main__":
+    images = glob.glob("images/*.png")
+    images.sort()
+    create_gif(images, "output.gif", duration=1000/15, loop=0)

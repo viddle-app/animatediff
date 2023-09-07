@@ -28,6 +28,7 @@ from diffusers.schedulers import (
 from diffusers.utils import deprecate, logging, BaseOutput, randn_tensor
 
 from einops import rearrange
+from ..utils.partition_utils import partitions, partitions_wrap_around
 
 from ..models.unet import UNet3DConditionModel
 
@@ -388,82 +389,41 @@ class AnimationPipeline(DiffusionPipeline, FromSingleFileMixin):
         # Prepare extra step kwargs.
         extra_step_kwargs = self.prepare_extra_step_kwargs(generator, eta)
 
-        # if the video_length is over 24 frames
-        # renderer the first 24 first
-        # then render the next 12 by each iterate
-        # noising the first 12 frames to the current timesteps
-        # add collect the last 12 frames then flip
 
-        output_latents = []
-        last_n_count = 12
-        last_n_latents = None
+        wrap_around = True
+        
+        # Denoising loop
+        num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
+        with self.progress_bar(total=num_inference_steps) as progress_bar:
+            for i, t in enumerate(timesteps):
 
-        # create the indices for indexing into the latents
-        indices = []
-        start = 0
-        # do the first part because it has 24 frames
-        end_index = start + min(24, video_length)
-        indices.append((start, end_index))
-        start = end_index
+                print("t: ", t)
+                print("i: ", i)
+                if wrap_around == True:
+                    indices = partitions_wrap_around(video_length, 24, i)
+                else:
+                    indices = partitions(video_length, 24, i)
 
-        while start < video_length: 
-            remaining_video_length = video_length - start
-            end_index = start + min(12, remaining_video_length)
-            indices.append((start, end_index))
-            start = end_index
- 
-        # TODO
-        # How can I overlap
-        # I need finished latents to noise up
-        # I can see how to do it with tedi
-        # train tedi to deal with 
-        # twelve frames that are before or after
-        # then bidirectionally lay down the latents
-        # use the current trained models with tedi
-        # to test the idea of bidirectionally rendering the 
-        # latents with twelve neighoring frames
+                for partition_indices in indices:
+                    print("partition_indices: ", partition_indices)
+                    # check if the partition_indices is a list or a tuple
+                    if isinstance(partition_indices, tuple):
+                        # make a list of the partition indices
+                        start_interval = partition_indices[0]
+                        end_interval = partition_indices[1]
 
-        # Okay is there another way to do this?
-        # the regions need to be random each timestep
+                        # turn the start interval into a list of indices
+                        start_indices = list(range(start_interval[0], start_interval[1]))
+                        end_indices = list(range(end_interval[0], end_interval[1]))
+                        # combine the lists
+                        partition_indices_expanded = end_indices + start_indices 
+                        print("partition_indices_expanded: ", partition_indices_expanded)
 
-        # another idea is to not worry about prior latents
-        # instead just make random overlapping regions
-        # and assume it will work out
-        # this is the simplest actually
-        # just try sliding a window over the regions
-        # each time increment by one
-
-        for partition_indices in indices:
-            print("partition_indices: ", partition_indices)
-            latent_partition = latents[:, :, partition_indices[0]:partition_indices[1]].to(device)
-            print("latent_partition: ", latent_partition.shape)
-
-            partition_length = partition_indices[1] - partition_indices[0]
-
-            # Denoising loop
-            num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
-            with self.progress_bar(total=num_inference_steps) as progress_bar:
-                for i, t in enumerate(timesteps):
-                    print("t: ", t)
-                    print("i: ", i)
+                        latent_partition = latents[:, :, partition_indices_expanded].to(device)
+                    else:
+                        latent_partition = latents[:, :, partition_indices[0]:partition_indices[1]].to(device)
                     print("latent_partition: ", latent_partition.shape)
-                    latent_partition = latent_partition[:, :, :partition_length]
 
-                    if last_n_latents is not None:
-                        # concat the last n latents with the current latents
-                        # noise code based on https://github.com/huggingface/diffusers/blob/5c404f20f4462bc07669280c9b9126a10196a34a/examples/community/stable_diffusion_controlnet_reference.py
-                        noise = randn_tensor(
-                            last_n_latents.shape, generator=generator, device=device, dtype=last_n_latents.dtype
-                        )
-                        noised_last_n_latents = self.scheduler.add_noise(
-                            last_n_latents,
-                            noise,
-                            t.reshape(1,),
-                        )
-                        noised_last_n_latents = self.scheduler.scale_model_input(noised_last_n_latents, t)
-                        print("noised_last_n_latents: ", noised_last_n_latents.shape)
-                        latent_partition = torch.cat([noised_last_n_latents, latent_partition], dim=2)
-                        print("latent_partition: ", latent_partition.shape)
 
                     # expand the latents if we are doing classifier free guidance
                     latent_model_input = torch.cat([latent_partition] * 2) if do_classifier_free_guidance else latent_partition
@@ -482,30 +442,22 @@ class AnimationPipeline(DiffusionPipeline, FromSingleFileMixin):
                     # compute the previous noisy sample x_t -> x_t-1
                     latent_partition = self.scheduler.step(noise_pred, t, latent_partition, **extra_step_kwargs).prev_sample
 
+                    # update the latents
+                    if isinstance(partition_indices, tuple):
+                        latents[:, :, partition_indices_expanded] = latent_partition.to(cpu_device)
+                    else:
+                        latents[:, :, partition_indices[0]:partition_indices[1]] = latent_partition.to(cpu_device)
+
                     # call the callback, if provided
                     if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
                         progress_bar.update()
                         if callback is not None and i % callback_steps == 0:
                             callback(i, t, latent_partition)
-                
+            
 
-                # move the latents to cpu 
-                last_latents = latent_partition.to(cpu_device)
-                # diff the indices to get the length
-                last_count = partition_indices[1] - partition_indices[0]
-                print("last_count: ", last_count)
-                # slice the latents portion after last_n_count 
-                new_latents = last_latents[:, :, :last_count]
-                print("new_latents: ", new_latents.shape)
-                output_latents.append(new_latents)
-                # slice the latents portion so there are only last_n_count left
-                last_n_latents = last_latents[:, :, :-last_n_count].to(device)
-                print("last_n_latents: ", last_n_latents.shape)
 
-        # concat the output latents
-        output_latents = torch.cat(output_latents, dim=2)
         # Post-processing
-        video = self.decode_latents(output_latents, device)
+        video = self.decode_latents(latents, device)
 
         # Convert to tensor
         if output_type == "tensor":

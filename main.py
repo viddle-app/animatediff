@@ -1,8 +1,10 @@
 import glob
 import os
 from pathlib import Path
-use_reference = True
-if use_reference:
+use_type = 'overlapping'
+if use_type == 'overlapping':
+  from src.pipelines.pipeline_animatediff_overlapping import AnimationPipeline
+elif use_type == 'reference':
   from src.pipelines.pipeline_animatediff_reference import AnimationPipeline
 else:
   from src.pipelines.pipeline_animatediff import AnimationPipeline
@@ -15,7 +17,7 @@ import numpy as np
 import cv2
 from diffusers.models.controlnet import ControlNetModel
 from PIL import Image
-from src.utils.image_utils import tensor_to_image_sequence
+from src.utils.image_utils import create_gif, tensor_to_image_sequence
 
 def tensor_to_video(tensor, output_path, fps=30):
     """
@@ -59,7 +61,7 @@ def run(model,
         width=512,
         height=512,
         dtype=torch.float16,
-        output_path="output.mp4"):
+        output_path="output.gif"):
   scheduler_kwargs = {
     "num_train_timesteps": 1000,
     "beta_start": 0.00085,
@@ -181,15 +183,20 @@ def run(model,
     # torch.save(video, output_path + ".pt")
 
   # tensor_to_video(video, output_path, fps=frame_count)
+  fps = 24
   tensor_to_image_sequence(video, "images")
+  images = glob.glob("images/*.png")
+  images.sort()
+  create_gif(images, output_path, duration=1000/fps, loop=0)
 
 # prompt="neon glowing psychedelic man dancing, photography, award winning, gorgous, highly detailed",
 
 if __name__ == "__main__":
   run(Path("../models/dreamshaper-6"), 
-      prompt="psychodelic neon glowing jellyfish, 35mm film, award winning, gorgous, highly detailed, underwater",
+      prompt="boris karloff",
       negative_prompt="ugly, blurry, wrong",
       height=512,
       width=512,
-      frame_count=64)
+      frame_count=96,
+      num_inference_steps=40)
 
