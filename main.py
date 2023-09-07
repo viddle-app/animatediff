@@ -1,7 +1,11 @@
 import glob
 import os
 from pathlib import Path
-from src.pipelines.pipeline_animatediff import AnimationPipeline
+use_reference = True
+if use_reference:
+  from src.pipelines.pipeline_animatediff_reference import AnimationPipeline
+else:
+  from src.pipelines.pipeline_animatediff import AnimationPipeline
 from src.pipelines.pipeline_animatediff_controlnet import StableDiffusionControlNetPipeline
 from diffusers import AutoencoderKL, EulerAncestralDiscreteScheduler, DDIMScheduler
 import torch
@@ -11,6 +15,7 @@ import numpy as np
 import cv2
 from diffusers.models.controlnet import ControlNetModel
 from PIL import Image
+from src.utils.image_utils import tensor_to_image_sequence
 
 def tensor_to_video(tensor, output_path, fps=30):
     """
@@ -48,7 +53,7 @@ def tensor_to_video(tensor, output_path, fps=30):
 def run(model,
         prompt="", 
         negative_prompt="", 
-        frame_count=16,
+        frame_count=24,
         num_inference_steps=20,
         guidance_scale=7.5,
         width=512,
@@ -91,7 +96,7 @@ def run(model,
 
   unet = unet.to(dtype=dtype)
 
-  use_controlnet = True
+  use_controlnet = False
 
   if use_controlnet:
     # controlnet_path = Path("../models/ControlNet-v1-1/control_v11p_sd15_openpose.yaml")
@@ -118,12 +123,12 @@ def run(model,
       scheduler=EulerAncestralDiscreteScheduler(**scheduler_kwargs),
     ).to(device)
 
-  motion_module_path = "models/mm-baseline-epoch-5.pth"
+  # motion_module_path = "models/mm-baseline-epoch-5.pth"
   # motion_module_path = "models/mm-Stabilized_high.pth"
   # motion_module_path = "models/mm-1000.pth"
   # motion_module_path = "models/motionModel_v03anime.ckpt"
   # motion_module_path = "models/mm_sd_v14.ckpt"
-  # motion_module_path = "models/mm_sd_v15.ckpt"
+  motion_module_path = "models/mm_sd_v15.ckpt"
   # motion_module_path = '../ComfyUI/custom_nodes/ComfyUI-AnimateDiff/models/animatediffMotion_v15.ckpt'
   motion_module_state_dict = torch.load(motion_module_path, map_location="cpu")
   missing, unexpected = pipeline.unet.load_state_dict(motion_module_state_dict, strict=False)
@@ -175,14 +180,16 @@ def run(model,
     # save the tensor 
     # torch.save(video, output_path + ".pt")
 
-  tensor_to_video(video, output_path, fps=frame_count)
+  # tensor_to_video(video, output_path, fps=frame_count)
+  tensor_to_image_sequence(video, "images")
 
 # prompt="neon glowing psychedelic man dancing, photography, award winning, gorgous, highly detailed",
 
 if __name__ == "__main__":
   run(Path("../models/dreamshaper-6"), 
-      prompt="neon jellyfish",
+      prompt="psychodelic neon glowing jellyfish, 35mm film, award winning, gorgous, highly detailed, underwater",
       negative_prompt="ugly, blurry, wrong",
       height=512,
-      width=512,)
+      width=512,
+      frame_count=64)
 
