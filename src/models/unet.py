@@ -629,3 +629,35 @@ class UNet3DConditionModel(ModelMixin, ConfigMixin):
         print(f"### Temporal Module Parameters: {sum(params) / 1e6} M")
         
         return model
+
+    @classmethod
+    def from_unet2d(cls, unet, unet_additional_kwargs=None):
+        assert(unet is not None)
+        state_dict = unet.state_dict()
+        config = unet.config
+
+        config["_class_name"] = cls.__name__
+        config["down_block_types"] = [
+            "CrossAttnDownBlock3D",
+            "CrossAttnDownBlock3D",
+            "CrossAttnDownBlock3D",
+            "DownBlock3D"
+        ]
+        config["up_block_types"] = [
+            "UpBlock3D",
+            "CrossAttnUpBlock3D",
+            "CrossAttnUpBlock3D",
+            "CrossAttnUpBlock3D"
+        ]
+        config["mid_block_type"] = "UNetMidBlock3DCrossAttn"
+
+        model = cls.from_config(config, **unet_additional_kwargs)
+        
+        m, u = model.load_state_dict(state_dict, strict=False)
+        print(f"### missing keys: {len(m)}; \n### unexpected keys: {len(u)};")
+        print(f"### missing keys:\n{m[:10]}\n### unexpected keys:\n{u}\n")
+        
+        params = [p.numel() if "temporal" in n else 0 for n, p in model.named_parameters()]
+        print(f"### Temporal Module Parameters: {sum(params) / 1e6} M")
+
+        return model

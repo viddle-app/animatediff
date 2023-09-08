@@ -28,7 +28,7 @@ from diffusers.schedulers import (
 from diffusers.utils import deprecate, logging, BaseOutput, randn_tensor
 
 from einops import rearrange
-from ..utils.partition_utils import partition_wrap_around_2, partitions, partitions_wrap_around
+from ..utils.partition_utils import partition_wrap_around_2, partitions, partitions_wrap_around, shifted_passes, shifted_passes_2
 
 from ..models.unet import UNet3DConditionModel
 
@@ -399,10 +399,15 @@ class AnimationPipeline(DiffusionPipeline, FromSingleFileMixin):
         
 
 
-        wrap_around = True
         # wrong but close
         remainder = 1 if video_length % window_length != 0 else 0
-        partition_count = video_length // window_length  + remainder
+        partition_count = 2 * (video_length // window_length  + remainder)
+        
+        latents_shape = latents.shape
+        count  = torch.zeros(latents_shape,
+                             dtype=latents.dtype)
+        values = torch.zeros(latents_shape,
+                             dtype=latents.dtype)
         # Denoising loop
         print("window_length: ", window_length)
         print("video_length: ", video_length)
@@ -412,63 +417,76 @@ class AnimationPipeline(DiffusionPipeline, FromSingleFileMixin):
 
                 print("t: ", t)
                 print("i: ", i)
-                
-                if wrap_around == True:
-                    indices = partition_wrap_around_2(video_length, window_length, i, offset=1)
+                count.zero_()
+                values.zero_()
+
+                # TODO looks washed out from the averaging
+                # if the i > len(timesteps) / 3 then just have one pass 
+                # that is the shifted windows for this index
+                if i > len(timesteps) / 6:
+                    the_pass = partition_wrap_around_2(video_length, window_length, i)
+                    passes = [the_pass]
                 else:
-                    indices = partitions(video_length, window_length, i)
-                print("indices: ", indices)
-                for partition_indices in indices:
-                    print("partition_indices: ", partition_indices)
-                    # check if the partition_indices is a list or a tuple
-                    if isinstance(partition_indices, tuple):
-                        # make a list of the partition indices
-                        start_interval = partition_indices[0]
-                        end_interval = partition_indices[1]
-
-                        # turn the start interval into a list of indices
-                        start_indices = list(range(start_interval[0], start_interval[1]))
-                        end_indices = list(range(end_interval[0], end_interval[1]))
-                        # combine the lists
-                        partition_indices_expanded = end_indices + start_indices 
-                        print("partition_indices_expanded: ", partition_indices_expanded)
-
-                        latent_partition = latents[:, :, partition_indices_expanded].to(device)
-                    else:
-                        latent_partition = latents[:, :, partition_indices[0]:partition_indices[1]].to(device)
-                    print("latent_partition: ", latent_partition.shape)
-
-
-                    # expand the latents if we are doing classifier free guidance
-                    latent_model_input = torch.cat([latent_partition] * 2) if do_classifier_free_guidance else latent_partition
-                    latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
-
-                    # predict the noise residual
-                    noise_pred = self.unet(latent_model_input, 
-                                        t, 
-                                        encoder_hidden_states=text_embeddings
-                                        ).sample.to(dtype=latents_dtype)
-                    # perform guidance
-                    if do_classifier_free_guidance:
-                        noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
-                        noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
-
-                    # compute the previous noisy sample x_t -> x_t-1
-                    latent_partition = self.scheduler.step(noise_pred, t, latent_partition, **extra_step_kwargs).prev_sample
-
-                    # update the latents
-                    if isinstance(partition_indices, tuple):
-                        latents[:, :, partition_indices_expanded] = latent_partition.to(cpu_device)
-                    else:
-                        latents[:, :, partition_indices[0]:partition_indices[1]] = latent_partition.to(cpu_device)
-
-                    # call the callback, if provided
-                    if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
-                        progress_bar.update()
-                        if callback is not None and i % callback_steps == 0:
-                            callback(i, t, latent_partition)
+                    passes = shifted_passes(video_length, window_length)
+                for p, pass_indices in enumerate(passes):
+                    print("p: ", p)
+                    print("pass_indices: ", pass_indices)
             
+                    pass_indices.reverse()
+                    for partition_indices in pass_indices:
+                        print("partition_indices: ", partition_indices)
+                        # check if the partition_indices is a list or a tuple
+                        if isinstance(partition_indices, tuple):
+                            # make a list of the partition indices
+                            start_interval = partition_indices[0]
+                            end_interval = partition_indices[1]
 
+                            # turn the start interval into a list of indices
+                            start_indices = list(range(start_interval[0], start_interval[1]))
+                            end_indices = list(range(end_interval[0], end_interval[1]))
+                            # combine the lists
+                            partition_indices_expanded = end_indices + start_indices 
+                            print("partition_indices_expanded: ", partition_indices_expanded)
+
+                            latent_partition = latents[:, :, partition_indices_expanded].to(device)
+                        else:
+                            latent_partition = latents[:, :, partition_indices[0]:partition_indices[1]].to(device)
+                        print("latent_partition: ", latent_partition.shape)
+
+
+                        # expand the latents if we are doing classifier free guidance
+                        latent_model_input = torch.cat([latent_partition] * 2) if do_classifier_free_guidance else latent_partition
+                        latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
+
+                        # predict the noise residual
+                        noise_pred = self.unet(latent_model_input, 
+                                            t, 
+                                            encoder_hidden_states=text_embeddings
+                                            ).sample.to(dtype=latents_dtype)
+                        # perform guidance
+                        if do_classifier_free_guidance:
+                            noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+                            noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
+
+                        # compute the previous noisy sample x_t -> x_t-1
+                        latent_partition = self.scheduler.step(noise_pred, t, latent_partition, **extra_step_kwargs).prev_sample
+
+                        # update the latents
+                        if isinstance(partition_indices, tuple):
+                            values[:, :, partition_indices_expanded] += latent_partition.to(cpu_device)
+                            count[:, :, partition_indices_expanded] += 1
+                        else:
+                            values[:, :, partition_indices[0]:partition_indices[1]] += latent_partition.to(cpu_device)
+                            count[:, :, partition_indices[0]:partition_indices[1]] += 1
+
+                        # call the callback, if provided
+                        if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
+                            progress_bar.update()
+                            if callback is not None and i % callback_steps == 0:
+                                callback(i, t, latent_partition)
+            
+                    # average the latents
+                    latents = torch.where(count > 0, values / count, values)
 
         # Post-processing
         video = self.decode_latents(latents, device)

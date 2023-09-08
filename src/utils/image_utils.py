@@ -31,9 +31,12 @@ def tensor_to_image_sequence(tensor, output_dir):
     # Ensure the tensor values are in the correct range [0, 255]
     tensor = np.clip(tensor, 0, 255).astype(np.uint8)
 
+    # swap the channels from RGB to BGR
+    tensor = tensor[...,::-1]
+
     for i in range(num_frames):
         frame = tensor[i]
-        image_path = os.path.join(output_dir, f"frame_{i:04d}.png")
+        image_path = os.path.join(output_dir, f"{i:04d}.png")
         cv2.imwrite(image_path, frame)
 
 def create_gif(image_files, output_file, duration=500, loop=0):
@@ -57,6 +60,10 @@ def create_gif(image_files, output_file, duration=500, loop=0):
                    duration=duration, 
                    optimize=False, quality=100)
     print(f"Saved gif to {output_file}")
+
+def create_mp4_from_images(images_folder, output_path, fps=15):
+    cmd = f"ffmpeg -r {fps} -i {images_folder}/%04d.png -c:v libx264 -profile:v high -crf 20 -pix_fmt yuv420p {output_path}"
+    os.system(cmd)
 
 if __name__ == "__main__":
     images = glob.glob("images/*.png")

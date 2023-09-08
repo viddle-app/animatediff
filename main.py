@@ -1,15 +1,20 @@
 import glob
 import os
 from pathlib import Path
+import random
+import sys
+import uuid
 use_type = 'overlapping'
 if use_type == 'overlapping':
   from src.pipelines.pipeline_animatediff_overlapping import AnimationPipeline
+elif use_type == 'overlapping_2':
+  from src.pipelines.pipeline_animatediff_overlapping_2 import AnimationPipeline
 elif use_type == 'reference':
   from src.pipelines.pipeline_animatediff_reference import AnimationPipeline
 else:
   from src.pipelines.pipeline_animatediff import AnimationPipeline
 from src.pipelines.pipeline_animatediff_controlnet import StableDiffusionControlNetPipeline
-from diffusers import AutoencoderKL, EulerAncestralDiscreteScheduler, DDIMScheduler
+from diffusers import AutoencoderKL, EulerAncestralDiscreteScheduler, DDIMScheduler, StableDiffusionPipeline
 import torch
 from transformers import CLIPTextModel, CLIPTokenizer
 from src.models.unet import UNet3DConditionModel
@@ -17,7 +22,7 @@ import numpy as np
 import cv2
 from diffusers.models.controlnet import ControlNetModel
 from PIL import Image
-from src.utils.image_utils import create_gif, tensor_to_image_sequence
+from src.utils.image_utils import create_gif, create_mp4_from_images, tensor_to_image_sequence
 
 def tensor_to_video(tensor, output_path, fps=30):
     """
@@ -61,7 +66,12 @@ def run(model,
         width=512,
         height=512,
         dtype=torch.float16,
-        output_path="output.gif"):
+        window_count=24,
+        output_dir="output",
+        use_single_file = True,
+        lora_folder=None,
+        lora_file=None,
+        seed=None):
   scheduler_kwargs = {
     "num_train_timesteps": 1000,
     "beta_start": 0.00085,
@@ -89,14 +99,30 @@ def run(model,
     },
   }
 
-  tokenizer    = CLIPTokenizer.from_pretrained(model, subfolder="tokenizer", torch_dtype=dtype)
-  text_encoder = CLIPTextModel.from_pretrained(model, subfolder="text_encoder", torch_dtype=dtype)
-  vae          = AutoencoderKL.from_pretrained(model, subfolder="vae", torch_dtype=dtype)            
-  unet         = UNet3DConditionModel.from_pretrained_2d(model, 
-                                                        subfolder="unet", 
-                                                        unet_additional_kwargs=unet_additional_kwargs)
+  
 
-  unet = unet.to(dtype=dtype)
+  if use_single_file:
+    pipeline = StableDiffusionPipeline.from_single_file(model)
+
+    if lora_folder is not None and lora_file is not None:
+      pipeline.load_lora_weights(lora_folder, 
+                                 weight_name=lora_file)
+      
+    tokenizer = pipeline.tokenizer
+    text_encoder = pipeline.text_encoder
+    vae = pipeline.vae
+    unet = UNet3DConditionModel.from_unet2d(pipeline.unet, 
+                                            unet_additional_kwargs=unet_additional_kwargs)
+
+  else:
+    tokenizer    = CLIPTokenizer.from_pretrained(model, subfolder="tokenizer", torch_dtype=dtype)
+    text_encoder = CLIPTextModel.from_pretrained(model, subfolder="text_encoder", torch_dtype=dtype)
+    vae          = AutoencoderKL.from_pretrained(model, subfolder="vae", torch_dtype=dtype)            
+    unet         = UNet3DConditionModel.from_pretrained_2d(model, 
+                                                          subfolder="unet", 
+                                                          unet_additional_kwargs=unet_additional_kwargs)
+
+    unet = unet.to(dtype=dtype)
 
   use_controlnet = False
 
@@ -116,29 +142,37 @@ def run(model,
       feature_extractor=None,
     ).to(device)
   else:
-    pipeline = AnimationPipeline(
-      vae=vae, 
-      text_encoder=text_encoder, 
-      tokenizer=tokenizer, 
-      unet=unet,
-      # scheduler=DDIMScheduler(**scheduler_kwargs),
-      scheduler=EulerAncestralDiscreteScheduler(**scheduler_kwargs),
-    ).to(device)
+
+      pipeline = AnimationPipeline(
+        vae=vae, 
+        text_encoder=text_encoder, 
+        tokenizer=tokenizer, 
+        unet=unet,
+        # scheduler=DDIMScheduler(**scheduler_kwargs),
+        scheduler=EulerAncestralDiscreteScheduler(**scheduler_kwargs),
+      ).to(device)
 
   # motion_module_path = "models/mm-baseline-epoch-5.pth"
-  # motion_module_path = "models/mm-Stabilized_high.pth"
+  motion_module_path = "models/mm-Stabilized_high.pth"
   # motion_module_path = "models/mm-1000.pth"
   # motion_module_path = "models/motionModel_v03anime.ckpt"
   # motion_module_path = "models/mm_sd_v14.ckpt"
-  motion_module_path = "models/mm_sd_v15.ckpt"
+  # motion_module_path = "models/mm_sd_v15.ckpt"
   # motion_module_path = '../ComfyUI/custom_nodes/ComfyUI-AnimateDiff/models/animatediffMotion_v15.ckpt'
   motion_module_state_dict = torch.load(motion_module_path, map_location="cpu")
   missing, unexpected = pipeline.unet.load_state_dict(motion_module_state_dict, strict=False)
   if "global_step" in motion_module_state_dict:
     raise Exception("global_step present. Not sure how to handle that.")
   print("unexpected", unexpected)
-  assert len(unexpected) == 0
+  # assert len(unexpected) == 0
   print("missing", len(missing))
+  print("missing", missing)
+
+  if seed is None:
+    seed = random.randint(-sys.maxsize, sys.maxsize)
+
+  # generators = [torch.Generator().manual_seed(seed) for _ in range(window_count)]
+  generators = torch.Generator().manual_seed(seed)
 
   if use_controlnet: 
     # load 16 frames from the directory
@@ -156,6 +190,8 @@ def run(model,
     # load the images as PIL images
     images = [Image.open(file) for file in sorted_files]
 
+
+  
   
     video = pipeline(prompt=prompt, 
                   negative_prompt=negative_prompt, 
@@ -170,33 +206,66 @@ def run(model,
 
   
   else:
-    video = pipeline(prompt=prompt, 
-                  negative_prompt=negative_prompt, 
-                  num_inference_steps=num_inference_steps,
-                  guidance_scale=guidance_scale,
-                    width=width,
-                    height=height,
-                    video_length=frame_count).videos[0]
+    if use_type == 'overlapping' or use_type == 'overlapping_2':
+      video = pipeline(prompt=prompt, 
+                    negative_prompt=negative_prompt, 
+                    num_inference_steps=num_inference_steps,
+                    guidance_scale=guidance_scale,
+                      width=width,
+                      height=height,
+                            window_count=window_count,
+                      video_length=frame_count,
+                      generator=generators).videos[0]
+    else:
+      video = pipeline(prompt=prompt, 
+                    negative_prompt=negative_prompt, 
+                    num_inference_steps=num_inference_steps,
+                    guidance_scale=guidance_scale,
+                      width=width,
+                      height=height,
+                      video_length=frame_count).videos[0]
   
-  
+   
     # save the tensor 
     # torch.save(video, output_path + ".pt")
 
-  # tensor_to_video(video, output_path, fps=frame_count)
-  fps = 24
+  # tensor_to_video(video, output_path,                     fps=frame_count)
+  os.makedirs(output_dir, exist_ok=True)
+  filename = str(uuid.uuid4())
+  output_path = os.path.join(output_dir, filename + ".gif")
+  fps = 15
   tensor_to_image_sequence(video, "images")
   images = glob.glob("images/*.png")
   images.sort()
   create_gif(images, output_path, duration=1000/fps, loop=0)
+  create_mp4_from_images("images", output_path.replace(".gif", ".mp4"), fps=fps)
 
 # prompt="neon glowing psychedelic man dancing, photography, award winning, gorgous, highly detailed",
+# prompt="a retrowave painting of a tom cruise with a black beard, retrowave. city skyline far away, road, purple neon lights, low to the ground shot, (masterpiece,detailed,highres)"
+# prompt="highly detail, Most Beautiful, extremely detailed book illustration of a woman fully clothed swaying, in the style of kay nielsen, dark white and light orange, apollinary vasnetsov, intricate embellishments, indonesian art, captivating gaze, by Kay Nielsen",
 
 if __name__ == "__main__":
-  run(Path("../models/dreamshaper-6"), 
-      prompt="boris karloff",
-      negative_prompt="ugly, blurry, wrong",
+  prompt = "close up Girl posing red dress upper body, illustration by Wu guanzhong,China village,twojjbe trees in front of my chinese house,light orange, pink,white,blue ,8k"
+  # prompt = "frazetta, man dancing, ed harris wearing a suit, dancing, mountain blue sky in background"
+  # prompt = "neon glowing psychedelic man dancing, photography, award winning, gorgous, highly detailed"
+  # prompt = "Cute Chunky anthropomorphic Siamese cat dressed in rags walking down a rural road, mindblowing illustration by Jean-Baptiste Monge + Emily Carr + Tsubasa Nakai"
+  # prompt = "A man standing in front of an event horizon, 16k HDR, hyper realistic, cinematic, photography, designed by daniel arsham, glowing white, futuristic, detailed white liquid, directed by stanley kubrick"
+  # prompt = "closeup of A woman dancing in front of a secret garden, early renaissance paintings, Rogier van der Weyden paintings style"
+  # prompt = "close up portrait of a woman in front of a lake artwork by Kawase Hasui"
+  # model = Path("../models/dreamshaper-6")
+  # model = Path("../models/deliberate_v2")
+  # lora_file="Frazetta.safetensors"
+  lora_file=None
+  model = "/mnt/newdrive/automatic1111/models/Stable-diffusion/dreamshaper_8.safetensors"
+  run(model, 
+      prompt=prompt,
+      negative_prompt="clone, cloned, bad anatomy, wrong anatomy, mutated hands and fingers, mutation, mutated, amputation, 3d render, lowres, signs, memes, labels, text, error, mutant, worst quality, low quality, normal quality, jpeg artifacts, signature, watermark, username, blurry, made by children, caricature, ugly, boring, sketch, lacklustre, repetitive, cropped, (long neck), body horror, out of frame, mutilated, tiled, frame, border",
       height=512,
       width=512,
-      frame_count=96,
-      num_inference_steps=40)
+      frame_count=15,
+      window_count=15,
+      num_inference_steps=20,
+      guidance_scale=7.0,
+      lora_folder="/mnt/newdrive/automatic1111/models/Lora",
+      lora_file=lora_file)
 
