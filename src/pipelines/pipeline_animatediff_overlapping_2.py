@@ -424,7 +424,10 @@ class AnimationPipeline(DiffusionPipeline, FromSingleFileMixin):
                 # if the i > len(timesteps) / 3 then just have one pass 
                 # that is the shifted windows for this index
                 if i > len(timesteps) / 6:
-                    the_pass = partition_wrap_around_2(video_length, window_length, i)
+                    # make a random in between 0 and window_length
+                    # offset = torch.randint(0, 2, (1,)).item()
+                    offset = window_length // 2
+                    the_pass = partition_wrap_around_2(video_length, window_length, i, offset)
                     passes = [the_pass]
                 else:
                     passes = shifted_passes(video_length, window_length)

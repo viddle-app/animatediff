@@ -6,6 +6,15 @@ import torch.nn.functional as F
 
 from einops import rearrange
 
+class InflatedGroupNorm(nn.GroupNorm):
+    def forward(self, x):
+        video_length = x.shape[2]
+
+        x = rearrange(x, "b c f h w -> (b f) c h w")
+        x = super().forward(x)
+        x = rearrange(x, "(b f) c h w -> b c f h w", f=video_length)
+
+        return x
 
 class InflatedConv3d(nn.Conv2d):
     def forward(self, x):
@@ -26,6 +35,7 @@ class Upsample3D(nn.Module):
         self.use_conv = use_conv
         self.use_conv_transpose = use_conv_transpose
         self.name = name
+        use_inflated_groupnorm=None,
 
         conv = None
         if use_conv_transpose:

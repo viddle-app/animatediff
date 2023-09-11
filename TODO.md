@@ -9,3 +9,8 @@
 - the window size is causing distinct sections. This is probably because
   early on it barely moves which allows sections to form. Either use multidiffusion or a 
   bigger increments at least early on.
+
+Ideas
+Looping to the music is cool
+Looping and reactive would be interesting
+If the fidelity could be increased you could animate a whole alblum. 

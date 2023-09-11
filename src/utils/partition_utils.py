@@ -1,3 +1,5 @@
+import torch
+
 def partitions(elementCount, windowSize, index):
     # Initialize the starting point for the first window
     start = 0
@@ -115,9 +117,55 @@ def shifted_passes_2(elementCount, windowSize):
 
     return passes
 
+def circular_shift(element_count, offset):
+    offset = offset % element_count
+    initial_indices = list(range(element_count))
+    # circular shift the indices by the offset
+    shifted_indices = initial_indices[offset:] + initial_indices[:offset]
+
+    return shifted_indices
+
+# create a list of start and end indices up to element 
+# where the length is max window_size and after the 
+# first element include last_n elements
+def last_n_indices(element_count, window_size, last_n):
+    assert(last_n <= window_size)
+    last_n = min(last_n, window_size)
+
+    output = []
+
+    output.append([0, window_size])
+
+    start = window_size
+    increment_amount = window_size - last_n
+
+    while start < element_count:
+        # Determine end index for the window based on window_size
+        end = start + increment_amount
+        
+        # Adjust end index if it exceeds element_count
+        end = min(end, element_count)
+        
+        output.append([start, end])
+        
+        # Update start for the next iteration (moving it by window_size - last_n)
+        start = end
+        
+    return output     
+        
+def peel_next_and_new(tensor, last_n, last_count):
+    # slice the latents portion after last_n_count 
+    new_latents = tensor[:, :, last_n:]
+    last_n_latents = tensor[:, :, -last_n:]
+    return new_latents, last_n_latents
+
 if __name__ == "__main__":
-    elementCount = 30
-    windowSize = 9
+    element_count = 30
+    window_size = 24
     index = 1
-    result = partition_wrap_around_2(elementCount, windowSize, index)
+    tensor = torch.tensor([[[1, 2, 3, 4, 5, 6, 7, 8, 9, 10]]])
+    result = peel_next_and_new(tensor, 7, 3)
+
+    new_tensor = torch.tensor([[[11, 12, 13]]])
+    result = torch.concat([result[1], new_tensor], dim=2)
     print(result)

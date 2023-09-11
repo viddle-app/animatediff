@@ -28,10 +28,13 @@ from diffusers.schedulers import (
 from diffusers.utils import deprecate, logging, BaseOutput, randn_tensor
 
 from einops import rearrange
-from ..utils.partition_utils import last_n_indices
+from ..utils.partition_utils import partition_wrap_around_2, partitions, partitions_wrap_around, shifted_passes, shifted_passes_2
 
 from ..models.unet import UNet3DConditionModel
-
+import torch.nn.functional as F
+import lpips
+from torch.autograd import grad
+# import bitsandbytes as bnb
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
@@ -40,6 +43,9 @@ logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 class AnimationPipelineOutput(BaseOutput):
     videos: Union[torch.Tensor, np.ndarray]
 
+def exponential_decay_list(init_weight, decay_rate, num_steps):
+    weights = [init_weight * (decay_rate ** i) for i in range(num_steps)]
+    return torch.tensor(weights)
 
 class AnimationPipeline(DiffusionPipeline, FromSingleFileMixin):
     _optional_components = []
@@ -117,7 +123,22 @@ class AnimationPipeline(DiffusionPipeline, FromSingleFileMixin):
             scheduler=scheduler,
         )
         self.vae_scale_factor = 2 ** (len(self.vae.config.block_out_channels) - 1)
+        # self.percept_loss = lpips.LPIPS(net='vgg').to(self.device)
 
+        for p in self.unet.parameters():
+            p.requires_grad_(False)
+        for p in self.vae.parameters():
+            p.requires_grad_(False)
+        for p in self.text_encoder.parameters():
+            p.requires_grad_(False)
+
+
+
+        self.unet.eval() 
+        self.unet.enable_gradient_checkpointing()
+        self.vae.eval()
+        self.text_encoder.eval()
+        
     def enable_vae_slicing(self):
         self.vae.enable_slicing()
 
@@ -239,6 +260,22 @@ class AnimationPipeline(DiffusionPipeline, FromSingleFileMixin):
 
         return text_embeddings
 
+    
+    def decode_latents_gpu(self, latents):
+        video_length = latents.shape[2]
+        latents = 1 / 0.18215 * latents
+        latents = rearrange(latents, "b c f h w -> (b f) c h w")
+
+        video = []
+        for frame_idx in tqdm(range(latents.shape[0])):
+            decoded = self.vae.decode(latents[frame_idx:frame_idx+1]).sample
+            decoded = (decoded / 2 + 0.5).clamp(0, 1)
+            video.append(decoded)
+        video = torch.cat(video)
+        video = rearrange(video, "(b f) c h w -> b c f h w", f=video_length)
+        return video
+
+
     def decode_latents(self, latents, device):
         video_length = latents.shape[2]
         latents = 1 / 0.18215 * latents
@@ -287,9 +324,9 @@ class AnimationPipeline(DiffusionPipeline, FromSingleFileMixin):
                 f" {type(callback_steps)}."
             )
 
-    def prepare_latents(self, batch_size, num_channels_latents, video_length, height, width, dtype, device, generator, latents=None):
+    def prepare_latents(self, batch_size, num_channels_latents, video_length, height, width, dtype, device, generator, window_size, latents=None):
         shape = (batch_size, num_channels_latents, video_length, height // self.vae_scale_factor, width // self.vae_scale_factor)
-        if isinstance(generator, list) and len(generator) != batch_size:
+        if isinstance(generator, list) and len(generator) != batch_size * window_size:
             raise ValueError(
                 f"You have passed a list of generators of length {len(generator)}, but requested an effective batch"
                 f" size of {batch_size}. Make sure the batch size matches the length of the generators."
@@ -313,10 +350,65 @@ class AnimationPipeline(DiffusionPipeline, FromSingleFileMixin):
             latents = latents.to(device)
 
         # scale the initial noise by the standard deviation required by the scheduler
-        latents = latents * self.scheduler.init_noise_sigma.to(device)
+        # check if the init_noise_sigma is a tensor
+        if isinstance(self.scheduler.init_noise_sigma, torch.Tensor):
+            latents = latents * self.scheduler.init_noise_sigma.to(device)
+        else:
+            latents = latents * self.scheduler.init_noise_sigma
         return latents
 
-    @torch.no_grad()
+    def optimize_latents(self, 
+                         latent_partition, 
+                         sync_scheduler_value, 
+                         pi, 
+                         anchor_view_idx,
+                         text_embeddings,
+                         guidance_scale,
+                         latent_pred_x0_anchor,
+                         t):
+                        
+        latent_view_copy = latent_partition.clone().detach()
+
+            
+        # gradient on latent_view
+        latent_partition = latent_partition.requires_grad_()
+        
+
+        # expand the latents for classifier-free guidance
+        latent_model_input = torch.cat([latent_partition] * 2)
+        
+
+        # predict the noise residual
+        noise_pred = self.unet(latent_model_input, t, encoder_hidden_states=text_embeddings)['sample']
+        
+
+        # perform guidance
+        noise_pred_uncond, noise_pred_cond = noise_pred.chunk(2)
+        noise_pred_new = noise_pred_uncond + guidance_scale * (noise_pred_cond - noise_pred_uncond)
+
+
+        # compute the denoising step with the reference model
+        out = self.scheduler.step(noise_pred_new, t, latent_partition)
+
+        # predict the 'foreseen denoised' latent (x0)
+        latent_view_x0 = out['pred_original_sample']
+        
+        # summed_loss = percept_loss.sum()
+        # compute the L2 loss
+        l2_loss = F.mse_loss(latent_view_x0, latent_pred_x0_anchor)
+        summed_loss = l2_loss.sum()
+
+        # compute the gradient of the perceptual loss w.r.t. the latent
+        norm_grad = grad(outputs=summed_loss, inputs=latent_partition)[0]
+
+        # SyncDiffusion: update the original latent
+        if pi != anchor_view_idx:
+            latent_view_copy = latent_view_copy - sync_scheduler_value * norm_grad 
+        
+        return latent_view_copy                            # 1 x 4 x 64 x 64   
+                        
+
+
     def __call__(
         self,
         prompt: Union[str, List[str]],
@@ -334,9 +426,13 @@ class AnimationPipeline(DiffusionPipeline, FromSingleFileMixin):
         return_dict: bool = True,
         callback: Optional[Callable[[int, int, torch.FloatTensor], None]] = None,
         callback_steps: Optional[int] = 1,
-        last_n: Optional[int] = 6,
-        window_size: Optional[int] = 9,
+        window_count=24,
+        sync_weight=20,                     # gradient descent weight 'w' in the paper
+        sync_freq=1,                        # sync_freq=n: perform gradient descent every n steps
+        sync_thres=50,                      # sync_thres=n: compute SyncDiffusion only for the first n steps
+        sync_decay_rate=0.95,               # decay rate for sync_weight, set as 0.95 in the paper    
         **kwargs,
+
     ):
         # Default height and width to unet
         height = height or self.unet.config.sample_size * self.vae_scale_factor
@@ -373,6 +469,7 @@ class AnimationPipeline(DiffusionPipeline, FromSingleFileMixin):
 
         # Prepare latent variables
         cpu_device = torch.device("cpu")
+        window_length = min(video_length, window_count)
 
         num_channels_latents = self.unet.in_channels
         latents = self.prepare_latents(
@@ -384,125 +481,156 @@ class AnimationPipeline(DiffusionPipeline, FromSingleFileMixin):
             text_embeddings.dtype,
             cpu_device,
             generator,
+            window_length,
             latents,
         )
         latents_dtype = latents.dtype
 
         # Prepare extra step kwargs.
         extra_step_kwargs = self.prepare_extra_step_kwargs(generator, eta)
+        
 
-        # if the video_length is over 24 frames
-        # renderer the first 24 first
-        # then render the next 12 by each iterate
-        # noising the first 12 frames to the current timesteps
-        # add collect the last 12 frames then flip
 
-        output_latents = []
+        # wrong but close
+        remainder = 1 if video_length % window_length != 0 else 0
+        partition_count = 2 * (video_length // window_length  + remainder)
+        
+        latents_shape = latents.shape
 
-        # create the indices for indexing into the latents
-        indices = last_n_indices(video_length, window_size, last_n)
- 
-        # TODO
-        # How can I overlap
-        # I need finished latents to noise up
-        # I can see how to do it with tedi
-        # train tedi to deal with 
-        # twelve frames that are before or after
-        # then bidirectionally lay down the latents
-        # use the current trained models with tedi
-        # to test the idea of bidirectionally rendering the 
-        # latents with twelve neighoring frames
+        # set SyncDiffusion scheduler
+        sync_scheduler = exponential_decay_list(
+            init_weight=sync_weight,
+            decay_rate=sync_decay_rate,
+            num_steps=num_inference_steps
+        )
 
-        # Okay is there another way to do this?
-        # the regions need to be random each timestep
-
-        # another idea is to not worry about prior latents
-        # instead just make random overlapping regions
-        # and assume it will work out
-        # this is the simplest actually
-        # just try sliding a window over the regions
-        # each time increment by one
-
-        last_n_latents = None
-
-        for p, partition_indices in enumerate(indices):
-            print("partition_indices: ", partition_indices)
-            latent_partition = latents[:, :, partition_indices[0]:partition_indices[1]].to(device)
-            print("latent_partition: ", latent_partition.shape)
-
-            partition_length = partition_indices[1] - partition_indices[0]
-
-            # Denoising loop
-            num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
-            with self.progress_bar(total=num_inference_steps) as progress_bar:
+        # Denoising loop
+        print("window_length: ", window_length)
+        print("video_length: ", video_length)
+        anchor_view_idx = 0
+        cpu_timesteps = timesteps.cpu()
+        # self.percept_loss = self.percept_loss.to(device)
+        num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
+        with torch.autocast('cuda'):
+            with self.progress_bar(total=num_inference_steps * partition_count) as progress_bar:
                 for i, t in enumerate(timesteps):
+                    ct = cpu_timesteps[i].long()
                     print("t: ", t)
                     print("i: ", i)
-                    print("latent_partition: ", latent_partition.shape)
-                    latent_partition = latent_partition[:, :, :partition_length]
 
-                    if last_n_latents is not None:
-                        # concat the last n latents with the current latents
-                        # noise code based on https://github.com/huggingface/diffusers/blob/5c404f20f4462bc07669280c9b9126a10196a34a/examples/community/stable_diffusion_controlnet_reference.py
-                        noise = randn_tensor(
-                            last_n_latents.shape, generator=generator, device=device, dtype=last_n_latents.dtype
-                        )
-                        noised_last_n_latents = self.scheduler.add_noise(
-                            last_n_latents,
-                            noise,
-                            t.reshape(1,),
-                        )
-                        noised_last_n_latents = self.scheduler.scale_model_input(noised_last_n_latents, t)
-                        print("noised_last_n_latents: ", noised_last_n_latents.shape)
-                        latent_partition = torch.cat([noised_last_n_latents, latent_partition], dim=2)
+
+                    # choose a random offset 
+                    # offset = np.random.randint(0, window_length)
+                    offset = 1
+                    the_pass = partition_wrap_around_2(video_length, window_length, i, offset)
+
+
+                    '''
+                    (1) First, obtain the reference anchor view (for computing the perceptual loss)
+                    '''
+                    with torch.no_grad():
+                        if (i + 1) % sync_freq == 0 and i < sync_thres:
+                            # decode the anchor view
+                            # partition_indices = the_pass[anchor_view_idx]
+                            # TODO remove this terrible hack
+                            partition_indices = [0, window_length]
+
+                            if isinstance(partition_indices, tuple):
+                                # make a list of the partition indices
+                                start_interval = partition_indices[0]
+                                end_interval = partition_indices[1]
+
+                                # turn the start interval into a list of indices
+                                start_indices = list(range(start_interval[0], start_interval[1]))
+                                end_indices = list(range(end_interval[0], end_interval[1]))
+                                # combine the lists
+                                partition_indices_expanded = end_indices + start_indices 
+                                print("partition_indices_expanded: ", partition_indices_expanded)
+
+                                latent_partition = latents[:, :, partition_indices_expanded].to(device).detach()
+                            else:
+                                latent_partition = latents[:, :, partition_indices[0]:partition_indices[1]].to(device).detach()
+                            print("latent_partition: ", latent_partition.shape)
+
+                            latent_model_input = torch.cat([latent_partition] * 2)                                               # 2 x 4 x 64 x 64
+                            noise_pred = self.unet(latent_model_input, t, encoder_hidden_states=text_embeddings)['sample']
+
+                            # perform guidance
+                            noise_pred_uncond, noise_pred_cond = noise_pred.chunk(2)
+                            noise_pred_new = noise_pred_uncond + guidance_scale * (noise_pred_cond - noise_pred_uncond)
+
+                            # predict the 'foreseen denoised' latent (x0) of the anchor view
+                            latent_pred_x0_anchor = self.scheduler.step(noise_pred_new, t, latent_partition)["pred_original_sample"]
+                            # decoded_image_anchor = self.decode_latents_gpu(latent_pred_x0)  
+                            # decoded_image_anchor = rearrange(decoded_image_anchor, "b c f h w -> (b f) c h w")
+
+                    for pi, partition_indices in enumerate(the_pass):
+                        print("partition_indices: ", partition_indices)
+                        # check if the partition_indices is a list or a tuple
+                        if isinstance(partition_indices, tuple):
+                            # make a list of the partition indices
+                            start_interval = partition_indices[0]
+                            end_interval = partition_indices[1]
+
+                            start_indices = list(range(start_interval[0], start_interval[1]))
+                            end_indices = list(range(end_interval[0], end_interval[1]))
+                            # combine the lists
+                            partition_indices_expanded = end_indices + start_indices 
+                            print("partition_indices_expanded: ", partition_indices_expanded)
+
+                            latent_partition = latents[:, :, partition_indices_expanded].to(device).detach()
+                        else:
+                            latent_partition = latents[:, :, partition_indices[0]:partition_indices[1]].to(device).detach()
                         print("latent_partition: ", latent_partition.shape)
 
-                    # expand the latents if we are doing classifier free guidance
-                    latent_model_input = torch.cat([latent_partition] * 2) if do_classifier_free_guidance else latent_partition
-                    latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
+                        if (i + 1) % sync_freq == 0 and i < sync_thres:
+                            latent_view_copy = self.optimize_latents(latent_partition, 
+                                sync_scheduler[i], 
+                                pi, 
+                                anchor_view_idx,
+                                text_embeddings,
+                                guidance_scale,
+                                latent_pred_x0_anchor,
+                                t)
+                        else:
+                            latent_view_copy = latent_partition
 
-                    # predict the noise residual
-                    noise_pred = self.unet(latent_model_input, 
-                                        t, 
-                                        encoder_hidden_states=text_embeddings
-                                        ).sample.to(dtype=latents_dtype)
-                    # perform guidance
-                    if do_classifier_free_guidance:
-                        noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
-                        noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
+                        with torch.no_grad():
+                        # expand the latents if we are doing classifier free guidance
+                            latent_model_input = torch.cat([latent_view_copy] * 2) if do_classifier_free_guidance else latent_view_copy
+                            latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
 
-                    # compute the previous noisy sample x_t -> x_t-1
-                    latent_partition = self.scheduler.step(noise_pred, t, latent_partition, **extra_step_kwargs).prev_sample
+                            # predict the noise residual
+                            noise_pred = self.unet(latent_model_input, 
+                                                t, 
+                                                encoder_hidden_states=text_embeddings
+                                                ).sample.to(dtype=latents_dtype)
+                            # perform guidance
+                            if do_classifier_free_guidance:
+                                noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+                                noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
+                            
 
-                    # call the callback, if provided
-                    if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
-                        progress_bar.update()
-                        if callback is not None and i % callback_steps == 0:
-                            callback(i, t, latent_partition)
-                
-            last_latents = latent_partition.to(cpu_device)
-            if p == 0:
-                output_latents.append(last_latents)
-            else:
-                # diff the indices to get the length
-                last_count = partition_indices[1] - partition_indices[0]
-                print("last_count: ", last_count)
-                # slice the latents portion after last_n_count 
-                new_latents = last_latents[:, :, last_n:]
-                print("new_latents: ", new_latents.shape)
-                output_latents.append(new_latents)
-                # slice the latents portion so there are only last_n_count left
-            
-            last_n_latents = last_latents[:, :, -last_n:].to(device)
-            print("last_n_latents: ", last_n_latents.shape)
+                            # compute the previous noisy sample x_t -> x_t-1
+                            latent_partition = self.scheduler.step(noise_pred, t, latent_view_copy, **extra_step_kwargs).prev_sample
 
-        print("output_latents: ", len(output_latents))
+                            # update the latents
+                            if isinstance(partition_indices, tuple):
+                                latents[:, :, partition_indices_expanded] = latent_partition.to(cpu_device)
+                            else:
+                                latents[:, :, partition_indices[0]:partition_indices[1]] = latent_partition.to(cpu_device)
+                    
 
-        # concat the output latents
-        output_latents = torch.cat(output_latents, dim=2)
-        print("output_latents: ", output_latents.shape)
+                        # call the callback, if provided
+                        if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
+                            progress_bar.update()
+                            if callback is not None and i % callback_steps == 0:
+                                callback(i, t, latent_partition)
+        
+
+
         # Post-processing
-        video = self.decode_latents(output_latents, device)
+        video = self.decode_latents(latents, device)
 
         # Convert to tensor
         if output_type == "tensor":

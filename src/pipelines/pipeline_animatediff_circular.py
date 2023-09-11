@@ -25,10 +25,11 @@ from diffusers.schedulers import (
     LMSDiscreteScheduler,
     PNDMScheduler,
 )
-from diffusers.utils import deprecate, logging, BaseOutput, randn_tensor
+from diffusers.utils import deprecate, logging, BaseOutput, PIL_INTERPOLATION, randn_tensor
+from PIL import Image
 
 from einops import rearrange
-from ..utils.partition_utils import last_n_indices
+from ..utils.partition_utils import circular_shift
 
 from ..models.unet import UNet3DConditionModel
 
@@ -289,7 +290,7 @@ class AnimationPipeline(DiffusionPipeline, FromSingleFileMixin):
 
     def prepare_latents(self, batch_size, num_channels_latents, video_length, height, width, dtype, device, generator, latents=None):
         shape = (batch_size, num_channels_latents, video_length, height // self.vae_scale_factor, width // self.vae_scale_factor)
-        if isinstance(generator, list) and len(generator) != batch_size:
+        if isinstance(generator, list) and len(generator) != batch_size * video_length:
             raise ValueError(
                 f"You have passed a list of generators of length {len(generator)}, but requested an effective batch"
                 f" size of {batch_size}. Make sure the batch size matches the length of the generators."
@@ -313,8 +314,89 @@ class AnimationPipeline(DiffusionPipeline, FromSingleFileMixin):
             latents = latents.to(device)
 
         # scale the initial noise by the standard deviation required by the scheduler
-        latents = latents * self.scheduler.init_noise_sigma.to(device)
+        # check if the init_noise_sigma is a tensor
+        if isinstance(self.scheduler.init_noise_sigma, torch.Tensor):
+            latents = latents * self.scheduler.init_noise_sigma.to(device)
+        else:
+            latents = latents * self.scheduler.init_noise_sigma
         return latents
+
+    def prepare_image_latents(
+        self,
+        image,
+        width,
+        height,
+        batch_size,
+        num_images_per_prompt,
+        device,
+        dtype,
+    ):
+        if not isinstance(image, torch.Tensor):
+            if isinstance(image, Image.Image):
+                image = [image]
+
+            if isinstance(image[0], Image.Image):
+                images = []
+
+                for image_ in image:
+                    image_ = image_.convert("RGB")
+                    image_ = image_.resize((width, height), resample=PIL_INTERPOLATION["lanczos"])
+                    image_ = np.array(image_)
+                    image_ = image_[None, :]
+                    images.append(image_)
+
+                image = images
+
+                image = np.concatenate(image, axis=0)
+                image = np.array(image).astype(np.float32) / 255.0
+                image = (image - 0.5) / 0.5
+                image = image.transpose(0, 3, 1, 2)
+                image = torch.from_numpy(image)
+            elif isinstance(image[0], torch.Tensor):
+                image = torch.cat(image, dim=0)
+
+        image_batch_size = image.shape[0]
+
+        if image_batch_size == 1:
+            repeat_by = batch_size
+        else:
+            # image batch size is the same as prompt batch size
+            repeat_by = num_images_per_prompt
+
+        image = image.repeat_interleave(repeat_by, dim=0)
+
+        image = image.to(device=device, dtype=dtype)
+
+        return image
+
+    def prepare_ref_latents(self, refimage, batch_size, dtype, device, generator):
+        refimage = refimage.to(device=device, dtype=dtype)
+
+        # encode the mask image into latents space so we can concatenate it to the latents
+        if isinstance(generator, list):
+            ref_image_latents = [
+                self.vae.encode(refimage[i : i + 1]).latent_dist.sample(generator=generator[i])
+                for i in range(batch_size)
+            ]
+            ref_image_latents = torch.cat(ref_image_latents, dim=0)
+        else:
+            ref_image_latents = self.vae.encode(refimage).latent_dist.sample(generator=generator)
+        ref_image_latents = self.vae.config.scaling_factor * ref_image_latents
+
+        # duplicate mask and ref_image_latents for each generation per prompt, using mps friendly method
+        print("ref_image_latents.shape", ref_image_latents.shape)
+        if ref_image_latents.shape[0] < batch_size:
+            if not batch_size % ref_image_latents.shape[0] == 0:
+                raise ValueError(
+                    "The passed images and the required batch size don't match. Images are supposed to be duplicated"
+                    f" to a total batch size of {batch_size}, but {ref_image_latents.shape[0]} images were passed."
+                    " Make sure the number of images that you pass is divisible by the total requested batch size."
+                )
+            ref_image_latents = ref_image_latents.repeat(batch_size // ref_image_latents.shape[0], 1, 1, 1)
+
+        # aligning device to prevent device errors when concating it with the latent model input
+        ref_image_latents = ref_image_latents.to(device=device, dtype=dtype)
+        return ref_image_latents
 
     @torch.no_grad()
     def __call__(
@@ -334,9 +416,9 @@ class AnimationPipeline(DiffusionPipeline, FromSingleFileMixin):
         return_dict: bool = True,
         callback: Optional[Callable[[int, int, torch.FloatTensor], None]] = None,
         callback_steps: Optional[int] = 1,
-        last_n: Optional[int] = 6,
-        window_size: Optional[int] = 9,
+        start_image: Optional[Image.Image] = None,
         **kwargs,
+
     ):
         # Default height and width to unet
         height = height or self.unet.config.sample_size * self.vae_scale_factor
@@ -372,7 +454,6 @@ class AnimationPipeline(DiffusionPipeline, FromSingleFileMixin):
         timesteps = self.scheduler.timesteps
 
         # Prepare latent variables
-        cpu_device = torch.device("cpu")
 
         num_channels_latents = self.unet.in_channels
         latents = self.prepare_latents(
@@ -382,127 +463,105 @@ class AnimationPipeline(DiffusionPipeline, FromSingleFileMixin):
             height,
             width,
             text_embeddings.dtype,
-            cpu_device,
+            device,
             generator,
             latents,
         )
         latents_dtype = latents.dtype
 
+        start_image_latents = None
+        if start_image is not None:
+            start_image = self.prepare_image_latents(start_image,
+                                                            width,
+                                                            height,
+                                                            batch_size,
+                                                            1,
+                                                            device,
+                                                            latents_dtype,)
+            
+            start_image_latents = self.prepare_ref_latents(start_image,
+                                                            batch_size,
+                                                            latents_dtype,
+                                                            device,
+                                                            generator,
+                                                            ).unsqueeze(0).permute(0, 2, 1, 3, 4)
+
         # Prepare extra step kwargs.
         extra_step_kwargs = self.prepare_extra_step_kwargs(generator, eta)
+        
+        # Denoising loop
+        print("video_length: ", video_length)
+        new_latents = None
+        num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
+        with self.progress_bar(total=num_inference_steps) as progress_bar:
+            for i, t in enumerate(timesteps):
+                print("t: ", t)
+                print("i: ", i)
 
-        # if the video_length is over 24 frames
-        # renderer the first 24 first
-        # then render the next 12 by each iterate
-        # noising the first 12 frames to the current timesteps
-        # add collect the last 12 frames then flip
-
-        output_latents = []
-
-        # create the indices for indexing into the latents
-        indices = last_n_indices(video_length, window_size, last_n)
- 
-        # TODO
-        # How can I overlap
-        # I need finished latents to noise up
-        # I can see how to do it with tedi
-        # train tedi to deal with 
-        # twelve frames that are before or after
-        # then bidirectionally lay down the latents
-        # use the current trained models with tedi
-        # to test the idea of bidirectionally rendering the 
-        # latents with twelve neighoring frames
-
-        # Okay is there another way to do this?
-        # the regions need to be random each timestep
-
-        # another idea is to not worry about prior latents
-        # instead just make random overlapping regions
-        # and assume it will work out
-        # this is the simplest actually
-        # just try sliding a window over the regions
-        # each time increment by one
-
-        last_n_latents = None
-
-        for p, partition_indices in enumerate(indices):
-            print("partition_indices: ", partition_indices)
-            latent_partition = latents[:, :, partition_indices[0]:partition_indices[1]].to(device)
-            print("latent_partition: ", latent_partition.shape)
-
-            partition_length = partition_indices[1] - partition_indices[0]
-
-            # Denoising loop
-            num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
-            with self.progress_bar(total=num_inference_steps) as progress_bar:
-                for i, t in enumerate(timesteps):
-                    print("t: ", t)
-                    print("i: ", i)
-                    print("latent_partition: ", latent_partition.shape)
-                    latent_partition = latent_partition[:, :, :partition_length]
-
-                    if last_n_latents is not None:
-                        # concat the last n latents with the current latents
-                        # noise code based on https://github.com/huggingface/diffusers/blob/5c404f20f4462bc07669280c9b9126a10196a34a/examples/community/stable_diffusion_controlnet_reference.py
-                        noise = randn_tensor(
-                            last_n_latents.shape, generator=generator, device=device, dtype=last_n_latents.dtype
+                # TODO try blending the latents near the image 
+                if start_image_latents is not None:
+                    # add the noised version of the image to the latents at the first step
+                    noise = randn_tensor(
+                            start_image_latents.shape, generator=generator, device=device, dtype=start_image_latents.dtype
                         )
-                        noised_last_n_latents = self.scheduler.add_noise(
-                            last_n_latents,
-                            noise,
-                            t.reshape(1,),
-                        )
-                        noised_last_n_latents = self.scheduler.scale_model_input(noised_last_n_latents, t)
-                        print("noised_last_n_latents: ", noised_last_n_latents.shape)
-                        latent_partition = torch.cat([noised_last_n_latents, latent_partition], dim=2)
-                        print("latent_partition: ", latent_partition.shape)
+                    noised_last_n_latents = self.scheduler.add_noise(
+                        start_image_latents,
+                        noise,
+                        t.reshape(1,),
+                    )
+                    noised_last_n_latents = self.scheduler.scale_model_input(noised_last_n_latents, t)
+                    print("noised_last_n_latents: ", noised_last_n_latents.shape)
+                    if new_latents is None:
+                        new_latents = torch.cat([noised_last_n_latents, latents], dim=2)
+                    else:
+                        actual_length = video_length + 1
+                        if i % actual_length == 0:
+                            offset_index = 0
+                        else:
+                            offset_index = actual_length - (i % actual_length)
+                        print("offset_index: ", offset_index)
+                        new_latents[:, :, offset_index, :, :] = noised_last_n_latents.squeeze(2)
+                    print("latent_partition: ", new_latents.shape)
+                else:
+                    if new_latents is None:
+                        new_latents = latents
 
-                    # expand the latents if we are doing classifier free guidance
-                    latent_model_input = torch.cat([latent_partition] * 2) if do_classifier_free_guidance else latent_partition
-                    latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
 
-                    # predict the noise residual
-                    noise_pred = self.unet(latent_model_input, 
-                                        t, 
-                                        encoder_hidden_states=text_embeddings
-                                        ).sample.to(dtype=latents_dtype)
-                    # perform guidance
-                    if do_classifier_free_guidance:
-                        noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
-                        noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
-
-                    # compute the previous noisy sample x_t -> x_t-1
-                    latent_partition = self.scheduler.step(noise_pred, t, latent_partition, **extra_step_kwargs).prev_sample
-
-                    # call the callback, if provided
-                    if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
-                        progress_bar.update()
-                        if callback is not None and i % callback_steps == 0:
-                            callback(i, t, latent_partition)
                 
-            last_latents = latent_partition.to(cpu_device)
-            if p == 0:
-                output_latents.append(last_latents)
-            else:
-                # diff the indices to get the length
-                last_count = partition_indices[1] - partition_indices[0]
-                print("last_count: ", last_count)
-                # slice the latents portion after last_n_count 
-                new_latents = last_latents[:, :, last_n:]
-                print("new_latents: ", new_latents.shape)
-                output_latents.append(new_latents)
-                # slice the latents portion so there are only last_n_count left
+                # expand the latents if we are doing classifier free guidance
+                latent_model_input = torch.cat([new_latents] * 2) if do_classifier_free_guidance else new_latents
+                latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
+
+                # predict the noise residual
+                noise_pred = self.unet(latent_model_input, 
+                                    t, 
+                                    encoder_hidden_states=text_embeddings
+                                    ).sample.to(dtype=latents_dtype)
+                # perform guidance
+                if do_classifier_free_guidance:
+                    noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+                    noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
+
+                # compute the previous noisy sample x_t -> x_t-1
+                new_latents = self.scheduler.step(noise_pred, t, new_latents, **extra_step_kwargs).prev_sample
+
+                actual_length = video_length + 1 if start_image_latents is not None else video_length
+                indices = list(range(1, actual_length)) + [0]
+                print("indices: ", indices)
+                indices = torch.tensor(indices, dtype=torch.long, device=new_latents.device)
+                new_latents = new_latents.index_select(2, indices)
+                
+
+                # call the callback, if provided
+                if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
+                    progress_bar.update()
+                    if callback is not None and i % callback_steps == 0:
+                        callback(i, t, new_latents)
             
-            last_n_latents = last_latents[:, :, -last_n:].to(device)
-            print("last_n_latents: ", last_n_latents.shape)
 
-        print("output_latents: ", len(output_latents))
 
-        # concat the output latents
-        output_latents = torch.cat(output_latents, dim=2)
-        print("output_latents: ", output_latents.shape)
         # Post-processing
-        video = self.decode_latents(output_latents, device)
+        video = self.decode_latents(new_latents, device)
 
         # Convert to tensor
         if output_type == "tensor":

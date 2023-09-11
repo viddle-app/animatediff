@@ -32,7 +32,7 @@ from diffusers.utils import (
 
 from einops import rearrange
 from diffusers.pipelines.controlnet.multicontrolnet import MultiControlNetModel
-from diffusers.models.controlnet import ControlNetModel
+from ..models.controlnet import ControlNetModel
 from diffusers.image_processor import VaeImageProcessor
 from diffusers.pipelines.stable_diffusion.safety_checker import StableDiffusionSafetyChecker
 from transformers import CLIPImageProcessor, CLIPTextModel, CLIPTokenizer
@@ -358,6 +358,9 @@ class StableDiffusionControlNetPipeline(
             )
             prompt_embeds = prompt_embeds[0]
 
+        print("self.text_encoder.dtype: ", self.text_encoder.dtype)
+        print("prompt_embeds.dtype: ", prompt_embeds.dtype)
+        print("self.unet.dtype: ", self.unet.dtype)
         if self.text_encoder is not None:
             prompt_embeds_dtype = self.text_encoder.dtype
         elif self.unet is not None:
@@ -567,8 +570,8 @@ class StableDiffusionControlNetPipeline(
             or is_compiled
             and isinstance(self.controlnet._orig_mod, ControlNetModel)
         ):
-            if not isinstance(controlnet_conditioning_scale, float):
-                raise TypeError("For single controlnet: `controlnet_conditioning_scale` must be type `float`.")
+            if not isinstance(controlnet_conditioning_scale, float) and not isinstance(controlnet_conditioning_scale, torch.Tensor):
+                raise TypeError("For single controlnet: `controlnet_conditioning_scale` must be type `float`.", type(controlnet_conditioning_scale))
         elif (
             isinstance(self.controlnet, MultiControlNetModel)
             or is_compiled
@@ -953,6 +956,7 @@ class StableDiffusionControlNetPipeline(
             controlnet_keep.append(keeps[0] if isinstance(controlnet, ControlNetModel) else keeps)
 
         # 8. Denoising loop
+        print("latent", latents.shape, latents.dtype)
         num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             for i, t in enumerate(timesteps):
@@ -983,7 +987,11 @@ class StableDiffusionControlNetPipeline(
                 # duplicate the controlnet_prompt_embeds video_length times
                 controlnet_prompt_embeds = controlnet_prompt_embeds.repeat_interleave(video_length, dim=0)
 
-                print("control_model_input", control_model_input.shape)
+                if isinstance(cond_scale, torch.Tensor):
+                    cond_scale = cond_scale.to(device=device, dtype=controlnet.dtype)
+                    cond_scale = torch.cat([cond_scale] * 2) if do_classifier_free_guidance and not guess_mode else cond_scale
+
+                print("control_model_input", control_model_input.shape, control_model_input.dtype)
                 print("image", image.shape)
                 print("controlnet_prompt_embeds", controlnet_prompt_embeds.shape)
                 print("cond_scale", cond_scale)
@@ -997,7 +1005,7 @@ class StableDiffusionControlNetPipeline(
                     return_dict=False,
                 )
 
-                samples_batch = batch_size * 2 if do_classifier_free_guidance else batch_size
+                samples_batch = batch_size * 2 if do_classifier_free_guidance and not guess_mode else batch_size
 
                 # reshape the controlnet samples
                 down_block_res_samples = [

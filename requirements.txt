@@ -10,3 +10,5 @@ omegaconf
 imageio
 decord
 xformers
+lpips
+bitsandbytes
