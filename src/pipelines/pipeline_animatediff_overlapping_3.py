@@ -405,6 +405,8 @@ class AnimationPipeline(DiffusionPipeline, FromSingleFileMixin):
         partition_count = 2 * (video_length // window_length  + remainder)
         
         latents_shape = latents.shape
+        target_noise = None
+        target_latent = None
 
         # Denoising loop
         print("window_length: ", window_length)
@@ -452,34 +454,55 @@ class AnimationPipeline(DiffusionPipeline, FromSingleFileMixin):
                                         t, 
                                         encoder_hidden_states=text_embeddings
                                         ).sample.to(dtype=latents_dtype)
+                    
+
                     # perform guidance
                     if do_classifier_free_guidance:
                         noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
                         noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
+
+                                        # if the partition_indices has a zero in it, then 
+                    # that entries index should be extracted and set the target_noise_pred
+                    float_latents_partition = latent_partition.float()
+                    if isinstance(partition_indices, tuple):
+                        # check it the zero is in the expanded indices
+                        if 0 in partition_indices_expanded:
+                            print("0 in partition_indices_expanded")
+                            # get the index of the zero
+                            index_of_zero = partition_indices_expanded.index(0)
+                            # get the target_noise_pred
+                            target_noise = noise_pred[:, :, index_of_zero:index_of_zero+1]
+                            target_latent = float_latents_partition[:, :, index_of_zero:index_of_zero+1]
+                    elif 0 in partition_indices:
+                            print("0 in partition_indices")
+                            # get the index of the zero
+                            index_of_zero = partition_indices.index(0)
+                            # get the target_noise_pred
+                            target_noise = noise_pred[:, :, index_of_zero:index_of_zero+1]
+                            target_latent = float_latents_partition[:, :, index_of_zero:index_of_zero+1]
+
                     
                     do_x_0_guidance = True
                     if do_x_0_guidance:
-                        alpha_prod_t = self.scheduler.alphas_cumprod[ct]
+                        step_index = (self.scheduler.timesteps == t).nonzero().item()
+                        alpha_prod_t = self.scheduler.alphas_cumprod[step_index]
                         beta_prod_t = 1 - alpha_prod_t
-                        float_latents_partition = latent_partition.float()
+                        
                         current_noise_pred_weight = 1.0
                         with torch.enable_grad():
                                 
                                 clone_noise_pred = noise_pred.clone().float().detach().requires_grad_()
                                 
-                                num_steps = 40
+                                num_steps = 100
 
                                 # Learning rate
-                                lr = 1e-2
+                                lr = 1e-3
                                 optimizer = torch.optim.Adam([clone_noise_pred], lr=lr)
 
                                 # randomly pick a frame from the partition
                                 # random_frame = np.random.randint(0, window_length)
-                                random_frame = 0
+                                # random_frame = 0
 
-                                # create a 
-                                target_noise = noise_pred[:, :, random_frame:random_frame+1]
-                                target_latent = float_latents_partition[:, :, random_frame:random_frame+1]
                                 # compute the predicted sample of the target_noise
                                 target_predicted_sample = (target_latent - beta_prod_t ** (0.5) * target_noise) / alpha_prod_t ** (0.5)
                                 # reshape the target_predicted_sample to be the same size as the clone_noise_pred
@@ -506,10 +529,10 @@ class AnimationPipeline(DiffusionPipeline, FromSingleFileMixin):
 
                                 # replace the clone_noise_pred at the random_frame with the original
                                  
-                                original = noise_pred[:, :, random_frame:random_frame+1]
+                                original = noise_pred[:, :, index_of_zero:index_of_zero+1]
 
                                 noise_pred = (1.0 - current_noise_pred_weight) * noise_pred + current_noise_pred_weight * clone_noise_pred.to(latents_dtype)
-                                noise_pred[:, :, random_frame:random_frame+1] = original
+                                noise_pred[:, :, index_of_zero:index_of_zero+1] = original
 
 
                     # compute the previous noisy sample x_t -> x_t-1

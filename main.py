@@ -5,7 +5,7 @@ from pathlib import Path
 import random
 import sys
 import uuid
-use_type = 'overlapping'
+use_type = 'overlapping_3'
 if use_type == 'overlapping':
   from src.pipelines.pipeline_animatediff_overlapping import AnimationPipeline
 elif use_type == 'circular':
@@ -178,8 +178,8 @@ def run(model,
         text_encoder=text_encoder, 
         tokenizer=tokenizer, 
         unet=unet,
-        # scheduler=DDIMScheduler(**scheduler_kwargs),
-        scheduler=EulerAncestralDiscreteScheduler(**scheduler_kwargs),
+        scheduler=DDIMScheduler(**scheduler_kwargs),
+        # scheduler=EulerAncestralDiscreteScheduler(**scheduler_kwargs),
       ).to(device)
 
       # set_upcast_softmax_to_false(pipeline)
@@ -205,8 +205,8 @@ def run(model,
   if seed is None:
     seed = random.randint(-sys.maxsize, sys.maxsize)
 
-  # generators = [torch.Generator().manual_seed(seed) for _ in range(window_count)]
-  generators = torch.Generator().manual_seed(seed)
+  generators = [torch.Generator().manual_seed(seed) for _ in range(window_count)]
+  # generators = torch.Generator().manual_seed(seed)
 
   if use_controlnet: 
     # load 16 frames from the directory
@@ -325,38 +325,42 @@ if __name__ == "__main__":
   # prompt = "paint by frazetta, man dancing, mountain blue sky in background"
   # prompt = "neon glowing psychedelic man dancing, photography, award winning, gorgous, highly detailed"
   # prompt = "Cute Chunky anthropomorphic Siamese cat dressed in rags walking down a rural road, mindblowing illustration by Jean-Baptiste Monge + Emily Carr + Tsubasa Nakai"
-  # prompt = "A man standing in front of an event horizon, 16k HDR, hyper realistic, cinematic, photography, designed by daniel arsham, glowing white, futuristic, detailed white liquid, directed by stanley kubrick"
+  # prompt = "close up of A man walking in front of cityscape, movie production, cinematic, photography, designed by daniel arsham, glowing white, futuristic, white liquid, highly detailed, 35mm"
   # prompt = "closeup of A woman dancing in front of a secret garden, early renaissance paintings, Rogier van der Weyden paintings style"
   # prompt = "close up portrait of a woman in front of a lake artwork by Kawase Hasui"
   # prompt = "A lego ninja bending down to pick a flower in the style of the lego movie. High quality render by arnold. Animal logic. 3D soft focus"
   # prompt = "Glowing jellyfish, calm, slow hypnotic undulations, 35mm Nature photography, award winning"
-  # prompt = "synthwave retrowave vaporware back of delorean driving on highway, neon lights, palm trees and sunset in background, nightcity"
+  prompt = "synthwave retrowave vaporware back of a delorean driving on highway, dmc rear grill, neon lights, palm trees and sunset in background, nightcity"
   # prompt = "a doodle of a bear dancing, scribble, messy, stickfigure, badly drawn"
   # prompt = "close up of Embrodery Elijah Wood smiling in front of a embroidery landscape"
-  prompt = "photo of a tom cruise statue made of ice, model shoot, empty black background"
+  # prompt = "photo of a tom cruise statue made of ice, model shoot, empty black background"
+  # prompt = "watermeloncarving, Terra Cotta Warriors,full body dancing"
+  # prompt = "A doll walking in the forest jan svankmajer, brother quay style stop action animation"
   # model = Path("../models/dreamshaper-6")
   # model = Path("../models/deliberate_v2")
   # lora_file="Frazetta.safetensors"
-  # lora_files=["NightCity.safetensors", "dmc12-000006.safetensors"]
+  lora_files=["NightCity.safetensors", "dmc12-000006.safetensors"]
   # lora
   # lora_files = ["doodle.safetensors"]
   # lora_files = ["kEmbroideryRev.safetensors"]
-  lora_files = ["made_of_ice.safetensors"]
-  # lora_files=[]
+  # lora_files = ["made_of_ice.safetensors"]
+  # lora_files = ["watermeloncarving-000004.safetensors"]
+  lora_files=[]
   # TODO the multidiffusion successor probably has the answer for duration
 
   # lora_file=None
   # lora_file
-  # model = "/mnt/newdrive/automatic1111/models/Stable-diffusion/dreamshaper_8.safetensors"
-  model = "/mnt/newdrive/automatic1111/models/Stable-diffusion/deliberate_v2.safetensors"
+  # model = "/mnt/newdrive/automatic1111/models/Stable-diffusion/dreamshaper_6BakedVae.safetensors"
+  model = "/mnt/newdrive/automatic1111/models/Stable-diffusion/dreamshaper_8.safetensors"
+  # model = "/mnt/newdrive/automatic1111/models/Stable-diffusion/deliberate_v2.safetensors"
   run(model, 
       prompt=prompt,
       negative_prompt="clone, cloned, bad anatomy, wrong anatomy, mutated hands and fingers, mutation, mutated, amputation, 3d render, lowres, signs, memes, labels, text, error, mutant, worst quality, low quality, normal quality, jpeg artifacts, signature, watermark, username, blurry, made by children, caricature, ugly, boring, sketch, lacklustre, repetitive, cropped, (long neck), body horror, out of frame, mutilated, tiled, frame, border",
       height=512,
       width=512,
-      frame_count=24,
+      frame_count=48,
       window_count=24,
-      num_inference_steps=20,
+      num_inference_steps=50,
       guidance_scale=7.0,
       last_n=23,
       lora_folder="/mnt/newdrive/automatic1111/models/Lora",

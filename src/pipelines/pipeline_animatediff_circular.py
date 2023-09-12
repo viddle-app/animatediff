@@ -543,13 +543,13 @@ class AnimationPipeline(DiffusionPipeline, FromSingleFileMixin):
                     noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
 
                 # compute the previous noisy sample x_t -> x_t-1
-                new_latents = self.scheduler.step(noise_pred, t, new_latents, **extra_step_kwargs).prev_sample
+                next_latents = self.scheduler.step(noise_pred, t, new_latents, **extra_step_kwargs).prev_sample
 
                 actual_length = video_length + 1 if start_image_latents is not None else video_length
                 indices = list(range(1, actual_length)) + [0]
                 print("indices: ", indices)
-                indices = torch.tensor(indices, dtype=torch.long, device=new_latents.device)
-                new_latents = new_latents.index_select(2, indices)
+                # indices = torch.tensor(indices, dtype=torch.long, device=new_latents.device)
+                new_latents[:, :, indices, :, :] = next_latents
                 
 
                 # call the callback, if provided
