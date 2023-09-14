@@ -278,7 +278,11 @@ class VersatileAttention(Attention):
     def extra_repr(self):
         return f"(Module Info) Attention_Mode: {self.attention_mode}, Is_Cross_Attention: {self.is_cross_attention}"
 
-    def forward(self, hidden_states, encoder_hidden_states=None, attention_mask=None, video_length=None):
+    def forward(self, 
+                hidden_states, 
+                encoder_hidden_states=None, 
+                attention_mask=None, 
+                video_length=None):
         batch_size, sequence_length, _ = hidden_states.shape
 
         if self.attention_mode == "Temporal":
@@ -305,6 +309,12 @@ class VersatileAttention(Attention):
             raise NotImplementedError
 
         encoder_hidden_states = encoder_hidden_states if encoder_hidden_states is not None else hidden_states
+        # concat on the the encoder_hidden_states 
+        # the first frames features duplicated 5 times
+        if False:
+            first_frame_states = encoder_hidden_states[:, 0:1, :]
+            first_frame_states_repeated = first_frame_states.repeat_interleave(32, dim=1)
+            encoder_hidden_states = torch.cat([encoder_hidden_states, first_frame_states_repeated], dim=1)
         key = self.to_k(encoder_hidden_states)
         value = self.to_v(encoder_hidden_states)
 

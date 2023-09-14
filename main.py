@@ -5,7 +5,8 @@ from pathlib import Path
 import random
 import sys
 import uuid
-use_type = 'overlapping_3'
+import torch.nn.functional as F
+use_type = 'init_image'
 if use_type == 'overlapping':
   from src.pipelines.pipeline_animatediff_overlapping import AnimationPipeline
 elif use_type == 'circular':
@@ -18,6 +19,8 @@ elif use_type == 'overlapping_4':
   from src.pipelines.pipeline_animatediff_overlapping_4 import AnimationPipeline
 elif use_type == 'reference':
   from src.pipelines.pipeline_animatediff_reference import AnimationPipeline
+elif use_type == "init_image":
+  from src.pipelines.pipeline_animatediff_init_image import AnimationPipeline
 else:
   from src.pipelines.pipeline_animatediff import AnimationPipeline
 from src.pipelines.pipeline_animatediff_controlnet import StableDiffusionControlNetPipeline
@@ -30,6 +33,32 @@ import cv2
 from src.models.controlnet import ControlNetModel
 from PIL import Image
 from src.utils.image_utils import create_gif, create_mp4_from_images, tensor_to_image_sequence
+from diffusers.utils import randn_tensor
+
+def make_progressive_latents(frames, height, width, alpha=0.5, dtype=torch.float16):
+  # Assuming B, C, H, W, and alpha are given
+  B, C, H, W = frames, 4, height, width  # example values, you should replace with your own
+
+
+  # Initialize the tensor for the first frame
+  epsilon_0 = torch.randn(C, H, W).half()
+
+  # Create a list to hold all frames, starting with the first frame
+  frames = [epsilon_0]
+
+  # Generate the rest of the frames
+  for i in range(1, B):  # now we are assuming the number of frames equals to batch size B
+      # Generate independent noise for the current frame
+      epsilon_ind = torch.randn(C, H, W, dtype=dtype) / torch.sqrt(torch.tensor(1.0 + alpha**2))
+
+      # Generate noise for the current frame based on the noise from the previous frame and the independent noise
+      epsilon_i = (alpha / torch.sqrt(torch.tensor(1.0 + alpha**2))) * frames[i-1] + epsilon_ind
+
+      # Add the current frame to the list of frames
+      frames.append(epsilon_i)
+
+  # Stack all frames along a new dimension (the batch dimension) to get a 5D tensor
+  return torch.stack(frames, dim=0)
 
 def set_upcast_softmax_to_false(obj):
     # If the object has the attribute 'upcast_softmax', set it to False
@@ -50,6 +79,126 @@ def set_upcast_softmax_to_false(obj):
     elif hasattr(obj, '__dict__'):
         for attr in obj.__dict__.values():
             set_upcast_softmax_to_false(attr)
+
+def make_preencoded_image_latents(pipe, init_latents, device, dtype, generator, timestep, noise_multiplier=1.0):
+  shape = init_latents.shape
+  # noise = randn_tensor(shape, generator=generator, device=device, dtype=dtype)'
+  # noise = make_progressive_latents(shape[0], shape[2], shape[3], alpha=50)
+  noise = randn_tensor(shape, generator=generator, device=device, dtype=dtype)  
+  # get latents
+  return pipe.scheduler.add_noise(init_latents, noise*noise_multiplier, timestep)
+
+def get_timesteps(pipe, num_inference_steps, strength, device):
+    # get the original timestep using init_timestep
+    init_timestep = min(int(num_inference_steps * strength), num_inference_steps)
+
+    t_start = max(num_inference_steps - init_timestep, 0)
+    timesteps = pipe.scheduler.timesteps[t_start * pipe.scheduler.order :]
+
+    return timesteps, num_inference_steps - t_start
+
+def encode_image_to_latent(pipe, image, generator, dtype):
+    cuda_device = torch.device("cuda:0")
+    image = image.to(device=cuda_device, dtype=dtype).unsqueeze(0)
+    image = (2 * image - 1).clamp(-1, 1)
+
+    # convert to a latent
+    print("image", image.shape)
+    the_latent = pipe.vae.encode(image).latent_dist.sample(generator).cpu()
+
+    del image
+
+    the_latent = pipe.vae.config.scaling_factor * the_latent
+
+    return the_latent
+
+
+def make_preencoded_latents(pipe,
+                 num_inference_steps,
+                 device,
+                 dtype,
+                 generator,
+                 noise_image,
+                 strength = 0.25,
+                 noise_multiplier=1.0,
+                 ):
+
+    pipe.scheduler.set_timesteps(num_inference_steps, device=device)
+    timesteps, num_inference_steps = get_timesteps(pipe,
+                                                   num_inference_steps,
+                                                   strength,
+                                                   device)
+
+    latent_timestep = timesteps[:1].repeat(noise_image.shape[0])
+    print("latent_timestep", latent_timestep)
+
+    print("noise_image", noise_image.shape)
+
+    # noise_image=pipe.image_processor.preprocess(noise_image)
+    return make_preencoded_image_latents(pipe=pipe,
+                                init_latents=noise_image,
+                                device=device,
+                                dtype=dtype,
+                                generator=generator,
+                                timestep=latent_timestep,
+                                noise_multiplier=noise_multiplier
+                                ), timesteps, num_inference_steps
+
+
+
+def upscale(pipeline, 
+            video, 
+            height, 
+            width, 
+            dtype, 
+            seed, 
+            frame_count, 
+            num_inference_steps, 
+            prompt, 
+            negative_prompt, 
+            guidance_scale,
+            strength=0.25,):
+    video = video.permute(1, 0, 2, 3)
+        # upscale the video resolution 2x
+    video = F.interpolate(video, size=(height, width), mode="bilinear")
+    gen = torch.Generator().manual_seed(seed)
+    
+    encoded_frames = []
+    for frame_index in range(video.shape[0]):
+      frame = video[frame_index]
+      with torch.no_grad():
+        encoded_frames.append(encode_image_to_latent(pipeline, 
+                                                  frame, 
+                                                  generator=gen, 
+                                                  dtype=dtype))
+      torch.cuda.empty_cache()
+    
+    encoded_video = torch.concat(encoded_frames)
+    print("encoded_video", encoded_video.shape)
+
+    cpu_device = torch.device("cpu")
+
+    latents, timesteps, _ = make_preencoded_latents(pipe=pipeline,
+                            num_inference_steps=num_inference_steps,
+                            device=cpu_device,
+                            dtype=dtype,
+                            generator=gen,
+                            noise_image=encoded_video,
+                            strength = 0.25,
+                            noise_multiplier=1.0,
+                            )
+    latents = latents.unsqueeze(0).permute(0, 2, 1, 3, 4)
+    return pipeline(prompt=prompt, 
+                negative_prompt=negative_prompt, 
+                num_inference_steps=num_inference_steps,
+                guidance_scale=guidance_scale,
+                  width=width,
+                  height=height,
+                  video_length=frame_count, 
+                  latents=latents, 
+                  timesteps=timesteps,
+                  do_init_noise=False).videos[0]
+
 
 def tensor_to_video(tensor, output_path, fps=30):
     """
@@ -178,8 +327,8 @@ def run(model,
         text_encoder=text_encoder, 
         tokenizer=tokenizer, 
         unet=unet,
-        scheduler=DDIMScheduler(**scheduler_kwargs),
-        # scheduler=EulerAncestralDiscreteScheduler(**scheduler_kwargs),
+        # scheduler=DDIMScheduler(**scheduler_kwargs),
+        scheduler=EulerAncestralDiscreteScheduler(**scheduler_kwargs),
       ).to(device)
 
       # set_upcast_softmax_to_false(pipeline)
@@ -207,6 +356,8 @@ def run(model,
 
   generators = [torch.Generator().manual_seed(seed) for _ in range(window_count)]
   # generators = torch.Generator().manual_seed(seed)
+
+  do_upscale = False
 
   if use_controlnet: 
     # load 16 frames from the directory
@@ -265,12 +416,74 @@ def run(model,
                             window_count=window_count,
                       video_length=frame_count,
                       generator=generators).videos[0]
+    elif use_type == "init_image":
+      init_image = Image.open("mona-lisa-1.jpg")
+
+      # convert the Image to a tensor
+      generator = torch.Generator().manual_seed(seed)
+      init_image = pipeline.image_processor.preprocess(init_image).to(device=device, dtype=dtype)
+      print("init_image", init_image.shape)
+      encoded_image = pipeline.vae.encode(init_image).latent_dist.sample(generator).cpu()
+      encoded_image = pipeline.vae.config.scaling_factor * encoded_image
+
+      encoded_video = encoded_image.repeat(frame_count, 1, 1, 1)
+      print("encoded_video", encoded_video.shape)
+
+      cpu_device = torch.device("cpu")
+
+      latents, timesteps, _ = make_preencoded_latents(pipe=pipeline,
+                              num_inference_steps=num_inference_steps,
+                              device=cpu_device,
+                              dtype=dtype,
+                              generator=generator,
+                              noise_image=encoded_video,
+                              strength = 0.50,
+                              noise_multiplier=1.0,
+                              )
+      print("time steps", len(timesteps))
+      latents = latents.unsqueeze(0).permute(0, 2, 1, 3, 4)
+
+      video = pipeline(prompt=prompt,
+                        negative_prompt=negative_prompt,
+                        num_inference_steps=num_inference_steps,
+                        guidance_scale=guidance_scale,
+                        width=width,
+                        height=height,
+                        video_length=frame_count,
+                        init_image=init_image, 
+                        latents=latents,
+                        timesteps=timesteps,
+                        do_init_noise=False,
+                        ).videos[0]
     elif use_type == 'circular':
       # load a init image 
       
       # init_image = Image.open("0000.png")
-      init_image = None
+      init_image = Image.open("byct.jpg")
+      generator = torch.Generator().manual_seed(seed)
+      init_image = pipeline.image_processor.preprocess(init_image).to(device=device, dtype=dtype)
+      print("init_image", init_image.shape)
+      encoded_image = pipeline.vae.encode(init_image).latent_dist.sample(generator).cpu()
+      encoded_image = pipeline.vae.config.scaling_factor * encoded_image
 
+      encoded_video = encoded_image.repeat(frame_count, 1, 1, 1)
+      print("encoded_video", encoded_video.shape)
+
+      cpu_device = torch.device("cpu")
+
+      latents, timesteps, _ = make_preencoded_latents(pipe=pipeline,
+                              num_inference_steps=num_inference_steps,
+                              device=cpu_device,
+                              dtype=dtype,
+                              generator=generator,
+                              noise_image=encoded_video,
+                              strength = 0.65,
+                              noise_multiplier=1.0,
+                              )
+      print("time steps", len(timesteps))
+      latents = latents.unsqueeze(0).permute(0, 2, 1, 3, 4)
+
+      
       video = pipeline(prompt=prompt, 
             negative_prompt=negative_prompt, 
             num_inference_steps=num_inference_steps,
@@ -278,7 +491,49 @@ def run(model,
               width=width,
               height=height,
               video_length=frame_count,
-              start_image = init_image).videos[0]
+              start_image = init_image,
+              latents=latents,
+              timesteps=timesteps,
+              do_init_noise=False).videos[0]
+      
+      if do_upscale:
+
+        # save the video 
+        # torch.save(video, "video.pt")
+        # video = torch.load("video.pt")
+
+        
+        # upscale the video resolution 2x
+        video = upscale(pipeline,
+                video,
+                height*2,
+                width*2,
+                dtype,
+                seed,
+                frame_count,
+                num_inference_steps,
+                prompt,
+                negative_prompt,
+                guidance_scale,
+                strength=0.75,
+                )
+        
+        # video = upscale(pipeline,
+        #         video,
+        #         height*4,
+        #         width*4,
+        #         dtype,
+        #         seed,
+        #         frame_count,
+        #         num_inference_steps,
+        #         prompt,
+        #         negative_prompt,
+        #         guidance_scale,
+        #         strength=0.25,
+        #         )
+
+
+                         
     
     elif use_type == 'reference':
       video = pipeline(prompt=prompt, 
@@ -299,8 +554,9 @@ def run(model,
                       width=width,
                       height=height,
                       video_length=frame_count).videos[0]
-  
-   
+      
+
+
     # save the tensor 
     # torch.save(video, output_path + ".pt")
 
@@ -320,18 +576,21 @@ def run(model,
 # prompt="highly detail, Most Beautiful, extremely detailed book illustration of a woman fully clothed swaying, in the style of kay nielsen, dark white and light orange, apollinary vasnetsov, intricate embellishments, indonesian art, captivating gaze, by Kay Nielsen",
 
 if __name__ == "__main__":
-  # prompt = "photograph of a bald caucasian man listening"
+  # prompt = "photograph of a bald man laughing"
+  # prompt = "photograph of a man scared"
+  prompt = "A woman laughing"
   # prompt = "close up of a Girl's face swaying, red blouse, illustration by Wu guanzhong,China village,twojjbe trees in front of my chinese house,light orange, pink,white,blue ,8k"
   # prompt = "paint by frazetta, man dancing, mountain blue sky in background"
   # prompt = "neon glowing psychedelic man dancing, photography, award winning, gorgous, highly detailed"
   # prompt = "Cute Chunky anthropomorphic Siamese cat dressed in rags walking down a rural road, mindblowing illustration by Jean-Baptiste Monge + Emily Carr + Tsubasa Nakai"
-  # prompt = "close up of A man walking in front of cityscape, movie production, cinematic, photography, designed by daniel arsham, glowing white, futuristic, white liquid, highly detailed, 35mm"
-  # prompt = "closeup of A woman dancing in front of a secret garden, early renaissance paintings, Rogier van der Weyden paintings style"
+  # prompt = "close up of A man walking, movie production, cinematic, photography, designed by daniel arsham, glowing white, futuristic, white liquid, highly detailed, 35mm"
+  # prompt = "closeup of A woman dancing in front of a secret garden, upper body headshot, early renaissance paintings, Rogier van der Weyden paintings style"
   # prompt = "close up portrait of a woman in front of a lake artwork by Kawase Hasui"
   # prompt = "A lego ninja bending down to pick a flower in the style of the lego movie. High quality render by arnold. Animal logic. 3D soft focus"
   # prompt = "Glowing jellyfish, calm, slow hypnotic undulations, 35mm Nature photography, award winning"
-  prompt = "synthwave retrowave vaporware back of a delorean driving on highway, dmc rear grill, neon lights, palm trees and sunset in background, nightcity"
+  # prompt = "synthwave retrowave vaporware back of a delorean driving on highway, dmc rear grill, neon lights, palm trees and sunset in background, nightcity"
   # prompt = "a doodle of a bear dancing, scribble, messy, stickfigure, badly drawn"
+  # prompt = "woman laughing"
   # prompt = "close up of Embrodery Elijah Wood smiling in front of a embroidery landscape"
   # prompt = "photo of a tom cruise statue made of ice, model shoot, empty black background"
   # prompt = "watermeloncarving, Terra Cotta Warriors,full body dancing"
@@ -339,7 +598,7 @@ if __name__ == "__main__":
   # model = Path("../models/dreamshaper-6")
   # model = Path("../models/deliberate_v2")
   # lora_file="Frazetta.safetensors"
-  lora_files=["NightCity.safetensors", "dmc12-000006.safetensors"]
+  # lora_files=["NightCity.safetensors", "dmc12-000006.safetensors"]
   # lora
   # lora_files = ["doodle.safetensors"]
   # lora_files = ["kEmbroideryRev.safetensors"]
@@ -351,18 +610,20 @@ if __name__ == "__main__":
   # lora_file=None
   # lora_file
   # model = "/mnt/newdrive/automatic1111/models/Stable-diffusion/dreamshaper_6BakedVae.safetensors"
-  model = "/mnt/newdrive/automatic1111/models/Stable-diffusion/dreamshaper_8.safetensors"
+  # model = "/mnt/newdrive/automatic1111/models/Stable-diffusion/dreamshaper_8.safetensors"
   # model = "/mnt/newdrive/automatic1111/models/Stable-diffusion/deliberate_v2.safetensors"
+  model = "/mnt/newdrive/automatic1111/models/Stable-diffusion/absolutereality_v181.safetensors"
   run(model, 
       prompt=prompt,
       negative_prompt="clone, cloned, bad anatomy, wrong anatomy, mutated hands and fingers, mutation, mutated, amputation, 3d render, lowres, signs, memes, labels, text, error, mutant, worst quality, low quality, normal quality, jpeg artifacts, signature, watermark, username, blurry, made by children, caricature, ugly, boring, sketch, lacklustre, repetitive, cropped, (long neck), body horror, out of frame, mutilated, tiled, frame, border",
       height=512,
       width=512,
-      frame_count=48,
-      window_count=24,
-      num_inference_steps=50,
+      frame_count=16,
+      window_count=16,
+      num_inference_steps=20,
       guidance_scale=7.0,
       last_n=23,
+      dtype=torch.float32,
       lora_folder="/mnt/newdrive/automatic1111/models/Lora",
       lora_files=lora_files)
 

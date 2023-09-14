@@ -66,7 +66,7 @@ def create_mp4_from_images(images_folder, output_path, fps=15):
     os.system(cmd)
 
 if __name__ == "__main__":
-    # create_mp4_from_images("images", "output.mp4", fps=15)
+    create_mp4_from_images("images", "output.mp4", fps=15)
     images = glob.glob("images/*.png")
     images.sort()
     create_gif(images, "output.gif", duration=1000/15, loop=0)

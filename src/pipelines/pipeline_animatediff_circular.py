@@ -32,6 +32,7 @@ from einops import rearrange
 from ..utils.partition_utils import circular_shift
 
 from ..models.unet import UNet3DConditionModel
+from diffusers.image_processor import VaeImageProcessor
 
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
@@ -118,6 +119,7 @@ class AnimationPipeline(DiffusionPipeline, FromSingleFileMixin):
             scheduler=scheduler,
         )
         self.vae_scale_factor = 2 ** (len(self.vae.config.block_out_channels) - 1)
+        self.image_processor = VaeImageProcessor(vae_scale_factor=self.vae_scale_factor)
 
     def enable_vae_slicing(self):
         self.vae.enable_slicing()
@@ -288,7 +290,17 @@ class AnimationPipeline(DiffusionPipeline, FromSingleFileMixin):
                 f" {type(callback_steps)}."
             )
 
-    def prepare_latents(self, batch_size, num_channels_latents, video_length, height, width, dtype, device, generator, latents=None):
+    def prepare_latents(self, 
+                        batch_size, 
+                        num_channels_latents, 
+                        video_length, 
+                        height, 
+                        width, 
+                        dtype, 
+                        device, 
+                        generator, 
+                        latents=None, 
+                        init_noise=True):
         shape = (batch_size, num_channels_latents, video_length, height // self.vae_scale_factor, width // self.vae_scale_factor)
         if isinstance(generator, list) and len(generator) != batch_size * video_length:
             raise ValueError(
@@ -315,11 +327,14 @@ class AnimationPipeline(DiffusionPipeline, FromSingleFileMixin):
 
         # scale the initial noise by the standard deviation required by the scheduler
         # check if the init_noise_sigma is a tensor
-        if isinstance(self.scheduler.init_noise_sigma, torch.Tensor):
-            latents = latents * self.scheduler.init_noise_sigma.to(device)
-        else:
-            latents = latents * self.scheduler.init_noise_sigma
+        if init_noise:
+            if isinstance(self.scheduler.init_noise_sigma, torch.Tensor):
+                latents = latents * self.scheduler.init_noise_sigma.to(device)
+            else:
+                latents = latents * self.scheduler.init_noise_sigma
+        
         return latents
+        
 
     def prepare_image_latents(
         self,
@@ -417,6 +432,8 @@ class AnimationPipeline(DiffusionPipeline, FromSingleFileMixin):
         callback: Optional[Callable[[int, int, torch.FloatTensor], None]] = None,
         callback_steps: Optional[int] = 1,
         start_image: Optional[Image.Image] = None,
+        do_init_noise: bool = True,
+        timesteps: Optional[torch.Tensor] = None,
         **kwargs,
 
     ):
@@ -451,7 +468,8 @@ class AnimationPipeline(DiffusionPipeline, FromSingleFileMixin):
 
         # Prepare timesteps
         self.scheduler.set_timesteps(num_inference_steps, device=device)
-        timesteps = self.scheduler.timesteps
+        if timesteps is None:
+            timesteps = self.scheduler.timesteps
 
         # Prepare latent variables
 
@@ -466,6 +484,7 @@ class AnimationPipeline(DiffusionPipeline, FromSingleFileMixin):
             device,
             generator,
             latents,
+            do_init_noise
         )
         latents_dtype = latents.dtype
 
