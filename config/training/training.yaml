@@ -1,7 +1,7 @@
 image_finetune: false
 
 output_dir: "outputs"
-pretrained_model_path: "../models/v1-5"
+pretrained_model_path: "../automatic1111/models/Stable-diffusion/v1-5-pruned.ckpt"
 
 unet_additional_kwargs:
   use_motion_module              : true
@@ -31,7 +31,7 @@ train_data:
   csv_path:        "data/output.csv"
   video_folder:    "data/videos"
   sample_size:     256
-  sample_stride:   4
+  sample_stride:   1
   sample_n_frames: 16
 
 validation_data:
@@ -46,19 +46,19 @@ validation_data:
 trainable_modules:
   - "motion_modules."
 
-unet_checkpoint_path: "outputs/training-2023-09-05T11-02-35/checkpoints/checkpoint.ckpt"
+unet_checkpoint_path: ""
 
-learning_rate:    1.e-4
-train_batch_size: 4
+learning_rate:    1.e-5
+train_batch_size: 1
 gradient_checkpointing: True
-gradient_accumulation_steps: 1
+gradient_accumulation_steps: 4
 
 max_train_epoch:      -1
-max_train_steps:      1000000
+max_train_steps:      20000
 checkpointing_epochs: -1
-checkpointing_steps:  10000
+checkpointing_steps:  2500
 
-validation_steps:       5000
+validation_steps:       1000
 validation_steps_tuple: []
 
 global_seed: 42
@@ -66,3 +66,4 @@ mixed_precision_training: true
 enable_xformers_memory_efficient_attention: False
 
 is_debug: False
+num_workers: 32

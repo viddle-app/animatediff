@@ -7,6 +7,7 @@ from torch import nn
 from .attention import Transformer3DModel
 from .resnet import Downsample3D, ResnetBlock3D, Upsample3D
 from .motion_module import get_motion_module
+# from .motion_module_previous_window import get_motion_module
 
 import pdb
 
@@ -256,6 +257,16 @@ class UNetMidBlock3DCrossAttn(nn.Module):
         self.resnets = nn.ModuleList(resnets)
         self.motion_modules = nn.ModuleList(motion_modules)
 
+    def clear_last_encoder_hidden_states(self):
+        for m in self.motion_modules:
+            if m is not None:
+                m.clear_last_encoder_hidden_states()
+
+    def swap_next_to_last(self):
+        for m in self.motion_modules:
+            if m is not None:
+                m.swap_next_to_last()
+
     def forward(self, 
                 hidden_states, 
                 temb=None, 
@@ -375,6 +386,16 @@ class CrossAttnDownBlock3D(nn.Module):
             self.downsamplers = None
 
         self.gradient_checkpointing = False
+    
+    def clear_last_encoder_hidden_states(self):
+        for m in self.motion_modules:
+            if m is not None:
+                m.clear_last_encoder_hidden_states()
+
+    def swap_next_to_last(self):
+        for m in self.motion_modules:
+            if m is not None:
+                m.swap_next_to_last()
 
     def forward(self, 
                 hidden_states, 
@@ -501,6 +522,16 @@ class DownBlock3D(nn.Module):
 
         self.gradient_checkpointing = False
 
+    def clear_last_encoder_hidden_states(self):
+        for m in self.motion_modules:
+            if m is not None:
+                m.clear_last_encoder_hidden_states()
+
+    def swap_next_to_last(self):
+        for m in self.motion_modules:
+            if m is not None:
+                m.swap_next_to_last()
+
     def forward(self, hidden_states, temb=None, encoder_hidden_states=None):
         output_states = ()
 
@@ -626,6 +657,16 @@ class CrossAttnUpBlock3D(nn.Module):
 
         self.gradient_checkpointing = False
 
+    def clear_last_encoder_hidden_states(self):
+        for m in self.motion_modules:
+            if m is not None:
+                m.clear_last_encoder_hidden_states()
+
+    def swap_next_to_last(self):
+        for m in self.motion_modules:
+            if m is not None:
+                m.swap_next_to_last()
+
     def forward(
         self,
         hidden_states,
@@ -735,6 +776,16 @@ class UpBlock3D(nn.Module):
             self.upsamplers = None
 
         self.gradient_checkpointing = False
+
+    def clear_last_encoder_hidden_states(self):
+        for m in self.motion_modules:
+            if m is not None:
+                m.clear_last_encoder_hidden_states()
+
+    def swap_next_to_last(self):
+        for m in self.motion_modules:
+            if m is not None:
+                m.swap_next_to_last()
 
     def forward(self, hidden_states, res_hidden_states_tuple, temb=None, upsample_size=None, encoder_hidden_states=None,):
         for resnet, motion_module in zip(self.resnets, self.motion_modules):

@@ -6,9 +6,11 @@ import random
 import sys
 import uuid
 import torch.nn.functional as F
-use_type = 'init_image'
+use_type = 'overlapping'
 if use_type == 'overlapping':
   from src.pipelines.pipeline_animatediff_overlapping import AnimationPipeline
+elif use_type == 'overlapping_previous':
+  from src.pipelines.pipeline_animatediff_overlapping_previous import AnimationPipeline
 elif use_type == 'circular':
   from src.pipelines.pipeline_animatediff_circular import AnimationPipeline
 elif use_type == 'overlapping_2':
@@ -273,6 +275,8 @@ def run(model,
         "temporal_position_encoding": True,
         "temporal_position_encoding_max_len": 24,
         "temporal_attention_dim_div": 1,
+
+
     },
   }
 
@@ -337,6 +341,12 @@ def run(model,
   # motion_module_path = "models/temporaldiff-v1-animatediff.ckpt"
   # motion_module_path = "models/mm-baseline-epoch-5.pth"
   motion_module_path = "models/mm-Stabilized_high.pth"
+  # motion_module_path = "models/overlapping-1e-5-100-steps.pth"
+  # motion_module_path = "models/overlapping-1e-5-3-20000-steps.pth"
+  # motion_module_path = "models/overlapping-1e-5-2-100-steps.pth"
+  # motion_module_path = "models/overlap-2-1000-steps.pth"
+  # motion_module_path = "models/base-100-steps.pth"
+  # motion_module_path = "models/overlap-epoch-1.pth"
   # motion_module_path = "models/mm-1000.pth"
   # motion_module_path = "models/motionModel_v03anime.ckpt"
   # motion_module_path = "models/mm_sd_v14.ckpt"
@@ -354,8 +364,8 @@ def run(model,
   if seed is None:
     seed = random.randint(-sys.maxsize, sys.maxsize)
 
-  generators = [torch.Generator().manual_seed(seed) for _ in range(window_count)]
-  # generators = torch.Generator().manual_seed(seed)
+  # generators = [torch.Generator().manual_seed(seed) for _ in range(window_count)]
+  generators = torch.Generator().manual_seed(seed)
 
   do_upscale = False
 
@@ -406,7 +416,7 @@ def run(model,
 
   
   else:
-    if use_type == 'overlapping' or use_type == 'overlapping_2' or use_type == 'overlapping_3' or use_type == 'overlapping_4':
+    if use_type == 'overlapping' or use_type == 'overlapping_2' or use_type == 'overlapping_3' or use_type == 'overlapping_4' or "overlapping_previous" in use_type:
       video = pipeline(prompt=prompt, 
                     negative_prompt=negative_prompt, 
                     num_inference_steps=num_inference_steps,
@@ -578,7 +588,7 @@ def run(model,
 if __name__ == "__main__":
   # prompt = "photograph of a bald man laughing"
   # prompt = "photograph of a man scared"
-  prompt = "A woman laughing"
+  # prompt = "A woman laughing"
   # prompt = "close up of a Girl's face swaying, red blouse, illustration by Wu guanzhong,China village,twojjbe trees in front of my chinese house,light orange, pink,white,blue ,8k"
   # prompt = "paint by frazetta, man dancing, mountain blue sky in background"
   # prompt = "neon glowing psychedelic man dancing, photography, award winning, gorgous, highly detailed"
@@ -588,7 +598,7 @@ if __name__ == "__main__":
   # prompt = "close up portrait of a woman in front of a lake artwork by Kawase Hasui"
   # prompt = "A lego ninja bending down to pick a flower in the style of the lego movie. High quality render by arnold. Animal logic. 3D soft focus"
   # prompt = "Glowing jellyfish, calm, slow hypnotic undulations, 35mm Nature photography, award winning"
-  # prompt = "synthwave retrowave vaporware back of a delorean driving on highway, dmc rear grill, neon lights, palm trees and sunset in background, nightcity"
+  prompt = "synthwave retrowave vaporware back of a delorean driving on highway, dmc rear grill, neon lights, palm trees and sunset in background, nightcity"
   # prompt = "a doodle of a bear dancing, scribble, messy, stickfigure, badly drawn"
   # prompt = "woman laughing"
   # prompt = "close up of Embrodery Elijah Wood smiling in front of a embroidery landscape"
@@ -598,13 +608,13 @@ if __name__ == "__main__":
   # model = Path("../models/dreamshaper-6")
   # model = Path("../models/deliberate_v2")
   # lora_file="Frazetta.safetensors"
-  # lora_files=["NightCity.safetensors", "dmc12-000006.safetensors"]
+  lora_files=["NightCity.safetensors", "dmc12-000006.safetensors"]
   # lora
   # lora_files = ["doodle.safetensors"]
   # lora_files = ["kEmbroideryRev.safetensors"]
   # lora_files = ["made_of_ice.safetensors"]
   # lora_files = ["watermeloncarving-000004.safetensors"]
-  lora_files=[]
+  # lora_files=[]
   # TODO the multidiffusion successor probably has the answer for duration
 
   # lora_file=None
@@ -618,11 +628,12 @@ if __name__ == "__main__":
       negative_prompt="clone, cloned, bad anatomy, wrong anatomy, mutated hands and fingers, mutation, mutated, amputation, 3d render, lowres, signs, memes, labels, text, error, mutant, worst quality, low quality, normal quality, jpeg artifacts, signature, watermark, username, blurry, made by children, caricature, ugly, boring, sketch, lacklustre, repetitive, cropped, (long neck), body horror, out of frame, mutilated, tiled, frame, border",
       height=512,
       width=512,
-      frame_count=16,
+      frame_count=32,
       window_count=16,
       num_inference_steps=20,
       guidance_scale=7.0,
       last_n=23,
+      seed=42,
       dtype=torch.float32,
       lora_folder="/mnt/newdrive/automatic1111/models/Lora",
       lora_files=lora_files)

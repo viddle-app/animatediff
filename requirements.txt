@@ -12,3 +12,4 @@ decord
 xformers
 lpips
 bitsandbytes
+pytorch-lightning

@@ -241,6 +241,33 @@ class UNet3DConditionModel(ModelMixin, ConfigMixin):
         self.conv_act = nn.SiLU()
         self.conv_out = InflatedConv3d(block_out_channels[0], out_channels, kernel_size=3, padding=1)
 
+    def clear_last_encoder_hidden_states(self):
+        # set clear_last_encoder_hidden_states
+        # on all up_blocks, down_blocks and mid_block
+        for m in self.down_blocks:
+            if m is not None:
+                m.clear_last_encoder_hidden_states()
+
+        if self.mid_block is not None:
+            self.mid_block.clear_last_encoder_hidden_states()
+
+        for m in self.up_blocks:
+            if m is not None:
+                m.clear_last_encoder_hidden_states()
+
+    def swap_next_to_last(self):
+        # set swap_next_to_last
+        # on all up_blocks, down_blocks and mid_block
+        for m in self.down_blocks:
+            if m is not None:
+                m.swap_next_to_last()
+
+        if self.mid_block is not None:
+            self.mid_block.swap_next_to_last()
+
+        for m in self.up_blocks:
+            if m is not None:
+                m.swap_next_to_last()
 
     @property
     # Copied from diffusers.models.unet_2d_condition.UNet2DConditionModel.attn_processors
