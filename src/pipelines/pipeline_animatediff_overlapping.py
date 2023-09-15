@@ -414,7 +414,7 @@ class AnimationPipeline(DiffusionPipeline, FromSingleFileMixin):
                 print("i: ", i)
                 
                 if wrap_around == True:
-                    indices = partition_wrap_around_2(video_length, window_length, i, offset=1)
+                    indices = partition_wrap_around_2(video_length, window_length, i, 2)
                 else:
                     indices = partitions(video_length, window_length, i)
                 print("indices: ", indices)

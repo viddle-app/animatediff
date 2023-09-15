@@ -533,11 +533,8 @@ class AnimationPipeline(DiffusionPipeline, FromSingleFileMixin):
                     if new_latents is None:
                         new_latents = torch.cat([noised_last_n_latents, latents], dim=2)
                     else:
-                        actual_length = video_length + 1
-                        if i % actual_length == 0:
-                            offset_index = 0
-                        else:
-                            offset_index = actual_length - (i % actual_length)
+                        offset_index = i % video_length
+                        
                         print("offset_index: ", offset_index)
                         new_latents[:, :, offset_index, :, :] = noised_last_n_latents.squeeze(2)
                     print("latent_partition: ", new_latents.shape)
