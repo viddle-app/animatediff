@@ -25,7 +25,7 @@ from .unet_blocks import (
     get_down_block,
     get_up_block,
 )
-from .resnet import InflatedConv3d
+from .resnet import InflatedConv3d, InflatedGroupNorm
 
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
@@ -77,6 +77,8 @@ class UNet3DConditionModel(ModelMixin, ConfigMixin):
         num_class_embeds: Optional[int] = None,
         upcast_attention: bool = False,
         resnet_time_scale_shift: str = "default",
+
+        use_inflated_groupnorm=False,
         
         # Additional
         use_motion_module              = False,
@@ -151,6 +153,8 @@ class UNet3DConditionModel(ModelMixin, ConfigMixin):
 
                 unet_use_cross_frame_attention=unet_use_cross_frame_attention,
                 unet_use_temporal_attention=unet_use_temporal_attention,
+
+                use_inflated_groupnorm=use_inflated_groupnorm,
                 
                 use_motion_module=use_motion_module and (res in motion_module_resolutions) and (not motion_module_decoder_only),
                 motion_module_type=motion_module_type,
@@ -176,6 +180,8 @@ class UNet3DConditionModel(ModelMixin, ConfigMixin):
 
                 unet_use_cross_frame_attention=unet_use_cross_frame_attention,
                 unet_use_temporal_attention=unet_use_temporal_attention,
+
+                use_inflated_groupnorm=use_inflated_groupnorm,
                 
                 use_motion_module=use_motion_module and motion_module_mid_block,
                 motion_module_type=motion_module_type,
@@ -229,6 +235,8 @@ class UNet3DConditionModel(ModelMixin, ConfigMixin):
                 unet_use_cross_frame_attention=unet_use_cross_frame_attention,
                 unet_use_temporal_attention=unet_use_temporal_attention,
 
+                use_inflated_groupnorm=use_inflated_groupnorm,
+
                 use_motion_module=use_motion_module and (res in motion_module_resolutions),
                 motion_module_type=motion_module_type,
                 motion_module_kwargs=motion_module_kwargs,
@@ -237,7 +245,10 @@ class UNet3DConditionModel(ModelMixin, ConfigMixin):
             prev_output_channel = output_channel
 
         # out
-        self.conv_norm_out = nn.GroupNorm(num_channels=block_out_channels[0], num_groups=norm_num_groups, eps=norm_eps)
+        if use_inflated_groupnorm:
+            self.conv_norm_out = InflatedGroupNorm(num_channels=block_out_channels[0], num_groups=norm_num_groups, eps=norm_eps)
+        else:
+            self.conv_norm_out = nn.GroupNorm(num_channels=block_out_channels[0], num_groups=norm_num_groups, eps=norm_eps)
         self.conv_act = nn.SiLU()
         self.conv_out = InflatedConv3d(block_out_channels[0], out_channels, kernel_size=3, padding=1)
 

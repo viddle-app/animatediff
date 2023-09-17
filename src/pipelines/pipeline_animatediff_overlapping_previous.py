@@ -416,10 +416,15 @@ class AnimationPipeline(DiffusionPipeline, FromSingleFileMixin):
                 self.unet.clear_last_encoder_hidden_states()
                 
                 if wrap_around == True:
-                    indices = partition_wrap_around_2(video_length, window_length, i, 2)
+                    random_int_tensor = torch.randint(window_length//4 - 1, window_length//4 + 1, (1,), generator=generator)
+                    offset = random_int_tensor.item()
+                    # offset = window_count//2
+                    indices = partition_wrap_around_2(video_length, window_length, i, offset)
                 else:
                     indices = partitions(video_length, window_length, i)
                 print("indices: ", indices)
+                if i % 2 == 0:
+                   indices = reversed(indices)
                 for partition_indices in indices:
                     print("partition_indices: ", partition_indices)
                     # check if the partition_indices is a list or a tuple

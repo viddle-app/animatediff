@@ -48,7 +48,7 @@ trainable_modules:
 
 unet_checkpoint_path: ""
 
-learning_rate:    1.e-5
+learning_rate:    1.e-6
 train_batch_size: 1
 gradient_checkpointing: True
 gradient_accumulation_steps: 4
@@ -56,7 +56,7 @@ gradient_accumulation_steps: 4
 max_train_epoch:      -1
 max_train_steps:      20000
 checkpointing_epochs: -1
-checkpointing_steps:  2500
+checkpointing_steps:  5000
 
 validation_steps:       1000
 validation_steps_tuple: []

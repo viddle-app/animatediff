@@ -6,7 +6,7 @@ import random
 import sys
 import uuid
 import torch.nn.functional as F
-use_type = 'overlapping'
+use_type = 'overlapping_previous'
 if use_type == 'overlapping':
   from src.pipelines.pipeline_animatediff_overlapping import AnimationPipeline
 elif use_type == 'overlapping_previous':
@@ -340,7 +340,9 @@ def run(model,
 
   # motion_module_path = "models/temporaldiff-v1-animatediff.ckpt"
   # motion_module_path = "models/mm-baseline-epoch-5.pth"
-  motion_module_path = "models/mm-Stabilized_high.pth"
+  # motion_module_path = "models/mm-Stabilized_high.pth"
+  # motion_module_path = "models/checkpoint.ckpt"
+  motion_module_path = "models/overlapping-1e-6-1-20000-steps.ckpt"
   # motion_module_path = "models/overlapping-1e-5-100-steps.pth"
   # motion_module_path = "models/overlapping-1e-5-3-20000-steps.pth"
   # motion_module_path = "models/overlapping-1e-5-2-100-steps.pth"
@@ -351,6 +353,7 @@ def run(model,
   # motion_module_path = "models/motionModel_v03anime.ckpt"
   # motion_module_path = "models/mm_sd_v14.ckpt"
   # motion_module_path = "models/mm_sd_v15.ckpt"
+  # motion_module_path = "models/mm_sd_v15_v2.ckpt"
   # motion_module_path = '../ComfyUI/custom_nodes/ComfyUI-AnimateDiff/models/animatediffMotion_v15.ckpt'
   motion_module_state_dict = torch.load(motion_module_path, map_location="cpu")
   missing, unexpected = pipeline.unet.load_state_dict(motion_module_state_dict, strict=False)
@@ -598,7 +601,7 @@ if __name__ == "__main__":
   # prompt = "close up portrait of a woman in front of a lake artwork by Kawase Hasui"
   # prompt = "A lego ninja bending down to pick a flower in the style of the lego movie. High quality render by arnold. Animal logic. 3D soft focus"
   # prompt = "Glowing jellyfish, calm, slow hypnotic undulations, 35mm Nature photography, award winning"
-  prompt = "synthwave retrowave vaporware back of a delorean driving on highway, dmc rear grill, neon lights, palm trees and sunset in background, nightcity"
+  prompt = "synthwave retrowave vaporware back of a delorean driving on highway, dmc rear grill, neon lights, palm trees and sunset in background"
   # prompt = "a doodle of a bear dancing, scribble, messy, stickfigure, badly drawn"
   # prompt = "woman laughing"
   # prompt = "close up of Embrodery Elijah Wood smiling in front of a embroidery landscape"
@@ -608,7 +611,7 @@ if __name__ == "__main__":
   # model = Path("../models/dreamshaper-6")
   # model = Path("../models/deliberate_v2")
   # lora_file="Frazetta.safetensors"
-  lora_files=["NightCity.safetensors", "dmc12-000006.safetensors"]
+  lora_files=["retrowave_0.12.safetensors", "dmc12-000006.safetensors"]
   # lora
   # lora_files = ["doodle.safetensors"]
   # lora_files = ["kEmbroideryRev.safetensors"]
@@ -628,9 +631,9 @@ if __name__ == "__main__":
       negative_prompt="clone, cloned, bad anatomy, wrong anatomy, mutated hands and fingers, mutation, mutated, amputation, 3d render, lowres, signs, memes, labels, text, error, mutant, worst quality, low quality, normal quality, jpeg artifacts, signature, watermark, username, blurry, made by children, caricature, ugly, boring, sketch, lacklustre, repetitive, cropped, (long neck), body horror, out of frame, mutilated, tiled, frame, border",
       height=512,
       width=512,
-      frame_count=32,
+      frame_count=256,
       window_count=16,
-      num_inference_steps=20,
+      num_inference_steps=60,
       guidance_scale=7.0,
       last_n=23,
       seed=42,

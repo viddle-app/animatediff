@@ -401,10 +401,14 @@ def main(
             # keeping things simply for now
             assert(bsz == 1)
             
+            # set the number of inference steps
+
             # Sample a random timestep for each video
             timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (bsz,), device=latents.device)
             timesteps = timesteps.long()
-            
+
+            # get a random timestep for each video
+
             # Get the text embedding for conditioning
             with torch.no_grad():
                 prompt_ids = tokenizer(
@@ -424,19 +428,72 @@ def main(
             # (this is the forward diffusion process)
             noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
 
-            if overlapping_step:
+            def ddim_step(model_output: torch.FloatTensor,
+                         timestep: int,
+                         sample: torch.FloatTensor,
+                         prev_timestep: int):
+                eta = 0
+                alpha_prod_t = noise_scheduler.alphas_cumprod[timestep]
+                alpha_prod_t_prev = noise_scheduler.alphas_cumprod[prev_timestep] if prev_timestep >= 0 else self.final_alpha_cumprod
+
+                beta_prod_t = 1 - alpha_prod_t
+
+                # 3. compute predicted original sample from predicted noise also called
+                # "predicted x_0" of formula (12) from https://arxiv.org/pdf/2010.02502.pdf
+                
+                pred_original_sample = (sample - beta_prod_t ** (0.5) * model_output) / alpha_prod_t ** (0.5)
+                pred_epsilon = model_output
+          
+
+                # 4. Clip or threshold "predicted x_0"
+                if noise_scheduler.config.thresholding:
+                    pred_original_sample = noise_scheduler._threshold_sample(pred_original_sample)
+                elif noise_scheduler.config.clip_sample:
+                    pred_original_sample = pred_original_sample.clamp(
+                        -noise_scheduler.config.clip_sample_range, noise_scheduler.config.clip_sample_range
+                    )
+
+                # 5. compute variance: "sigma_t(η)" -> see formula (16)
+                # σ_t = sqrt((1 − α_t−1)/(1 − α_t)) * sqrt(1 − α_t/α_t−1)
+                variance = noise_scheduler._get_variance(timestep, prev_timestep)
+                std_dev_t = eta * variance ** (0.5)
+
+
+                # 6. compute "direction pointing to x_t" of formula (12) from https://arxiv.org/pdf/2010.02502.pdf
+                pred_sample_direction = (1 - alpha_prod_t_prev - std_dev_t**2) ** (0.5) * pred_epsilon
+
+                # 7. compute x_t without "random noise" of formula (12) from https://arxiv.org/pdf/2010.02502.pdf
+                return alpha_prod_t_prev ** (0.5) * pred_original_sample + pred_sample_direction
+            
+            the_timestep = timesteps[0].item()
+            if overlapping_step and the_timestep > 1:
                 with torch.no_grad():
                     noisy_latents_1 = noisy_latents[:, :, :16].detach()
                     noisy_latents_2 = noisy_latents[:, :, 16:].detach()
 
                     model_pred_1 = unet(noisy_latents_1, timesteps, encoder_hidden_states).sample
+                    print("model_pred_1 mean and std", model_pred_1.mean(), model_pred_1.std())
                     model_pred_2 = unet(noisy_latents_2, timesteps, encoder_hidden_states).sample
+                    print("model_pred_2 mean and std", model_pred_2.mean(), model_pred_2.std())
 
+                    # how to randomly step
+                    # just picking a random num inference steps won't work
+                    # it might not have the current time step.
+                    # I might want to start by picking a num inference steps
+                    # then pick a random timestep from there 
+                    # then step to the next timestep
 
+                    previous_step = torch.randint(0, 
+                                                  the_timestep - 1, 
+                                                  (1,), 
+                                                  device=latents.device)
+                    previous_step = previous_step.long().item()
+                    # previous_step = the_timestep - 1
                     # DDIM step 
-                    the_timestep = timesteps[0].item()
-                    noisy_latents_1 = noise_scheduler.step(model_pred_1, the_timestep, noisy_latents_1).prev_sample
-                    noisy_latents_2 = noise_scheduler.step(model_pred_2, the_timestep, noisy_latents_2).prev_sample
+                    noisy_latents_1 = ddim_step(model_pred_1, the_timestep, noisy_latents_1, previous_step)
+                    noisy_latents_2 = ddim_step(model_pred_2, the_timestep, noisy_latents_2, previous_step)
+                    # noisy_latents_1 = noise_scheduler.step(noisy_latents_1, the_timestep, model_pred_1).prev_sample
+                    # noisy_latents_2 = noise_scheduler.step(noisy_latents_2, the_timestep, model_pred_2).prev_sample
                     
 
                     # take the last 8 frames from the first part and the first 8 frames from the second part
@@ -445,8 +502,9 @@ def main(
                     latents = latents[:, :, 8:24]
 
                     print("timesteps before: ", timesteps)
-                    timesteps = timesteps - 1
-                    the_timestep = timesteps[0].item()
+                    # convert the previous_step to a tensor the same shape as timesteps
+                    timesteps = torch.full_like(timesteps, previous_step)
+                    the_timestep = previous_step
 
                     print("timesteps after: ", timesteps)
                     alphas_cumprod = noise_scheduler.alphas_cumprod.to(device=latents.device, dtype=latents.dtype)
@@ -464,17 +522,26 @@ def main(
                     print("sqrt_alpha_prod.device", sqrt_alpha_prod.device)
                     sqrt_alpha_prod = sqrt_alpha_prod.to(device=latents.device)
                     recovered_noisy_samples = noisy_latents - sqrt_alpha_prod * latents 
+                    print("target before mean: ", target.mean())
+                    print("target before std: ", target.std())
                     target = recovered_noisy_samples  / sqrt_one_minus_alpha_prod
+                    print("target after mean: ", target.mean())
+                    print("target after std: ", target.std())
 
-
+                noisy_latents = noisy_latents.clone().detach().requires_grad_(True) 
+            else: 
+                # slice the latents and target to 16 frames
+                noisy_latents = noisy_latents[:, :, :16]
+                target = target[:, :, :16]
 
                 # clone the noisy_latents to have gradients
-                noisy_latents = noisy_latents.clone().detach().requires_grad_(True) 
 
             # Predict the noise residual and compute loss
             # Mixed-precision training
+            # unet.clear_last_encoder_hidden_states()
             with torch.cuda.amp.autocast(enabled=mixed_precision_training):
                 model_pred = unet(noisy_latents, timesteps, encoder_hidden_states).sample
+                print("model_pred mean and std", model_pred.mean(), model_pred.std())
                 loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
 
             optimizer.zero_grad()
