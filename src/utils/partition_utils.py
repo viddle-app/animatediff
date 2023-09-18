@@ -1,9 +1,9 @@
 import torch
 
-def partitions(elementCount, windowSize, index):
+def partitions(elementCount, windowSize, index, offset):
     # Initialize the starting point for the first window
     start = 0
-    end = index % windowSize
+    end = (index * offset) % windowSize
     if end == 0:
         end = windowSize
     output = [[start, end]]
@@ -21,6 +21,8 @@ def partitions(elementCount, windowSize, index):
 
         # Update the start for the next window
         start = end
+
+    return output
 
 def partitions_wrap_around(elementCount, windowSize, index):
     # Initialize the starting point for the first window
@@ -162,10 +164,7 @@ def peel_next_and_new(tensor, last_n, last_count):
 if __name__ == "__main__":
     element_count = 30
     window_size = 24
-    index = 1
-    tensor = torch.tensor([[[1, 2, 3, 4, 5, 6, 7, 8, 9, 10]]])
-    result = peel_next_and_new(tensor, 7, 3)
-
-    new_tensor = torch.tensor([[[11, 12, 13]]])
-    result = torch.concat([result[1], new_tensor], dim=2)
+    index = 8
+    offset = 2
+    result = partitions(element_count, window_size, index, offset)
     print(result)

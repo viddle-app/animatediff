@@ -287,7 +287,13 @@ class AnimationPipeline(DiffusionPipeline, FromSingleFileMixin):
                 f" {type(callback_steps)}."
             )
 
-    def prepare_latents(self, batch_size, num_channels_latents, video_length, height, width, dtype, device, generator, window_size, latents=None):
+    def prepare_latents(self, batch_size, 
+                        num_channels_latents, 
+                        video_length, height, 
+                        width, dtype, device, 
+                        generator, window_size, 
+                        latents=None, 
+                        do_init_noise=True):
         shape = (batch_size, num_channels_latents, video_length, height // self.vae_scale_factor, width // self.vae_scale_factor)
         if isinstance(generator, list) and len(generator) != batch_size * window_size:
             raise ValueError(
@@ -314,10 +320,12 @@ class AnimationPipeline(DiffusionPipeline, FromSingleFileMixin):
 
         # scale the initial noise by the standard deviation required by the scheduler
         # check if the init_noise_sigma is a tensor
-        if isinstance(self.scheduler.init_noise_sigma, torch.Tensor):
-            latents = latents * self.scheduler.init_noise_sigma.to(device)
-        else:
-            latents = latents * self.scheduler.init_noise_sigma
+        if do_init_noise:
+            if isinstance(self.scheduler.init_noise_sigma, torch.Tensor):
+                latents = latents * self.scheduler.init_noise_sigma.to(device)
+            else:
+                latents = latents * self.scheduler.init_noise_sigma
+        
         return latents
 
     @torch.no_grad()
@@ -339,6 +347,13 @@ class AnimationPipeline(DiffusionPipeline, FromSingleFileMixin):
         callback: Optional[Callable[[int, int, torch.FloatTensor], None]] = None,
         callback_steps: Optional[int] = 1,
         window_count=24,
+        wrap_around = True,
+        min_offset = 3,
+        max_offset = 5,
+        offset_generator = None,
+        alternate_direction = True,
+        do_init_noise: bool = True,
+        timesteps: Optional[torch.Tensor] = None,
         **kwargs,
 
     ):
@@ -392,15 +407,17 @@ class AnimationPipeline(DiffusionPipeline, FromSingleFileMixin):
             generator,
             window_length,
             latents,
+            do_init_noise=do_init_noise,
         )
         latents_dtype = latents.dtype
 
         # Prepare extra step kwargs.
         extra_step_kwargs = self.prepare_extra_step_kwargs(generator, eta)
         
-
-
-        wrap_around = True
+        if offset_generator is None:
+            offset_generator = generator
+        
+        # start_
         # wrong but close
         remainder = 1 if video_length % window_length != 0 else 0
         partition_count = video_length // window_length  + remainder
@@ -415,15 +432,15 @@ class AnimationPipeline(DiffusionPipeline, FromSingleFileMixin):
                 print("i: ", i)
                 self.unet.clear_last_encoder_hidden_states()
                 
+
+                random_int_tensor = torch.randint(min_offset, max_offset, (1,), generator=offset_generator)
+                offset = random_int_tensor.item()
                 if wrap_around == True:
-                    random_int_tensor = torch.randint(window_length//4 - 1, window_length//4 + 1, (1,), generator=generator)
-                    offset = random_int_tensor.item()
-                    # offset = window_count//2
                     indices = partition_wrap_around_2(video_length, window_length, i, offset)
                 else:
-                    indices = partitions(video_length, window_length, i)
+                    indices = partitions(video_length, window_length, i, offset)
                 print("indices: ", indices)
-                if i % 2 == 0:
+                if i % 2 == 0 and alternate_direction == True:
                    indices = reversed(indices)
                 for partition_indices in indices:
                     print("partition_indices: ", partition_indices)
