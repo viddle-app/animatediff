@@ -283,6 +283,11 @@ class UNetMidBlock3DCrossAttn(nn.Module):
             if m is not None:
                 m.swap_next_to_last()
 
+    def reset_call_index(self):
+        for m in self.motion_modules:
+            if m is not None:
+                m.reset_call_index()
+
     def forward(self, 
                 hidden_states, 
                 temb=None, 
@@ -415,6 +420,11 @@ class CrossAttnDownBlock3D(nn.Module):
         for m in self.motion_modules:
             if m is not None:
                 m.swap_next_to_last()
+
+    def reset_call_index(self):
+        for m in self.motion_modules:
+            if m is not None:
+                m.reset_call_index()
 
     def forward(self, 
                 hidden_states, 
@@ -554,6 +564,11 @@ class DownBlock3D(nn.Module):
             if m is not None:
                 m.swap_next_to_last()
 
+    def reset_call_index(self):
+        for m in self.motion_modules:
+            if m is not None:
+                m.reset_call_index()
+
     def forward(self, hidden_states, temb=None, encoder_hidden_states=None):
         output_states = ()
 
@@ -692,6 +707,11 @@ class CrossAttnUpBlock3D(nn.Module):
             if m is not None:
                 m.swap_next_to_last()
 
+    def reset_call_index(self):
+        for m in self.motion_modules:
+            if m is not None:
+                m.reset_call_index()
+
     def forward(
         self,
         hidden_states,
@@ -813,6 +833,11 @@ class UpBlock3D(nn.Module):
         for m in self.motion_modules:
             if m is not None:
                 m.swap_next_to_last()
+
+    def reset_call_index(self):
+        for m in self.motion_modules:
+            if m is not None:
+                m.reset_call_index()
 
     def forward(self, hidden_states, res_hidden_states_tuple, temb=None, upsample_size=None, encoder_hidden_states=None,):
         for resnet, motion_module in zip(self.resnets, self.motion_modules):

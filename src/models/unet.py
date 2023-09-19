@@ -280,6 +280,20 @@ class UNet3DConditionModel(ModelMixin, ConfigMixin):
             if m is not None:
                 m.swap_next_to_last()
 
+    def reset_call_index(self):
+        # set reset_call_index
+        # on all up_blocks, down_blocks and mid_block
+        for m in self.down_blocks:
+            if m is not None:
+                m.reset_call_index()
+
+        if self.mid_block is not None:
+            self.mid_block.reset_call_index()
+
+        for m in self.up_blocks:
+            if m is not None:
+                m.reset_call_index()
+
     @property
     # Copied from diffusers.models.unet_2d_condition.UNet2DConditionModel.attn_processors
     def attn_processors(self) -> Dict[str, AttentionProcessor]:
