@@ -309,6 +309,21 @@ class VersatileAttention(Attention):
 
         self.next_encoder_hidden_states = []
 
+        # is this a valid approach?
+        self.key_projection_net = nn.Sequential(
+            nn.Linear(self.dim_head, self.dim_head),
+            nn.ReLU(),
+            nn.Linear(self.dim_head, self.dim_head)
+        )
+
+        self.value_projection_net = nn.Sequential(
+            nn.Linear(self.dim_head, self.dim_head),
+            nn.ReLU(),
+            nn.Linear(self.dim_head, self.dim_head)
+        )
+
+        
+
     def clear_last_encoder_hidden_states(self):
         self.last_encoder_hidden_states = []
         self.last_encoder_hidden_states_1 = []
@@ -381,14 +396,17 @@ class VersatileAttention(Attention):
             # repeat the self.last_encoder_hidden_states[self.call_index] twice in the 2 dimension
             repeat_count = 1
             repeated_last = self.last_encoder_hidden_states[self.call_index].repeat(1, repeat_count, 1)
-            if self.last_encoder_hidden_states_1 != []:
-                last_last = self.last_encoder_hidden_states_1[self.call_index]
-                encoder_hidden_states = torch.cat([last_last, repeated_last, encoder_hidden_states], dim=1)
-            else:
-                encoder_hidden_states = torch.cat([repeated_last, encoder_hidden_states], dim=1)
+            
+        # project the repeated_last throught the key_projection_net
+        last_proj_keys = self.key_projection_net(repeated_last)
+        last_proj_values = self.value_projection_net(repeated_last)
         
-        key = self.to_k(encoder_hidden_states)
-        value = self.to_v(encoder_hidden_states)
+        # concat the last_proj_keys and the encoder_hidden_states
+        keys = torch.cat([encoder_hidden_states, last_proj_keys], dim=1)
+        values = torch.cat([encoder_hidden_states, last_proj_values], dim=1)
+
+        key = self.to_k(keys)
+        value = self.to_v(values)
 
         key = self.reshape_heads_to_batch_dim(key)
         value = self.reshape_heads_to_batch_dim(value)

@@ -74,10 +74,7 @@ class VanillaTemporalModule(nn.Module):
         )
         
         if zero_initialize:
-            print("Zero initializing the temporal transformer.")
             self.temporal_transformer.proj_out = zero_module(self.temporal_transformer.proj_out)
-        else:
-            print("Not zero initializing the temporal transformer.")
 
     def forward(self, input_tensor, temb, encoder_hidden_states, attention_mask=None, anchor_frame_idx=None):
         hidden_states = input_tensor
@@ -94,6 +91,9 @@ class VanillaTemporalModule(nn.Module):
 
     def reset_call_index(self):
         self.temporal_transformer.reset_call_index()
+
+    def set_forward_direction(self, forward_direction):
+        self.temporal_transformer.set_forward_direction(forward_direction)
         
 
 class TemporalTransformer3DModel(nn.Module):
@@ -156,6 +156,10 @@ class TemporalTransformer3DModel(nn.Module):
     def reset_call_index(self):
         for block in self.transformer_blocks:
             block.reset_call_index()
+    
+    def set_forward_direction(self, forward_direction):
+        for block in self.transformer_blocks:
+            block.set_forward_direction(forward_direction)
 
     def forward(self, hidden_states, encoder_hidden_states=None, attention_mask=None):
         assert hidden_states.dim() == 5, f"Expected hidden_states to have ndim=5, but got ndim={hidden_states.dim()}."
@@ -243,6 +247,10 @@ class TemporalTransformerBlock(nn.Module):
     def reset_call_index(self):
         for attention_block in self.attention_blocks:
             attention_block.reset_call_index()
+    
+    def set_forward_direction(self, forward_direction):
+        for attention_block in self.attention_blocks:
+            attention_block.set_forward_direction(forward_direction)
 
     def forward(self, hidden_states, encoder_hidden_states=None, attention_mask=None, video_length=None):
         for attention_block, norm in zip(self.attention_blocks, self.norms):
@@ -275,9 +283,12 @@ class PositionalEncoding(nn.Module):
         pe[0, :, 1::2] = torch.cos(position * div_term)
         self.register_buffer('pe', pe)
 
-    def forward(self, x):
-        x = x + self.pe[:, :x.size(1)]
+    def forward(self, x, offset=0):
+        x = self.offset(x, offset)
         return self.dropout(x)
+
+    def offset(self, x, offset=0, multiplier=1):
+        return x + multiplier * self.pe[:, offset:offset+x.size(1)]
 
 
 class VersatileAttention(Attention):
@@ -306,6 +317,7 @@ class VersatileAttention(Attention):
         self.last_encoder_hidden_states_1 = []
         self.call_index = 0
         self.last_values_max_count = last_values_max_count
+        self.forward_direction = True
 
         self.next_encoder_hidden_states = []
 
@@ -326,11 +338,14 @@ class VersatileAttention(Attention):
         # get every other last encoder hidden states
         # and set it to the last encoder hidden states 1
         self.last_encoder_hidden_states_1 = [] 
-        for t in self.last_encoder_hidden_states:
-            self.last_encoder_hidden_states_1.append(t[:, ::2])
+        # for t in self.last_encoder_hidden_states:
+        #    self.last_encoder_hidden_states_1.append(t[:, ::2])
 
         self.last_encoder_hidden_states = self.next_encoder_hidden_states
         self.next_encoder_hidden_states = []
+
+    def set_forward_direction(self, forward_direction):
+        self.forward_direction = forward_direction
 
     def reshape_heads_to_batch_dim(self, tensor):
         batch_size, seq_len, dim = tensor.shape
@@ -350,12 +365,16 @@ class VersatileAttention(Attention):
                 video_length=None):
         batch_size, sequence_length, _ = hidden_states.shape
 
+        last_hidden_states = None
+        if self.last_encoder_hidden_states != []:
+            last_hidden_states = self.last_encoder_hidden_states[self.call_index]
+
         if self.attention_mode == "Temporal":
             d = hidden_states.shape[1]
             hidden_states = rearrange(hidden_states, "(b f) d c -> (b d) f c", f=video_length)
             
             if self.pos_encoder is not None:
-                hidden_states = self.pos_encoder(hidden_states)
+                hidden_states = self.pos_encoder(hidden_states, offset=0)
             
             encoder_hidden_states = repeat(encoder_hidden_states, "b n c -> (b d) n c", d=d) if encoder_hidden_states is not None else encoder_hidden_states
         else:
@@ -372,20 +391,34 @@ class VersatileAttention(Attention):
             raise NotImplementedError
 
         encoder_hidden_states = encoder_hidden_states if encoder_hidden_states is not None else hidden_states
-        # concat on the the encoder_hidden_states 
-        # the first frames features duplicated 5 times
         
-        self.next_encoder_hidden_states.append(encoder_hidden_states[:, -self.last_values_max_count:])
+        # TODO this isn't right. It needs to undo the last change and then do another change
+        adjustments = []
+        if self.forward_direction:
+            # for the first time don't do anything
+            # else remove the original offset
+            # and add the new offset 
+            if last_hidden_states is not None: 
+                adjustments.append((0, -1))
+                adjustments.append((encoder_hidden_states.shape[1], -1))
+        else:
+            # remove the original offset and add a new one
+            adjustments.append((0, -1))
+            adjustments.append((encoder_hidden_states.shape[1], 1))
+            
 
-        if self.last_encoder_hidden_states != []:
-            # repeat the self.last_encoder_hidden_states[self.call_index] twice in the 2 dimension
-            repeat_count = 1
-            repeated_last = self.last_encoder_hidden_states[self.call_index].repeat(1, repeat_count, 1)
-            if self.last_encoder_hidden_states_1 != []:
-                last_last = self.last_encoder_hidden_states_1[self.call_index]
-                encoder_hidden_states = torch.cat([last_last, repeated_last, encoder_hidden_states], dim=1)
-            else:
-                encoder_hidden_states = torch.cat([repeated_last, encoder_hidden_states], dim=1)
+        last_values_to_save = encoder_hidden_states[:, -self.last_values_max_count:]
+        
+        if self.pos_encoder is not None:
+            for (the_offset, multiplier) in adjustments:
+                last_values_to_save = self.pos_encoder.offset(last_values_to_save, 
+                                                              offset=the_offset, 
+                                                              multiplier=multiplier)
+
+        self.next_encoder_hidden_states.append(last_values_to_save)
+
+        if last_hidden_states is not None:            
+            encoder_hidden_states = torch.cat([last_hidden_states, encoder_hidden_states], dim=1)
         
         key = self.to_k(encoder_hidden_states)
         value = self.to_v(encoder_hidden_states)

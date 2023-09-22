@@ -74,10 +74,7 @@ class VanillaTemporalModule(nn.Module):
         )
         
         if zero_initialize:
-            print("Zero initializing the temporal transformer.")
             self.temporal_transformer.proj_out = zero_module(self.temporal_transformer.proj_out)
-        else:
-            print("Not zero initializing the temporal transformer.")
 
     def forward(self, input_tensor, temb, encoder_hidden_states, attention_mask=None, anchor_frame_idx=None):
         hidden_states = input_tensor
@@ -86,15 +83,6 @@ class VanillaTemporalModule(nn.Module):
         output = hidden_states
         return output
 
-    def clear_last_encoder_hidden_states(self):
-        self.temporal_transformer.clear_last_encoder_hidden_states()
-
-    def swap_next_to_last(self):
-        self.temporal_transformer.swap_next_to_last()
-
-    def reset_call_index(self):
-        self.temporal_transformer.reset_call_index()
-        
 
 class TemporalTransformer3DModel(nn.Module):
     def __init__(
@@ -145,18 +133,6 @@ class TemporalTransformer3DModel(nn.Module):
         )
         self.proj_out = nn.Linear(inner_dim, in_channels)    
     
-    def clear_last_encoder_hidden_states(self):
-        for block in self.transformer_blocks:
-            block.clear_last_encoder_hidden_states()
-
-    def swap_next_to_last(self):
-        for block in self.transformer_blocks:
-            block.swap_next_to_last()
-    
-    def reset_call_index(self):
-        for block in self.transformer_blocks:
-            block.reset_call_index()
-
     def forward(self, hidden_states, encoder_hidden_states=None, attention_mask=None):
         assert hidden_states.dim() == 5, f"Expected hidden_states to have ndim=5, but got ndim={hidden_states.dim()}."
         video_length = hidden_states.shape[2]
@@ -232,17 +208,6 @@ class TemporalTransformerBlock(nn.Module):
         self.ff = FeedForward(dim, dropout=dropout, activation_fn=activation_fn)
         self.ff_norm = nn.LayerNorm(dim)
 
-    def clear_last_encoder_hidden_states(self):
-        for attention_block in self.attention_blocks:
-            attention_block.clear_last_encoder_hidden_states()
-
-    def swap_next_to_last(self):
-        for attention_block in self.attention_blocks:
-            attention_block.swap_next_to_last()
-
-    def reset_call_index(self):
-        for attention_block in self.attention_blocks:
-            attention_block.reset_call_index()
 
     def forward(self, hidden_states, encoder_hidden_states=None, attention_mask=None, video_length=None):
         for attention_block, norm in zip(self.attention_blocks, self.norms):
@@ -276,7 +241,7 @@ class PositionalEncoding(nn.Module):
         self.register_buffer('pe', pe)
 
     def forward(self, x):
-        x = x + self.pe[:, :x.size(1)]
+        x = x + self.pe[:, 16:x.size(1) + 16]
         return self.dropout(x)
 
 
@@ -286,8 +251,7 @@ class VersatileAttention(Attention):
             attention_mode                     = None,
             cross_frame_attention_mode         = None,
             temporal_position_encoding         = False,
-            temporal_position_encoding_max_len = 24,
-            last_values_max_count = 24,         
+            temporal_position_encoding_max_len = 24,            
             *args, **kwargs
         ):
         super().__init__(*args, **kwargs)
@@ -302,35 +266,6 @@ class VersatileAttention(Attention):
             max_len=temporal_position_encoding_max_len
         ) if (temporal_position_encoding and attention_mode == "Temporal") else None
 
-        self.last_encoder_hidden_states = []
-        self.last_encoder_hidden_states_1 = []
-        self.call_index = 0
-        self.last_values_max_count = last_values_max_count
-
-        self.next_encoder_hidden_states = []
-
-    def clear_last_encoder_hidden_states(self):
-        self.last_encoder_hidden_states = []
-        self.last_encoder_hidden_states_1 = []
-
-        self.next_encoder_hidden_states = []
-
-        self.call_index = 0
-
-    def reset_call_index(self):
-        self.call_index = 0
-
-    def swap_next_to_last(self):
-        self.call_index = 0
-
-        # get every other last encoder hidden states
-        # and set it to the last encoder hidden states 1
-        self.last_encoder_hidden_states_1 = [] 
-        for t in self.last_encoder_hidden_states:
-            self.last_encoder_hidden_states_1.append(t[:, ::2])
-
-        self.last_encoder_hidden_states = self.next_encoder_hidden_states
-        self.next_encoder_hidden_states = []
 
     def reshape_heads_to_batch_dim(self, tensor):
         batch_size, seq_len, dim = tensor.shape
@@ -361,6 +296,8 @@ class VersatileAttention(Attention):
         else:
             raise NotImplementedError
 
+        encoder_hidden_states = encoder_hidden_states
+
         if self.group_norm is not None:
             hidden_states = self.group_norm(hidden_states.transpose(1, 2)).transpose(1, 2)
 
@@ -374,19 +311,10 @@ class VersatileAttention(Attention):
         encoder_hidden_states = encoder_hidden_states if encoder_hidden_states is not None else hidden_states
         # concat on the the encoder_hidden_states 
         # the first frames features duplicated 5 times
-        
-        self.next_encoder_hidden_states.append(encoder_hidden_states[:, -self.last_values_max_count:])
-
-        if self.last_encoder_hidden_states != []:
-            # repeat the self.last_encoder_hidden_states[self.call_index] twice in the 2 dimension
-            repeat_count = 1
-            repeated_last = self.last_encoder_hidden_states[self.call_index].repeat(1, repeat_count, 1)
-            if self.last_encoder_hidden_states_1 != []:
-                last_last = self.last_encoder_hidden_states_1[self.call_index]
-                encoder_hidden_states = torch.cat([last_last, repeated_last, encoder_hidden_states], dim=1)
-            else:
-                encoder_hidden_states = torch.cat([repeated_last, encoder_hidden_states], dim=1)
-        
+        if False:
+            first_frame_states = encoder_hidden_states[:, 0:1, :]
+            first_frame_states_repeated = first_frame_states.repeat_interleave(32, dim=1)
+            encoder_hidden_states = torch.cat([encoder_hidden_states, first_frame_states_repeated], dim=1)
         key = self.to_k(encoder_hidden_states)
         value = self.to_v(encoder_hidden_states)
 
@@ -423,7 +351,5 @@ class VersatileAttention(Attention):
 
         if self.attention_mode == "Temporal":
             hidden_states = rearrange(hidden_states, "(b d) f c -> (b f) d c", d=d)
-        
-        self.call_index += 1
 
         return hidden_states

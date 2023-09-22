@@ -6,10 +6,53 @@ from torch import nn
 
 from .attention import Transformer3DModel
 from .resnet import Downsample3D, ResnetBlock3D, Upsample3D
-# from .motion_module import get_motion_module
-from .motion_module_previous_window import get_motion_module
+from .motion_module import get_motion_module
+# from .motion_module_offset import get_motion_module
+# from .motion_module_previous_window import get_motion_module
+# from .motion_module_previous_window_pe import get_motion_module
+# from .motion_module_previous_window_pe_2 import get_motion_module
+# from .motion_module_previous_window_pe_3 import get_motion_module
+# from .motion_module_previous_window_pe_4 import get_motion_module
 
 import pdb
+
+def spectral_modulation(hl_i, sl, rthresh):
+    """
+    Applies spectral modulation in the Fourier domain.
+
+    Parameters:
+    - hl_i: Input tensor (feature) with shape [B, D, C]
+    - sl: Frequency-dependent scaling factor
+    - rthresh: Threshold frequency
+
+    Returns:
+    - h_prime_l_i: Modified feature after spectral modulation
+    """
+    
+    # Compute the Fourier transform
+    F_hl_i = torch.fft.fftn(hl_i)
+    
+    # Generate a grid of coordinates in the Fourier domain for the D and C dimensions
+    _, D, C = hl_i.shape
+    x = torch.linspace(-D // 2, D // 2 - 1, D)
+    y = torch.linspace(-C // 2, C // 2 - 1, C)
+    xx, yy = torch.meshgrid(x, y)
+    r = torch.sqrt(xx**2 + yy**2)
+    
+    # Construct the Fourier mask
+    mask = torch.ones_like(r)
+    mask[r < rthresh] = sl
+
+    # Expand the mask dimensions to match the input batch size
+    mask = mask.unsqueeze(0).expand_as(F_hl_i)
+    
+    # Apply the mask to the Fourier coefficients
+    F_prime_hl_i = F_hl_i * mask
+    
+    # Compute the inverse Fourier transform
+    h_prime_l_i = torch.fft.ifftn(F_prime_hl_i).real
+    
+    return h_prime_l_i
 
 def get_down_block(
     down_block_type,
@@ -276,17 +319,26 @@ class UNetMidBlock3DCrossAttn(nn.Module):
     def clear_last_encoder_hidden_states(self):
         for m in self.motion_modules:
             if m is not None:
-                m.clear_last_encoder_hidden_states()
+                if hasattr(m, 'clear_last_encoder_hidden_states'):
+                    m.clear_last_encoder_hidden_states()
 
     def swap_next_to_last(self):
         for m in self.motion_modules:
             if m is not None:
-                m.swap_next_to_last()
+                if hasattr(m, 'swap_next_to_last'):
+                    m.swap_next_to_last()
 
     def reset_call_index(self):
         for m in self.motion_modules:
             if m is not None:
-                m.reset_call_index()
+                if hasattr(m, 'reset_call_index'):
+                    m.reset_call_index()
+
+    def set_forward_direction(self, forward_direction):
+        for m in self.motion_modules:
+            if m is not None:
+                if hasattr(m, 'set_forward_direction'):
+                    m.set_forward_direction(forward_direction)
 
     def forward(self, 
                 hidden_states, 
@@ -414,17 +466,26 @@ class CrossAttnDownBlock3D(nn.Module):
     def clear_last_encoder_hidden_states(self):
         for m in self.motion_modules:
             if m is not None:
-                m.clear_last_encoder_hidden_states()
+                if hasattr(m, 'clear_last_encoder_hidden_states'):
+                    m.clear_last_encoder_hidden_states()
 
     def swap_next_to_last(self):
         for m in self.motion_modules:
             if m is not None:
-                m.swap_next_to_last()
+                if hasattr(m, 'swap_next_to_last'):
+                    m.swap_next_to_last()
 
     def reset_call_index(self):
         for m in self.motion_modules:
             if m is not None:
-                m.reset_call_index()
+                if hasattr(m, 'reset_call_index'):
+                    m.reset_call_index()
+
+    def set_forward_direction(self, forward_direction):
+        for m in self.motion_modules:
+            if m is not None:
+                if hasattr(m, 'set_forward_direction'):
+                    m.set_forward_direction(forward_direction)
 
     def forward(self, 
                 hidden_states, 
@@ -557,17 +618,26 @@ class DownBlock3D(nn.Module):
     def clear_last_encoder_hidden_states(self):
         for m in self.motion_modules:
             if m is not None:
-                m.clear_last_encoder_hidden_states()
+                if hasattr(m, 'clear_last_encoder_hidden_states'):
+                    m.clear_last_encoder_hidden_states()
 
     def swap_next_to_last(self):
         for m in self.motion_modules:
             if m is not None:
-                m.swap_next_to_last()
+                if hasattr(m, 'swap_next_to_last'):
+                    m.swap_next_to_last()
 
     def reset_call_index(self):
         for m in self.motion_modules:
             if m is not None:
-                m.reset_call_index()
+                if hasattr(m, 'reset_call_index'):
+                    m.reset_call_index()
+
+    def set_forward_direction(self, forward_direction):
+        for m in self.motion_modules:
+            if m is not None:
+                if hasattr(m, 'set_forward_direction'):
+                    m.set_forward_direction(forward_direction)
 
     def forward(self, hidden_states, temb=None, encoder_hidden_states=None):
         output_states = ()
@@ -700,17 +770,26 @@ class CrossAttnUpBlock3D(nn.Module):
     def clear_last_encoder_hidden_states(self):
         for m in self.motion_modules:
             if m is not None:
-                m.clear_last_encoder_hidden_states()
+                if hasattr(m, 'clear_last_encoder_hidden_states'):
+                    m.clear_last_encoder_hidden_states()
 
     def swap_next_to_last(self):
         for m in self.motion_modules:
             if m is not None:
-                m.swap_next_to_last()
+                if hasattr(m, 'swap_next_to_last'):
+                    m.swap_next_to_last()
 
     def reset_call_index(self):
         for m in self.motion_modules:
             if m is not None:
-                m.reset_call_index()
+                if hasattr(m, 'reset_call_index'):
+                    m.reset_call_index()
+
+    def set_forward_direction(self, forward_direction):
+        for m in self.motion_modules:
+            if m is not None:
+                if hasattr(m, 'set_forward_direction'):
+                    m.set_forward_direction(forward_direction)
 
     def forward(
         self,
@@ -827,23 +906,55 @@ class UpBlock3D(nn.Module):
     def clear_last_encoder_hidden_states(self):
         for m in self.motion_modules:
             if m is not None:
-                m.clear_last_encoder_hidden_states()
+                if hasattr(m, 'clear_last_encoder_hidden_states'):
+                    m.clear_last_encoder_hidden_states()
 
     def swap_next_to_last(self):
         for m in self.motion_modules:
             if m is not None:
-                m.swap_next_to_last()
+                if hasattr(m, 'swap_next_to_last'):
+                    m.swap_next_to_last()
 
     def reset_call_index(self):
         for m in self.motion_modules:
             if m is not None:
-                m.reset_call_index()
+                if hasattr(m, 'reset_call_index'):
+                    m.reset_call_index()
 
-    def forward(self, hidden_states, res_hidden_states_tuple, temb=None, upsample_size=None, encoder_hidden_states=None,):
+    def set_forward_direction(self, forward_direction):
+        for m in self.motion_modules:
+            if m is not None:
+                if hasattr(m, 'set_forward_direction'):
+                    m.set_forward_direction(forward_direction)
+
+    def forward(self, 
+                hidden_states, 
+                res_hidden_states_tuple, 
+                temb=None, 
+                upsample_size=None, 
+                encoder_hidden_states=None,
+                backbone_scale=None, 
+                backbone_scale_threshold=None,
+                skip_scale=None,
+                skip_scale_threshold=None,
+                ):
         for resnet, motion_module in zip(self.resnets, self.motion_modules):
             # pop res hidden states
             res_hidden_states = res_hidden_states_tuple[-1]
             res_hidden_states_tuple = res_hidden_states_tuple[:-1]
+            # print("hidden_states", hidden_states.shape)
+            # print("res_hidden_states", res_hidden_states.shape)
+
+            if backbone_scale is not None and skip_scale is not None and backbone_scale_threshold is not None and skip_scale_threshold is not None:
+                num_channels = hidden_states.shape[2]
+                channels_to_scale = int(num_channels * backbone_scale_threshold)
+
+                # Scale only the selected channels
+                hidden_states[:, :, :channels_to_scale] = backbone_scale * hidden_states[:, :, :channels_to_scale]
+                
+                res_hidden_states = spectral_modulation(res_hidden_states, skip_scale, skip_scale_threshold)
+            # None, apply them
+
             hidden_states = torch.cat([hidden_states, res_hidden_states], dim=1)
 
             if self.training and self.gradient_checkpointing:

@@ -14,3 +14,17 @@ Ideas
 Looping to the music is cool
 Looping and reactive would be interesting
 If the fidelity could be increased you could animate a whole alblum. 
+
+Try multidiffusion with less blending
+- doesn't seem like it works at least with noise_pred blending
+Modify to use same size windows without looping and use blending instead
+- This is going to have issues
+Look at how the inpainting model is trained
+
+Need to write a new captioning dataset script
+Should start downloading videos all the time
+Docker image for training
+
+Finish second blog post
+Add images
+

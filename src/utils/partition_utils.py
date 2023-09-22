@@ -127,6 +127,26 @@ def circular_shift(element_count, offset):
 
     return shifted_indices
 
+def convolution_partitions(element_count, window_size, offset):
+    # create a window of size window_size
+    # and shift it by offset
+    # repeat this until the window reaches the end
+    # of the element_count
+    output = []
+    start = 0
+    end = window_size
+    while end <= element_count:
+        output.append([start, end])
+        start += offset
+        end += offset
+
+    # add the last window to the output list
+    # if the end of the window exceeds the element_count
+    if end > element_count:
+        output[-1] = [output[-1][0], element_count]
+
+    return output
+
 # create a list of start and end indices up to element 
 # where the length is max window_size and after the 
 # first element include last_n elements
@@ -161,10 +181,32 @@ def peel_next_and_new(tensor, last_n, last_count):
     last_n_latents = tensor[:, :, -last_n:]
     return new_latents, last_n_latents
 
+def indices_for_averaging(frame_count, window_size, offset):
+    # Initialize the list to store the (start, end) indices
+    result = []
+
+    # Start from the first frame
+    start = 0
+    end = start + window_size
+    result.append((start, end))
+    # Continue generating windows until the last end index reaches `frame_count - 1`
+    while end < frame_count:
+        
+        # Move to the next window using the offset
+        start += offset
+        end += offset
+
+        result.append((start, end))
+
+    # Handle the edge case where the last window's end is beyond `frame_count - 1`
+    if end > frame_count and len(result) > 0:
+        result[-1] = (result[-1][0], frame_count)
+    return result
+
 if __name__ == "__main__":
-    element_count = 30
-    window_size = 24
+    element_count = 40
+    window_size = 16
     index = 8
-    offset = 2
-    result = partitions(element_count, window_size, index, offset)
+    offset = 12
+    result = indices_for_averaging(element_count, window_size, offset)
     print(result)

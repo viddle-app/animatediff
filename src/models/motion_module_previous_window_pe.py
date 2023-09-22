@@ -74,7 +74,10 @@ class VanillaTemporalModule(nn.Module):
         )
         
         if zero_initialize:
+            print("Zero initializing the temporal transformer.")
             self.temporal_transformer.proj_out = zero_module(self.temporal_transformer.proj_out)
+        else:
+            print("Not zero initializing the temporal transformer.")
 
     def forward(self, input_tensor, temb, encoder_hidden_states, attention_mask=None, anchor_frame_idx=None):
         hidden_states = input_tensor
@@ -420,7 +423,7 @@ class VersatileAttention(Attention):
 
         self.next_encoder_hidden_states.append(last_values_to_save)
 
-        if last_hidden_states:            
+        if last_hidden_states is not None:            
             encoder_hidden_states = torch.cat([last_hidden_states, encoder_hidden_states], dim=1)
         
         key = self.to_k(encoder_hidden_states)

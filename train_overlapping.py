@@ -34,9 +34,12 @@ from diffusers.utils.import_utils import is_xformers_available
 
 import transformers
 from transformers import CLIPTextModel, CLIPTokenizer
+# from torch.utils.tensorboard import SummaryWriter
+
 
 from src.models.unet import UNet3DConditionModel
-from src.pipelines.pipeline_animatediff import AnimationPipeline
+# from src.pipelines.pipeline_animatediff import AnimationPipeline
+from src.pipelines.pipeline_animatediff_overlapping_previous import AnimationPipeline
 from src.utils.util import save_videos_grid, zero_rank_print
 from src.data.dataset_overlapping import WebVid10M
 # from src.data.dataset import WebVid10M
@@ -138,6 +141,8 @@ def main(
 ):
     check_min_version("0.10.0.dev0")
 
+    # writer = SummaryWriter()
+
     # Initialize distributed training
     local_rank      = init_dist(launcher=launcher)
     global_rank     = dist.get_rank()
@@ -188,11 +193,12 @@ def main(
         
     print(f"state_dict keys: {list(unet.config.keys())[:10]}")
 
-    motion_module_path = "models/mm-Stabilized_high.pth"
+    # motion_module_path = "motion-models/mm-Stabilized_high.pth"
     # motion_module_path = "models/mm-1000.pth"
     # motion_module_path = "models/motionModel_v03anime.ckpt"
     # motion_module_path = "models/mm_sd_v14.ckpt"
-    # motion_module_path = "models/mm_sd_v15.ckpt"
+    # motion_module_path = "motion-models/mm_sd_v15_v2.ckpt"
+    motion_module_path = "motion-models/temporal-attn-pe-5e-7-4-50000-steps.ckpt"
     # motion_module_path = '../ComfyUI/custom_nodes/ComfyUI-AnimateDiff/models/animatediffMotion_v15.ckpt'
     motion_module_state_dict = torch.load(motion_module_path, map_location="cpu")
     missing, unexpected = unet.load_state_dict(motion_module_state_dict, strict=False)
@@ -313,7 +319,7 @@ def main(
 
     # DDP warpper
     unet.to(local_rank)
-    unet = DDP(unet, device_ids=[local_rank], output_device=local_rank)
+    # unet = DDP(unet, device_ids=[local_rank], output_device=local_rank)
 
     # We need to recalculate our total training steps as the size of the training dataloader may have changed.
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / gradient_accumulation_steps)
@@ -348,6 +354,7 @@ def main(
         print(f"epoch: {epoch}, global_step: {global_step}, max_train_steps: {max_train_steps}")
         
         for step, batch in enumerate(train_dataloader):
+            unet.clear_last_encoder_hidden_states()
             print(f"step: {step}")
 
             if cfg_random_null_text:
@@ -466,14 +473,17 @@ def main(
                 return alpha_prod_t_prev ** (0.5) * pred_original_sample + pred_sample_direction
             
             the_timestep = timesteps[0].item()
-            if overlapping_step and the_timestep > 1:
-                with torch.no_grad():
+            if overlapping_step and the_timestep > 2:
+                # with torch.no_grad():
                     noisy_latents_1 = noisy_latents[:, :, :16].detach()
                     noisy_latents_2 = noisy_latents[:, :, 16:].detach()
 
                     model_pred_1 = unet(noisy_latents_1, timesteps, encoder_hidden_states).sample
+                    unet.swap_next_to_last()
                     print("model_pred_1 mean and std", model_pred_1.mean(), model_pred_1.std())
                     model_pred_2 = unet(noisy_latents_2, timesteps, encoder_hidden_states).sample
+                    unet.clear_last_encoder_hidden_states()
+                    
                     print("model_pred_2 mean and std", model_pred_2.mean(), model_pred_2.std())
 
                     # how to randomly step
@@ -483,7 +493,7 @@ def main(
                     # then pick a random timestep from there 
                     # then step to the next timestep
 
-                    previous_step = torch.randint(0, 
+                    previous_step = torch.randint(1, 
                                                   the_timestep - 1, 
                                                   (1,), 
                                                   device=latents.device)
@@ -525,14 +535,16 @@ def main(
                     print("target before mean: ", target.mean())
                     print("target before std: ", target.std())
                     target = recovered_noisy_samples  / sqrt_one_minus_alpha_prod
-                    print("target after mean: ", target.mean())
-                    print("target after std: ", target.std())
 
-                noisy_latents = noisy_latents.clone().detach().requires_grad_(True) 
+
+                # noisy_latents = noisy_latents.clone().detach().requires_grad_(True) 
             else: 
                 # slice the latents and target to 16 frames
                 noisy_latents = noisy_latents[:, :, :16]
                 target = target[:, :, :16]
+            
+            print("target after mean: ", target.mean())
+            print("target after std: ", target.std())
 
                 # clone the noisy_latents to have gradients
 
@@ -544,6 +556,7 @@ def main(
                 print("model_pred mean and std", model_pred.mean(), model_pred.std())
                 loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
 
+            unet.clear_last_encoder_hidden_states()
             optimizer.zero_grad()
 
             # Backpropagate
@@ -586,7 +599,8 @@ def main(
             if is_main_process and (global_step % validation_steps == 0 or global_step in validation_steps_tuple):
                 samples = []
                 
-                generator = torch.Generator(device=latents.device)
+                # generator = torch.Generator(device=latents.device)
+                generator = torch.Generator(device="cpu")
                 generator.manual_seed(global_seed)
                 
                 height = train_data.sample_size[0] if not isinstance(train_data.sample_size, int) else train_data.sample_size
@@ -596,12 +610,18 @@ def main(
 
                 for idx, prompt in enumerate(prompts):
                     if not image_finetune:
+                        window_length = train_data.sample_n_frames
                         sample = validation_pipeline(
                             prompt,
                             generator    = generator,
-                            video_length = train_data.sample_n_frames,
+                            video_length = train_data.sample_n_frames * 2,
                             height       = height,
                             width        = width,
+                            window_count = window_length,
+                            wrap_around=True,
+                            alternate_direction=True,
+                            min_offset = window_length // 2,
+                            max_offset = window_length // 2,
                             **validation_data,
                         ).videos
                         save_videos_grid(sample, f"{output_dir}/samples/sample-{global_step}/{idx}.gif")

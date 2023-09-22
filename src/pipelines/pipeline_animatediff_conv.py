@@ -30,7 +30,7 @@ from diffusers.schedulers import (
 from diffusers.utils import deprecate, logging, BaseOutput, randn_tensor, is_compiled_module
 
 from einops import rearrange
-from ..utils.partition_utils import partition_wrap_around_2, partitions, partitions_wrap_around
+from ..utils.partition_utils import convolution_partitions, partition_wrap_around_2, partitions, partitions_wrap_around
 from diffusers.image_processor import VaeImageProcessor
 from ..models.unet import UNet3DConditionModel
 from ..models.controlnet import ControlNetModel
@@ -308,10 +308,10 @@ class AnimationPipeline(DiffusionPipeline, FromSingleFileMixin):
                         latents=None, 
                         do_init_noise=True):
         shape = (batch_size, num_channels_latents, video_length, height // self.vae_scale_factor, width // self.vae_scale_factor)
-        if isinstance(generator, list) and len(generator) != video_length:
+        if isinstance(generator, list) and len(generator) != batch_size * window_size:
             raise ValueError(
-                f"You have passed a list of generators of length {len(generator)}, but requested an effective video_length"
-                f" size of {video_length}. Make sure the video_length size matches the length of the generators."
+                f"You have passed a list of generators of length {len(generator)}, but requested an effective batch"
+                f" size of {batch_size}. Make sure the batch size matches the length of the generators."
             )
         if latents is None:
             rand_device = "cpu" if device.type == "mps" else device
@@ -507,7 +507,7 @@ class AnimationPipeline(DiffusionPipeline, FromSingleFileMixin):
         latents_dtype = latents.dtype
 
         # Prepare extra step kwargs.
-        # extra_step_kwargs = self.prepare_extra_step_kwargs(generator, eta)
+        extra_step_kwargs = self.prepare_extra_step_kwargs(generator, eta)
         
         if offset_generator is None:
             offset_generator = generator
@@ -592,6 +592,8 @@ class AnimationPipeline(DiffusionPipeline, FromSingleFileMixin):
         min_offset = min(min_offset, max_offset)
         max_offset = max(min_offset, max_offset)
         images_partition = None
+
+        replace_partition = window_length // 3
         # Denoising loop
         print("window_length: ", window_length)
         print("video_length: ", video_length)
@@ -613,17 +615,18 @@ class AnimationPipeline(DiffusionPipeline, FromSingleFileMixin):
                         random_int_tensor = torch.randint(min_offset, max_offset, (1,), generator=offset_generator)
                         offset = random_int_tensor.item()
                 if wrap_around == True:
-                    indices = partition_wrap_around_2(video_length, window_length, i, offset)
+                    indices = convolution_partitions(video_length, window_length, offset)
                 else:
-                    indices = partitions(video_length, window_length, i, offset)
+                    indices = convolution_partitions(video_length, window_length, offset)
                 print("indices: ", indices)
                 if i % 2 == 1 and alternate_direction == True:
                     indices = reversed(indices)
                     self.unet.set_forward_direction(False)
                 else:
                     self.unet.set_forward_direction(True)
-                for partition_indices in indices:
+                for p, partition_indices in enumerate(indices):
                     print("partition_indices: ", partition_indices)
+                    print("p: ", p)
                     # check if the partition_indices is a list or a tuple
                     if isinstance(partition_indices, tuple):
                         # make a list of the partition indices
@@ -635,14 +638,31 @@ class AnimationPipeline(DiffusionPipeline, FromSingleFileMixin):
                         end_indices = list(range(end_interval[0], end_interval[1]))
                         # combine the lists
                         partition_indices_expanded = end_indices + start_indices 
+                        # replace indices are the middle third of the window
+                        # drop the replace_count number of indices and take the 
+                        # same number of indices
+                        if p == 0:
+                            # first time take the first 2/3 of the window
+                            replace_indices = partition_indices_expanded[:2 * window_length // 3]
+                        elif p == len(indices) - 1:
+                            # last time take the last 2/3 of the window
+                            replace_indices = partition_indices_expanded[window_length // 3:]
+                        else:
+                            replace_indices = partition_indices_expanded[window_length // 3: 2 * window_length // 3]
                         print("partition_indices_expanded: ", partition_indices_expanded)
 
                         latent_partition = latents[:, :, partition_indices_expanded].to(device)
                     else:
-                        partition_indices_expanded = list(range(partition_indices[0], partition_indices[1]))
                         latent_partition = latents[:, :, partition_indices[0]:partition_indices[1]].to(device)
+                        if p == 0:
+                            replace_indices = list(range(partition_indices[0], partition_indices[0] + 2 * window_length // 3))
+                        elif p == len(indices) - 1:
+                            replace_indices = list(range(partition_indices[0] + window_length // 3, partition_indices[0] + window_length))
+                        else:
+                            replace_indices = list(range(partition_indices[0] + window_length // 3, partition_indices[0] + 2 * window_length // 3))
                     print("latent_partition: ", latent_partition.shape)
 
+                    print("replace_indices: ", replace_indices)
 
                     # expand the latents if we are doing classifier free guidance
                     latent_model_input = torch.cat([latent_partition] * 2) if do_classifier_free_guidance else latent_partition
@@ -738,20 +758,21 @@ class AnimationPipeline(DiffusionPipeline, FromSingleFileMixin):
                         noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
 
                     # compute the previous noisy sample x_t -> x_t-1
-                    if isinstance(generator, list):
-                        current_generators = []
-                        for idx in partition_indices_expanded: 
-                            current_generators.append(generator[idx])
-                    else:
-                        current_generators = generator
-                    extra_step_kwargs = self.prepare_extra_step_kwargs(current_generators, eta)
                     latent_partition = self.scheduler.step(noise_pred, t, latent_partition, **extra_step_kwargs).prev_sample
 
                     # update the latents
-                    if isinstance(partition_indices, tuple):
-                        latents[:, :, partition_indices_expanded] = latent_partition.to(cpu_device)
+                    
+                    if p == 0:
+                        # take the first 2/3 of the window
+                        latents_for_replace = latent_partition[:, :, :2 * window_length // 3].to(cpu_device)
+                        print("latents_for_replace: ", latents_for_replace.shape)
+                        latents[:, :, replace_indices] = latents_for_replace
+                    elif p == len(indices) - 1:
+                        # take the last 2/3 of the window
+                        latents[:, :, replace_indices] = latent_partition[:, :, window_length // 3:].to(cpu_device)
                     else:
-                        latents[:, :, partition_indices[0]:partition_indices[1]] = latent_partition.to(cpu_device)
+                        latents[:, :, replace_indices] = latent_partition[:, :, window_length // 3: 2 * window_length // 3].to(cpu_device)
+                    
 
                     if images_partition is not None:
                         del images_partition

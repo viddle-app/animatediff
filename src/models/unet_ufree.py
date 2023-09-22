@@ -492,6 +492,10 @@ class UNet3DConditionModel(ModelMixin, ConfigMixin):
         cross_attention_kwargs: Optional[Dict[str, Any]] = None,
         encoder_attention_mask: Optional[torch.Tensor] = None,
         return_dict: bool = True,
+        backbone_scale: Optional[float] = None,
+        skip_scale: Optional[float] = None,
+        backbone_scale_threshold: Optional[float] = None,
+        skip_scale_threshold: Optional[float] = None,
     ) -> Union[UNet3DConditionOutput, Tuple]:
         r"""
         Args:
@@ -623,6 +627,7 @@ class UNet3DConditionModel(ModelMixin, ConfigMixin):
             is_final_block = i == len(self.up_blocks) - 1
 
             res_samples = down_block_res_samples[-len(upsample_block.resnets) :]
+            print("res_samples", len(res_samples), res_samples[0].shape, res_samples[1].shape, res_samples[2].shape, res_samples[3].shape)
             down_block_res_samples = down_block_res_samples[: -len(upsample_block.resnets)]
 
             # if we have not reached the final block and need to forward the
@@ -641,7 +646,15 @@ class UNet3DConditionModel(ModelMixin, ConfigMixin):
                 )
             else:
                 sample = upsample_block(
-                    hidden_states=sample, temb=emb, res_hidden_states_tuple=res_samples, upsample_size=upsample_size, encoder_hidden_states=encoder_hidden_states,
+                    hidden_states=sample, 
+                    temb=emb, 
+                    res_hidden_states_tuple=res_samples, 
+                    upsample_size=upsample_size, 
+                    encoder_hidden_states=encoder_hidden_states,
+                    backbone_scale=backbone_scale, 
+                    backbone_scale_threshold=backbone_scale_threshold,
+                    skip_scale=skip_scale,
+                    skip_scale_threshold=skip_scale_threshold,
                 )
 
         # post-process
