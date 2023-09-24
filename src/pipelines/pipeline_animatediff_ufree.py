@@ -396,11 +396,7 @@ class AnimationPipeline(DiffusionPipeline, FromSingleFileMixin):
                 # predict the noise residual
                 noise_pred = self.unet(latent_model_input, 
                                        t, 
-                                       encoder_hidden_states=text_embeddings
-                                       backbone_scale=1.2,
-                                       backbone_threshold=0.5,
-                                       skip_scale=0.5,
-                                       skip_threshold=0.5,
+                                       encoder_hidden_states=text_embeddings,
                                        ).sample.to(dtype=latents_dtype)
                 # perform guidance
                 if do_classifier_free_guidance:

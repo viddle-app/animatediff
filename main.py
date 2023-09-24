@@ -7,7 +7,8 @@ import shutil
 import sys
 import uuid
 import torch.nn.functional as F
-use_type = 'overlapping_previous'
+use_ufree = False
+use_type = 'overlapping_previous_1'
 if use_type == 'overlapping':
   from src.pipelines.pipeline_animatediff_overlapping import AnimationPipeline
 elif use_type == 'conv':
@@ -16,6 +17,8 @@ elif use_type == 'overlapping_noise_pred':
    from src.pipelines.pipeline_animatediff_overlapping_noise_pred import AnimationPipeline
 elif use_type == 'overlapping_previous':
   from src.pipelines.pipeline_animatediff_overlapping_previous import AnimationPipeline
+elif use_type == 'overlapping_previous_1':
+  from src.pipelines.pipeline_animatediff_overlapping_previous_1 import AnimationPipeline
 elif use_type == 'circular':
   from src.pipelines.pipeline_animatediff_circular import AnimationPipeline
 elif use_type == 'overlapping_2':
@@ -28,19 +31,51 @@ elif use_type == 'reference':
   from src.pipelines.pipeline_animatediff_reference import AnimationPipeline
 elif use_type == "init_image":
   from src.pipelines.pipeline_animatediff_init_image import AnimationPipeline
+elif use_type == "ufree":
+   from src.pipelines.pipeline_animatediff_ufree import AnimationPipeline
 else:
   from src.pipelines.pipeline_animatediff import AnimationPipeline
 from src.pipelines.pipeline_animatediff_controlnet import StableDiffusionControlNetPipeline
 from diffusers import AutoencoderKL, EulerAncestralDiscreteScheduler, DDIMScheduler, StableDiffusionPipeline
 import torch
 from transformers import CLIPTextModel, CLIPTokenizer
-from src.models.unet import UNet3DConditionModel
+if use_type == "ufree" or use_ufree == True:
+  from src.models.unet_ufree import UNet3DConditionModel
+else:
+  from src.models.unet import UNet3DConditionModel
 import numpy as np
 import cv2
 from src.models.controlnet import ControlNetModel
 from PIL import Image
 from src.utils.image_utils import create_gif, create_mp4_from_images, tensor_to_image_sequence
 from diffusers.utils import randn_tensor
+
+class AttentionProcessorController:
+    def __init__(self) -> None:
+        self.attention_processors = []
+
+    def add_attention_processor(self, attention_processor):
+        self.attention_processors.append(attention_processor)
+
+    def reset_last(self):
+        for attention_processor in self.attention_processors:
+            attention_processor.reset_last()
+
+    def clear(self):
+        for attention_processor in self.attention_processors:
+            attention_processor.clear()
+
+    def swap_next_to_last(self):
+        for attention_processor in self.attention_processors:
+            attention_processor.swap_next_to_last()
+
+    def disable_cross_frame_attention(self):
+        for attention_processor in self.attention_processors:
+            attention_processor.disable_cross_frame_attention
+
+    def enable_cross_frame_attention(self):
+        for attention_processor in self.attention_processors:
+            attention_processor.enable_cross_frame_attention
 
 def make_progressive_latents(window_count, windows_length, height, width, 
                              alpha=0.5, dtype=torch.float16, generator=None,
@@ -159,6 +194,9 @@ def make_preencoded_latents(pipe,
                                 noise_multiplier=noise_multiplier
                                 ), timesteps, num_inference_steps
 
+
+
+   
 
 
 def upscale(pipeline, 
@@ -341,7 +379,7 @@ def run(model,
         "num_transformer_block": 1,
         "attention_block_types": ["Temporal_Self", "Temporal_Self"],
         "temporal_position_encoding": True,
-        "temporal_position_encoding_max_len": 24,
+        "temporal_position_encoding_max_len": 32,
         "temporal_attention_dim_div": 1,
         "zero_initialize" : False,
 
@@ -374,10 +412,10 @@ def run(model,
 
   unet = unet.to(dtype=dtype) 
 
-  use_controlnet = True
+  use_controlnet = False
 
 
-  if (use_type == "overlapping_previous" or use_type == 'conv') and use_controlnet:
+  if (use_type == "overlapping_previous" or use_type == 'conv' or use_type == 'overlapping_previous_1') and use_controlnet:
     # controlnet_path = Path("../models/ControlNet-v1-1/control_v11p_sd15_openpose.yaml")
     controlnet_path = "lllyasviel/control_v11p_sd15_openpose"
     # controlnet_path = "lllyasviel/control_v11f1e_sd15_tile"
@@ -410,7 +448,7 @@ def run(model,
   # motion_module_path = "models/mm-baseline-epoch-5.pth"
   # motion_module_path = "motion-models/mm-Stabilized_high.pth"
   # motion_module_path = "models/checkpoint.ckpt"
-  motion_module_path = "motion-models/overlapping-1e-6-1-20000-steps.ckpt"
+  # motion_module_path = "motion-models/overlapping-1e-6-1-20000-steps.ckpt"
   # motion_module_path = "motion-models/overlapping-5e-7-1-40000-steps.ckpt"
   # motion_module_path = "models/overlapping-1e-5-100-steps.pth"
   # motion_module_path = "models/overlapping-1e-5-3-20000-steps.pth"
@@ -429,7 +467,7 @@ def run(model,
   # motion_module_path = "motion-models/temporal-attn-5e-7-3-40000-steps.ckpt"
   # motion_module_path = "motion-models/overlapping-attn-5e-7-1-5000-steps.ckpt"
   # motion_module_path = "motion-models/temporal-overlap-attn-5e-7-2-15000-steps.ckpt"
-  # motion_module_path = "motion-models/mm_sd_v15_v2.ckpt"
+  motion_module_path = "motion-models/mm_sd_v15_v2.ckpt"
   # motion_module_path = "motion-models/temporal-attn-negative-pe-1e-6-1-5000-steps.ckpt"
   # motion_module_path = '../ComfyUI/custom_nodes/ComfyUI-AnimateDiff/models/animatediffMotion_v15.ckpt'
   motion_module_state_dict = torch.load(motion_module_path, map_location="cpu")
@@ -449,6 +487,7 @@ def run(model,
   generators = torch.Generator().manual_seed(seed)
 
   do_upscale = False
+  use_img2img = False
 
 
   if use_type == 'overlapping' or use_type == 'overlapping_noise_pred' or use_type == 'overlapping_2' or use_type == 'overlapping_3' or use_type == 'overlapping_4' :
@@ -481,7 +520,7 @@ def run(model,
               strength=0.25,
               window_count=window_count//4,
               )
-  elif use_type == 'overlapping_previous' or use_type == 'conv':
+  elif use_type == 'overlapping_previous' or use_type == 'conv' or use_type == 'overlapping_previous_1':
       if use_controlnet:
         # load 16 frames from the directory
         open_pose_path = Path("/mnt/newdrive/stable-diffusion-docker/output/dwpose")
@@ -514,14 +553,62 @@ def run(model,
         #                       device=cpu_device, 
         #                       dtype=dtype).repeat(1, 1, frame_count // window_count, 1, 1)
 
-        latents = make_progressive_latents(frame_count // window_count,
-                                            window_count, 
-                                           height // 8, 
-                                           width // 8, 
-                                           alpha=0.1,
-                                           dtype=dtype,
-                                           generator=latent_generator,
-                                           device=cpu_device,)
+        if use_img2img:
+          do_init_noise = False
+          encoded_frames = []
+            # load all the frames in the 
+            # "/mnt/newdrive/stable-diffusion-docker/output/background_frames" folder
+          background_frames_path = Path("/mnt/newdrive/stable-diffusion-docker/output/background_frames")
+          background_frames = glob.glob(os.path.join(background_frames_path, '*.png'))
+          background_frames = sorted(background_frames)
+          background_frames = background_frames[:frame_count]
+          for frame_path in background_frames:
+          
+            frame = Image.open(frame_path)
+            frame_tensor = pipeline.image_processor.preprocess(frame).to(device=device, dtype=dtype)
+            print("frame_tensor", frame_tensor.shape)
+            with torch.no_grad():
+              encoded_frames.append(encode_image_to_latent(pipeline, 
+                                                        frame_tensor.squeeze(0), 
+                                                        generator=generators, 
+                                                        dtype=dtype))
+            torch.cuda.empty_cache()
+          
+          encoded_video = torch.concat(encoded_frames)
+          print("encoded_video", encoded_video.shape)
+
+          cpu_device = torch.device("cpu")
+
+          latents, timesteps, _ = make_preencoded_latents(pipe=pipeline,
+                                  num_inference_steps=num_inference_steps,
+                                  device=cpu_device,
+                                  dtype=dtype,
+                                  generator=generators,
+                                  noise_image=encoded_video,
+                                  strength = 0.95,
+                                  noise_multiplier=1.0,
+                                  )
+          latents = latents.unsqueeze(0).permute(0, 2, 1, 3, 4)
+          print("latents", latents.shape)
+
+        else:
+          do_init_noise = True
+          timesteps = None
+          # latents = make_progressive_latents(frame_count // window_count,
+          #                                  window_count, 
+          #                                 height // 8, 
+          #                                 width // 8, 
+          #                                 alpha=0.0,
+          #                                 dtype=dtype,
+          #                                 generator=latent_generator,
+          #                                 device=cpu_device,)
+
+          # latents = randn_tensor((1, 4, 
+          #                        window_count, height // 8, width // 8), generator=generators, dtype=dtype).repeat(1, 1, frame_count // window_count, 1, 1)
+          latents = randn_tensor((1, 4, 
+                                  frame_count, 
+                                  height // 8, 
+                                  width // 8), generator=generators, dtype=dtype)
 
         video = pipeline(prompt=prompt, 
               negative_prompt=negative_prompt, 
@@ -532,15 +619,17 @@ def run(model,
               window_count=window_count,
               video_length=frame_count,
               generator=generators,
-              wrap_around=True,
-              alternate_direction=True,
+              wrap_around=False,
+              alternate_direction=False,
               guess_mode=guess_mode,
               image=images,
               controlnet_conditioning_scale=controlnet_conditioning_scale,
-              min_offset = 4,
-              max_offset = 4,
+              min_offset = 8,
+              max_offset = 8,
               latents=latents,
               offset_generator=latent_generator,
+              do_init_noise=do_init_noise,
+              timesteps=timesteps,
               ).videos[0]
 
       else:
@@ -553,10 +642,10 @@ def run(model,
                 window_count=window_count,
                 video_length=frame_count,
                 generator=generators,
-                wrap_around=False,
+                wrap_around=True,
                 alternate_direction=False,
-                min_offset = window_count//3,
-                max_offset = window_count//3,
+                min_offset = 8,
+                max_offset = 8,
                 # cpu_device=torch.device("cuda"),
                 ).videos[0]
       
@@ -728,7 +817,7 @@ def run(model,
   os.makedirs(output_dir, exist_ok=True)
   filename = str(uuid.uuid4())
   output_path = os.path.join(output_dir, filename + ".gif")
-  fps = 15
+  fps = 8
   tensor_to_image_sequence(video, "images")
   images = glob.glob("images/*.png")
   images.sort()
@@ -743,13 +832,18 @@ if __name__ == "__main__":
   # prompt = "photograph of a bald man laughing"
   # prompt = "photograph of a man scared"
   # prompt = "A woman laughing"
-  prompt = "full body of a Girl swaying, red blouse, illustration by Wu guanzhong,China village,twojjbe trees in front of my chinese house,light orange, pink,white,blue ,8k"
+  # prompt = "full body of a Girl swaying, red blouse, illustration by Wu guanzhong,China village,twojjbe trees in front of my chinese house,light orange, pink,white,blue ,8k"
   # prompt = "paint by frazetta, man dancing, mountain blue sky in background"
   # prompt = "1man dancing outside, clear blue sky sunny day, photography, award winning, highly detailed, bright, well lit"
   # prompt = "Cute Chunky anthropomorphic Siamese cat dressed in rags walking down a rural road, mindblowing illustration by Jean-Baptiste Monge + Emily Carr + Tsubasa Nakai"
   # prompt = "close up of A man walking, movie production, cinematic, photography, designed by daniel arsham, glowing white, futuristic, white liquid, highly detailed, 35mm"
   # prompt = "closeup of A woman dancing in front of a secret garden, upper body headshot, early renaissance paintings, Rogier van der Weyden paintings style"
   # prompt = "close up portrait of a woman in front of a lake artwork by Kawase Hasui"
+  # prompt = "close up head shot of girl standing in a field of flowers, windy, long blonde hair in a blue dress smiling"
+  prompt = "RAW Photo, DSLR BREAK a young woman with bangs, (light smile:0.8), (smile:0.5), wearing relaxed shirt and trousers, causal clothes, (looking at viewer), focused, (modern and cozy office space), design agency office, spacious and open office, Scandinavian design space BREAK detailed, natural light"
+  # prompt = "taken with iphone camera BREAK medium shot selfie of a pretty young woman BREAK (ombre:1.3) blonde pink BREAK film grain, medium quality"
+  # prompt = "girl posing outside a bar on a rainy day, black clothes, street, neon sign, movie production still, high quality, neo-noir"
+  # prompt = "cowboy shot, cyberpunk jacket, camera following woman walking and smoking down street on rainy night, led sign"
   # prompt = "A lego ninja bending down to pick a flower in the style of the lego movie. High quality render by arnold. Animal logic. 3D soft focus"
   # prompt = "Glowing jellyfish, calm, slow hypnotic undulations, 35mm Nature photography, award winning"
   # prompt = "synthwave retrowave vaporware back of a delorean driving on highway, dmc rear grill, neon lights, palm trees and sunset in background"
@@ -774,18 +868,21 @@ if __name__ == "__main__":
   # lora_file=None
   # lora_file
   # model = "/mnt/newdrive/automatic1111/models/Stable-diffusion/dreamshaper_6BakedVae.safetensors"
-  model = "/mnt/newdrive/automatic1111/models/Stable-diffusion/dreamshaper_8.safetensors"
+  # model = "/mnt/newdrive/automatic1111/models/Stable-diffusion/dreamshaper_8.safetensors"
+  model = "/mnt/newdrive/automatic1111/models/Stable-diffusion/epicrealism_pureEvolutionV5.safetensors"
   # model = "/mnt/newdrive/automatic1111/models/Stable-diffusion/deliberate_v2.safetensors"
   # model = "/mnt/newdrive/automatic1111/models/Stable-diffusion/absolutereality_v181.safetensors"
+  # model = "/mnt/newdrive/automatic1111/models/Stable-diffusion/neonskiesai_V10.safetensors"
+  # model = "/mnt/newdrive/automatic1111/models/Stable-diffusion/synthwavepunk_v2.ckpt"
   run(model, 
       prompt=prompt,
       negative_prompt="clone, cloned, bad anatomy, wrong anatomy, mutated hands and fingers, mutation, mutated, amputation, 3d render, lowres, signs, memes, labels, text, error, mutant, worst quality, low quality, normal quality, jpeg artifacts, signature, watermark, username, blurry, made by children, caricature, ugly, boring, sketch, lacklustre, repetitive, cropped, (long neck), body horror, out of frame, mutilated, tiled, frame, border",
-      height=1024,
-      width=576,
-      frame_count=128, # 288,
+      height=512,
+      width=512,
+      frame_count=32, # 288,
       window_count=16,
-      num_inference_steps=100,
-      guidance_scale= 7.0,
+      num_inference_steps=20,
+      guidance_scale=7.0,
       last_n=23,
       seed=42,
       dtype=torch.float16,

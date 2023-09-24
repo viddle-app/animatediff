@@ -30,7 +30,7 @@ from diffusers.schedulers import (
 from diffusers.utils import deprecate, logging, BaseOutput, randn_tensor, is_compiled_module
 
 from einops import rearrange
-from ..utils.partition_utils import partition_wrap_around_2, partitions, partitions_wrap_around
+from ..utils.partition_utils import partition_sliding, partition_wrap_around_2, partitions, partitions_wrap_around
 from diffusers.image_processor import VaeImageProcessor
 from ..models.unet import UNet3DConditionModel
 from ..models.controlnet import ControlNetModel
@@ -590,6 +590,15 @@ class AnimationPipeline(DiffusionPipeline, FromSingleFileMixin):
                 ]
                 controlnet_keep.append(keeps[0] if isinstance(controlnet, ControlNetModel) else keeps)
 
+        remainder = 1 if video_length % window_length != 0 else 0
+        partition_count = video_length // window_length  + remainder
+        min_offset = max(min_offset, 0)
+        max_offset = min(max_offset, window_length)
+        min_offset = min(min_offset, max_offset)
+        max_offset = max(min_offset, max_offset)
+        offset = min_offset
+        first_window_size = window_length - offset
+
         MODE = "write"
         def hacked_basic_transformer_inner_forward(
                 self,
@@ -622,17 +631,20 @@ class AnimationPipeline(DiffusionPipeline, FromSingleFileMixin):
                     )
                 else:
                     if MODE == "write":
-                        rearrange_norms = rearrange(norm_hidden_states, "(b f) d c -> b f d c", f=window_length)
-                        to_save = rearrange_norms[:, 0:1, :, :].detach().clone().repeat(1, window_length, 1, 1)
+                        rearrange_norms = rearrange(norm_hidden_states, "(b f) d c -> b f d c", f=norm_hidden_states.shape[0] // 2)
+                        # to_save = rearrange_norms[:, 0:1, :, :].detach().clone().repeat(1, first_window_size, 1, 1)
+                        to_save = rearrange_norms[:, 0:1, :, :].detach().clone()
                         print("to_save: ", to_save.shape)
-                        rearrange_to_save = rearrange(to_save, "b f d c -> (b f) d c")
-                        self.bank = rearrange_to_save
+                        # rearrange_to_save = rearrange(to_save, "b f d c -> (b f) d c")
+                        self.bank = to_save
                         print("bank: ", self.bank.shape)
                         print("norm_hidden_states: ", norm_hidden_states.shape)
+                    
+                    rearranged = rearrange(self.bank.repeat(1, norm_hidden_states.shape[0] // 2, 1, 1), "b f d c -> (b f) d c")
 
                     attn_output = self.attn1(
                         norm_hidden_states,
-                        encoder_hidden_states=torch.cat([norm_hidden_states, self.bank] , dim=1),
+                        encoder_hidden_states=torch.cat([norm_hidden_states, rearranged] , dim=1),
                         # attention_mask=attention_mask,
                         **cross_attention_kwargs,
                     )
@@ -682,37 +694,36 @@ class AnimationPipeline(DiffusionPipeline, FromSingleFileMixin):
 
         # start_
         # wrong but close
-        remainder = 1 if video_length % window_length != 0 else 0
-        partition_count = video_length // window_length  + remainder
-        min_offset = max(min_offset, 0)
-        max_offset = min(max_offset, window_length)
-        min_offset = min(min_offset, max_offset)
-        max_offset = max(min_offset, max_offset)
+
         images_partition = None
         # Denoising loop
         print("window_length: ", window_length)
         print("video_length: ", video_length)
+        print("min_offset: ", min_offset)
+        print("max_offset: ", max_offset)
         num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
         with self.progress_bar(total=num_inference_steps * partition_count) as progress_bar:
             for i, t in enumerate(timesteps):
 
                 print("t: ", t)
                 print("i: ", i)
-                if hasattr(self.unet, 'clear_last_encoder_hidden_states'):
-                    self.unet.clear_last_encoder_hidden_states()
-                
-                if video_length == window_length:
-                    offset = 0
-                else:
-                    if min_offset == max_offset:
-                        offset = min_offset
-                    else:
-                        random_int_tensor = torch.randint(min_offset, max_offset, (1,), generator=offset_generator)
-                        offset = random_int_tensor.item()
+                # if hasattr(self.unet, 'clear_last_encoder_hidden_states'):
+                #     self.unet.clear_last_encoder_hidden_states()
+                # 
+                # if video_length == window_length:
+                #     offset = 0
+                # else:
+                #     if min_offset == max_offset:
+                #         offset = min_offset
+                #     else:
+                #         random_int_tensor = torch.randint(min_offset, max_offset, (1,), generator=offset_generator)
+                #         offset = random_int_tensor.item()
+
+                print("offset: ", offset)
                 if wrap_around == True:
-                    indices = partition_wrap_around_2(video_length, window_length, i, offset)
+                    indices = partition_sliding(video_length, window_length, offset, i)
                 else:
-                    indices = partitions(video_length, window_length, i, offset)
+                    indices = partition_sliding(video_length, window_length, offset, i)
                 print("indices: ", indices)
                 if i % 2 == 1 and alternate_direction == True:
                     indices = reversed(indices)
@@ -818,7 +829,7 @@ class AnimationPipeline(DiffusionPipeline, FromSingleFileMixin):
                             mid_block_res_sample = torch.cat([torch.zeros_like(mid_block_res_sample), mid_block_res_sample])
 
                     step_percentage = i / len(timesteps)
-                    should_use_ufree = 0.6 < step_percentage
+                    should_use_ufree = 0.7 < step_percentage
                     backbone_scale_1 = 1.2 if should_use_ufree else 1.0
                     backbone_scale_2 = 1.4 if should_use_ufree else 1.0
                     skip_scale_1 = 0.0 if should_use_ufree else 1.0
@@ -835,24 +846,24 @@ class AnimationPipeline(DiffusionPipeline, FromSingleFileMixin):
                                         down_block_additional_residuals=down_block_res_samples,
                                         mid_block_additional_residual=mid_block_res_sample,
                                         return_dict=False,
-                                        backbone_scale_1=backbone_scale_1,
-                                        backbone_scale_2=backbone_scale_2,
-                                        skip_scale_1=skip_scale_1,
-                                        skip_scale_2=skip_scale_2,
-                                        skip_scale_threshold_1=skip_scale_threshold_1,
-                                        skip_scale_threshold_2=skip_scale_threshold_2,
+                                        # backbone_scale_1=backbone_scale_1,
+                                        # backbone_scale_2=backbone_scale_2,
+                                        # skip_scale_1=skip_scale_1,
+                                        # skip_scale_2=skip_scale_2,
+                                        # skip_scale_threshold_1=skip_scale_threshold_1,
+                                        # skip_scale_threshold_2=skip_scale_threshold_2,
 
                                     )[0]
                     else:
                         noise_pred = self.unet(latent_model_input, 
                                             t, 
                                             encoder_hidden_states=text_embeddings,
-                                            backbone_scale_1=backbone_scale_1,
-                                            backbone_scale_2=backbone_scale_2,
-                                            skip_scale_1=skip_scale_1,
-                                            skip_scale_2=skip_scale_2,
-                                            skip_scale_threshold_1=skip_scale_threshold_1,
-                                            skip_scale_threshold_2=skip_scale_threshold_2,
+                                            # backbone_scale_1=backbone_scale_1,
+                                            # backbone_scale_2=backbone_scale_2,
+                                            # skip_scale_1=skip_scale_1,
+                                            # skip_scale_2=skip_scale_2,
+                                            # skip_scale_threshold_1=skip_scale_threshold_1,
+                                            # skip_scale_threshold_2=skip_scale_threshold_2,
                                             ).sample.to(dtype=latents_dtype)
                     # perform guidance
                     if do_classifier_free_guidance:

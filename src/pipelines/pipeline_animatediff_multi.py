@@ -817,14 +817,7 @@ class AnimationPipeline(DiffusionPipeline, FromSingleFileMixin):
                             down_block_res_samples = [torch.cat([torch.zeros_like(d), d]) for d in down_block_res_samples]
                             mid_block_res_sample = torch.cat([torch.zeros_like(mid_block_res_sample), mid_block_res_sample])
 
-                    step_percentage = i / len(timesteps)
-                    should_use_ufree = 0.6 < step_percentage
-                    backbone_scale_1 = 1.2 if should_use_ufree else 1.0
-                    backbone_scale_2 = 1.4 if should_use_ufree else 1.0
-                    skip_scale_1 = 0.0 if should_use_ufree else 1.0
-                    skip_scale_2 = 0.0 if should_use_ufree else 1.0
-                    skip_scale_threshold_1 = 1
-                    skip_scale_threshold_2 = 2
+
                     # predict the noise residual
                     if controlnet is not None:
                         noise_pred = self.unet(
@@ -835,24 +828,11 @@ class AnimationPipeline(DiffusionPipeline, FromSingleFileMixin):
                                         down_block_additional_residuals=down_block_res_samples,
                                         mid_block_additional_residual=mid_block_res_sample,
                                         return_dict=False,
-                                        backbone_scale_1=backbone_scale_1,
-                                        backbone_scale_2=backbone_scale_2,
-                                        skip_scale_1=skip_scale_1,
-                                        skip_scale_2=skip_scale_2,
-                                        skip_scale_threshold_1=skip_scale_threshold_1,
-                                        skip_scale_threshold_2=skip_scale_threshold_2,
-
                                     )[0]
                     else:
                         noise_pred = self.unet(latent_model_input, 
                                             t, 
-                                            encoder_hidden_states=text_embeddings,
-                                            backbone_scale_1=backbone_scale_1,
-                                            backbone_scale_2=backbone_scale_2,
-                                            skip_scale_1=skip_scale_1,
-                                            skip_scale_2=skip_scale_2,
-                                            skip_scale_threshold_1=skip_scale_threshold_1,
-                                            skip_scale_threshold_2=skip_scale_threshold_2,
+                                            encoder_hidden_states=text_embeddings
                                             ).sample.to(dtype=latents_dtype)
                     # perform guidance
                     if do_classifier_free_guidance:

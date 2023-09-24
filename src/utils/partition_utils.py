@@ -1,4 +1,8 @@
+from typing import List
 import torch
+from torch import FloatTensor
+from typing import List
+import numpy as np
 
 def partitions(elementCount, windowSize, index, offset):
     # Initialize the starting point for the first window
@@ -105,6 +109,10 @@ def partition_wrap_around_2(elementCount, windowSize, index, offset=1):
 
     return shifted_windows
 
+# need explain to chatgpt how to do this
+# def partition_wrap_around_2(elementCount, windowSize, index, offset=1):
+
+
 def shifted_passes(elementCount, windowSize):
     even_pass = partition_wrap_around_2(elementCount, windowSize, 0)
     odd_pass = partition_wrap_around_2(elementCount, windowSize, 1)
@@ -203,10 +211,157 @@ def indices_for_averaging(frame_count, window_size, offset):
         result[-1] = (result[-1][0], frame_count)
     return result
 
+
+class Range:
+    def __init__(self, start, end):
+        self.start = start
+        self.end = end
+
+    def __str__(self):
+        return f"Range({self.start}, {self.end})"
+    
+    __repr__ = __str__
+
+class Slice3D:
+    def __init__(self, 
+                 ts:Range, 
+                 xs:Range, 
+                 ys:Range,
+    ): 
+        self.ts = ts
+        self.xs = xs
+        self.ys = ys
+
+    def __str__(self):
+        return f"Slice3D(ts={self.ts}, xs={self.xs}, ys={self.ys})"
+
+    __repr__ = __str__
+
+# Assuming FloatTensor is a pre-defined type or class
+# If FloatTensor is a typo or if it's just an example, you can replace it with the correct type
+class WeightedSlice3D:
+    def __init__(self, 
+                 ts:Range, 
+                 xs:Range, 
+                 ys:Range,
+                 weights,  # type FloatTensor is removed for clarity unless you define it
+    ): 
+        self.ts = ts
+        self.xs = xs
+        self.ys = ys
+        self.weights = weights
+
+    def __str__(self):
+        return f"WeightedSlice3D(ts={self.ts}, xs={self.xs}, ys={self.ys}, weights={self.weights})"
+    
+    __repr__ = __str__
+
+
+# returns a list of Slice3D objects
+# if wrap_around False then only a single Slice3D object is returned
+# otherwise potentially two Slice3D objects are returned
+# for regions that wrap around
+# the 
+
+
+
+def compute_slices(region: Range, window: Range, offset: Range, max_limit: int, wrap_around: bool):
+    start = region.start + offset.start
+    end = region.start + window.end + offset.start
+
+    # Split the slices if wrap_around is True and the slice exceeds the bounds.
+    if wrap_around and end > max_limit:
+        # Calculate the portion that exceeds the limit
+        overflow = end - max_limit
+        return [Range(start, max_limit), Range(region.start, overflow)]
+    else:
+        return [Range(max(0, start), min(end, max_limit))]
+
+def multi(whole_region: Slice3D, window: Slice3D, offset: Slice3D, wrap_around: bool):
+    ts_slices = compute_slices(whole_region.ts, window.ts, offset.ts, whole_region.ts.end, wrap_around)
+    xs_slices = compute_slices(whole_region.xs, window.xs, offset.xs, whole_region.xs.end, wrap_around)
+    ys_slices = compute_slices(whole_region.ys, window.ys, offset.ys, whole_region.ys.end, wrap_around)
+    
+    # Forming the slices
+    slices = []
+    for t in ts_slices:
+        for x in xs_slices:
+            for y in ys_slices:
+                slices.append(Slice3D(t, x, y))
+    
+    return slices
+
+def compute_weights(slice_range: Range, window: Range, offset: Range, max_limit: int):
+    # Calculate the overlap range
+    overlap_start = max(slice_range.start, window.start + offset.start)
+    overlap_end = min(slice_range.end, window.end + offset.start)
+    
+    overlap_length = max(0, overlap_end - overlap_start)
+    
+    # Initialize weights to 1
+    weights = np.ones(slice_range.end - slice_range.start)
+    
+    if overlap_length > 0:
+        # Linearly interpolate weights for the overlap region
+        weights[overlap_start - slice_range.start: overlap_end - slice_range.start] = \
+            np.linspace(0, 1, overlap_length)
+    
+    return weights
+
+def multi_with_weights(whole_region: Slice3D, window: Slice3D, offset: Slice3D, wrap_around: bool):
+    ts_slices = compute_slices(whole_region.ts, window.ts, offset.ts, whole_region.ts.end, wrap_around)
+    xs_slices = compute_slices(whole_region.xs, window.xs, offset.xs, whole_region.xs.end, wrap_around)
+    ys_slices = compute_slices(whole_region.ys, window.ys, offset.ys, whole_region.ys.end, wrap_around)
+    
+    # Forming the weighted slices
+    weighted_slices = []
+    for t in ts_slices:
+        for x in xs_slices:
+            for y in ys_slices:
+                ts_weights = compute_weights(t, window.ts, offset.ts, whole_region.ts.end)
+                xs_weights = compute_weights(x, window.xs, offset.xs, whole_region.xs.end)
+                ys_weights = compute_weights(y, window.ys, offset.ys, whole_region.ys.end)
+                
+                # Form a 3D weight tensor by broadcasting the individual weights
+                weights = ts_weights[:, None, None] * xs_weights[None, :, None] * ys_weights[None, None, :]
+                weighted_slices.append(WeightedSlice3D(t, x, y, weights))
+    
+    return weighted_slices
+
+def partition_sliding(elementCount, windowSize, offset, index):
+    actual_offset = offset - (index % offset)
+
+    start = 0
+    end = windowSize - actual_offset
+    partitions = [[start, end]]
+
+    start = end
+    while start < elementCount:
+        end = start + windowSize
+        partitions.append([start, min(end, elementCount)])
+        start = end
+
+    # if the last entry is not greater than window size - actual_offset
+    # then combine the last two entries
+    if partitions[-1][1] - partitions[-1][0] <= windowSize - actual_offset:
+        partitions[-2][1] = partitions[-1][1]
+        partitions = partitions[:-1]
+
+    return partitions
+
 if __name__ == "__main__":
-    element_count = 40
-    window_size = 16
-    index = 8
-    offset = 12
-    result = indices_for_averaging(element_count, window_size, offset)
+    # element_count = 64
+    # window_size = 16
+    # index = 0
+    # offset = 4
+    # for i in range(20):
+    #     result = partition_sliding(element_count, window_size, offset, i)
+    #     print(result)
+
+    wrap_around = True
+    whole_region = Slice3D(Range(0, 4), Range(0, 4), Range(0, 4))
+    window = Slice3D(Range(0, 2), Range(0, 2), Range(0, 2))
+    offset = Slice3D(Range(0, 1), Range(0, 1), Range(0, 1))
+
+    result = multi(whole_region, window, offset, wrap_around)
     print(result)

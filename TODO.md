@@ -28,3 +28,16 @@ Docker image for training
 Finish second blog post
 Add images
 
+First port over cross attention
+
+We could look at collaborative score distillation
+As a way to using motion astetic classier
+
+to guide the sample process
+
+We need to train a aestehtic model for video clips
+How can we train that?
+
+We need a data set that scores video clips by voting
+The goal is build a video voting system
+that makes data that is used to train a classifier

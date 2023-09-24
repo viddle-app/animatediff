@@ -26,10 +26,28 @@ from .unet_blocks import (
     get_up_block,
 )
 from .resnet import InflatedConv3d, InflatedGroupNorm
-
+import torch.fft as fft
+from einops import rearrange
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
+def Fourier_filter(x, threshold, scale):
+    # FFT
+    x_freq = fft.fftn(x, dim=(-2, -1))
+    x_freq = fft.fftshift(x_freq, dim=(-2, -1))
+    
+    B, C, H, W = x_freq.shape
+    mask = torch.ones_like(x_freq)
+
+    crow, ccol = H // 2, W //2
+    mask[..., crow - threshold:crow + threshold, ccol - threshold:ccol + threshold] = scale
+    x_freq = x_freq * mask
+
+    # IFFT
+    x_freq = fft.ifftshift(x_freq, dim=(-2, -1))
+    x_filtered = fft.ifftn(x_freq, dim=(-2, -1)).real
+    
+    return x_filtered
 
 @dataclass
 class UNet3DConditionOutput(BaseOutput):
@@ -492,10 +510,12 @@ class UNet3DConditionModel(ModelMixin, ConfigMixin):
         cross_attention_kwargs: Optional[Dict[str, Any]] = None,
         encoder_attention_mask: Optional[torch.Tensor] = None,
         return_dict: bool = True,
-        backbone_scale: Optional[float] = None,
-        skip_scale: Optional[float] = None,
-        backbone_scale_threshold: Optional[float] = None,
-        skip_scale_threshold: Optional[float] = None,
+        backbone_scale_1: Optional[float] = 1.2,
+        backbone_scale_2: Optional[float] = 1.4,
+        skip_scale_1: Optional[float] = 0.9,
+        skip_scale_2: Optional[float] = 0.2,
+        skip_scale_threshold_1: Optional[float] = 1,
+        skip_scale_threshold_2: Optional[float] = 1,
     ) -> Union[UNet3DConditionOutput, Tuple]:
         r"""
         Args:
@@ -627,13 +647,37 @@ class UNet3DConditionModel(ModelMixin, ConfigMixin):
             is_final_block = i == len(self.up_blocks) - 1
 
             res_samples = down_block_res_samples[-len(upsample_block.resnets) :]
-            print("res_samples", len(res_samples), res_samples[0].shape, res_samples[1].shape, res_samples[2].shape, res_samples[3].shape)
             down_block_res_samples = down_block_res_samples[: -len(upsample_block.resnets)]
 
             # if we have not reached the final block and need to forward the
             # upsample size, we do it here
             if not is_final_block and forward_upsample_size:
                 upsample_size = down_block_res_samples[-1].shape[2:]
+
+            skip_states = res_samples[-1]
+
+            print("sample.shape", sample.shape)
+            if sample.shape[1] == 1280:
+                print("apply freeu to 1280")
+                sample[:,:640] = sample[:,:640] * backbone_scale_1
+
+                frame_count = skip_states.shape[2]
+                print("frame_count", frame_count)
+                rearranged_skip_states = rearrange(skip_states, "b c f h w -> (b f) c h w")
+                rearranged_skip_states = Fourier_filter(rearranged_skip_states.to(dtype=torch.float32), threshold=skip_scale_threshold_1, scale=skip_scale_1).to(dtype=sample.dtype)
+                skip_states = rearrange(rearranged_skip_states, "(b f) c h w -> b c f h w", f=frame_count)
+
+            if sample.shape[1] == 640:
+                print("apply freeu to 640")
+                sample[:,:320] = sample[:,:320] * backbone_scale_2
+                frame_count = skip_states.shape[2]
+                print("frame_count", frame_count)
+                rearranged_skip_states = rearrange(skip_states, "b c f h w -> (b f) c h w")
+                rearranged_skip_states = Fourier_filter(rearranged_skip_states.to(dtype=torch.float32), threshold=skip_scale_threshold_2, scale=skip_scale_2).to(dtype=sample.dtype)
+                skip_states = rearrange(rearranged_skip_states, "(b f) c h w -> b c f h w", f=frame_count)
+
+            res_samples = res_samples[:-1] + (skip_states,)
+
 
             if hasattr(upsample_block, "has_cross_attention") and upsample_block.has_cross_attention:
                 sample = upsample_block(
@@ -651,10 +695,6 @@ class UNet3DConditionModel(ModelMixin, ConfigMixin):
                     res_hidden_states_tuple=res_samples, 
                     upsample_size=upsample_size, 
                     encoder_hidden_states=encoder_hidden_states,
-                    backbone_scale=backbone_scale, 
-                    backbone_scale_threshold=backbone_scale_threshold,
-                    skip_scale=skip_scale,
-                    skip_scale_threshold=skip_scale_threshold,
                 )
 
         # post-process
