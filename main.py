@@ -8,7 +8,7 @@ import sys
 import uuid
 import torch.nn.functional as F
 use_ufree = False
-use_type = 'overlapping_previous_1'
+use_type = 'pix2pix_2'
 if use_type == 'overlapping':
   from src.pipelines.pipeline_animatediff_overlapping import AnimationPipeline
 elif use_type == 'conv':
@@ -19,6 +19,8 @@ elif use_type == 'overlapping_previous':
   from src.pipelines.pipeline_animatediff_overlapping_previous import AnimationPipeline
 elif use_type == 'overlapping_previous_1':
   from src.pipelines.pipeline_animatediff_overlapping_previous_1 import AnimationPipeline
+elif use_type == 'overlapping_previous_2':
+  from src.pipelines.pipeline_animatediff_overlapping_previous_2 import AnimationPipeline
 elif use_type == 'circular':
   from src.pipelines.pipeline_animatediff_circular import AnimationPipeline
 elif use_type == 'overlapping_2':
@@ -32,7 +34,9 @@ elif use_type == 'reference':
 elif use_type == "init_image":
   from src.pipelines.pipeline_animatediff_init_image import AnimationPipeline
 elif use_type == "ufree":
-   from src.pipelines.pipeline_animatediff_ufree import AnimationPipeline
+  from src.pipelines.pipeline_animatediff_ufree import AnimationPipeline
+elif use_type == "pix2pix_2":
+   from src.pipelines.pipeline_animatediff_pix2pix_2 import StableDiffusionInstructPix2PixPipeline
 else:
   from src.pipelines.pipeline_animatediff import AnimationPipeline
 from src.pipelines.pipeline_animatediff_controlnet import StableDiffusionControlNetPipeline
@@ -49,6 +53,7 @@ from src.models.controlnet import ControlNetModel
 from PIL import Image
 from src.utils.image_utils import create_gif, create_mp4_from_images, tensor_to_image_sequence
 from diffusers.utils import randn_tensor
+from torchvision.transforms import ToTensor
 
 class AttentionProcessorController:
     def __init__(self) -> None:
@@ -132,6 +137,7 @@ def set_upcast_softmax_to_false(obj):
 
 def make_preencoded_image_latents(pipe, init_latents, device, dtype, generator, timestep, noise_multiplier=1.0):
   shape = init_latents.shape
+  print("shape", shape)
   # noise = randn_tensor(shape, generator=generator, device=device, dtype=dtype)'
   # noise = make_progressive_latents(shape[0], shape[2], shape[3], alpha=50)
   noise = randn_tensor(shape, generator=generator, device=device, dtype=dtype)  
@@ -367,9 +373,10 @@ def run(model,
   device = "cuda" if torch.cuda.is_available() else "cpu"
 
   unet_additional_kwargs = {
+    "in_channels": 8,
     "unet_use_cross_frame_attention": False,
     "unet_use_temporal_attention": False,
-    "use_motion_module": True,
+    "use_motion_module": False,
     "motion_module_resolutions": [1, 2, 4, 8],
     "motion_module_mid_block": False,
     "motion_module_decoder_only": False,
@@ -412,10 +419,10 @@ def run(model,
 
   unet = unet.to(dtype=dtype) 
 
-  use_controlnet = False
+  use_controlnet = True
 
 
-  if (use_type == "overlapping_previous" or use_type == 'conv' or use_type == 'overlapping_previous_1') and use_controlnet:
+  if (use_type == "overlapping_previous" or use_type == 'conv' or use_type == 'overlapping_previous_1' or use_type == 'overlapping_previous_2') and use_controlnet:
     # controlnet_path = Path("../models/ControlNet-v1-1/control_v11p_sd15_openpose.yaml")
     controlnet_path = "lllyasviel/control_v11p_sd15_openpose"
     # controlnet_path = "lllyasviel/control_v11f1e_sd15_tile"
@@ -429,6 +436,17 @@ def run(model,
       unet=unet,
       scheduler=EulerAncestralDiscreteScheduler(**scheduler_kwargs),
       controlnet=controlnet,
+    ).to(device)
+  elif use_type == "pix2pix_2":
+    pipeline = StableDiffusionInstructPix2PixPipeline(
+      vae=vae, 
+      text_encoder=text_encoder, 
+      tokenizer=tokenizer, 
+      unet=unet,
+      scheduler=EulerAncestralDiscreteScheduler(**scheduler_kwargs),
+      safety_checker=None,
+      feature_extractor=None,
+      requires_safety_checker=False,
     ).to(device)
   else:
 
@@ -487,7 +505,7 @@ def run(model,
   generators = torch.Generator().manual_seed(seed)
 
   do_upscale = False
-  use_img2img = False
+  use_img2img = True
 
 
   if use_type == 'overlapping' or use_type == 'overlapping_noise_pred' or use_type == 'overlapping_2' or use_type == 'overlapping_3' or use_type == 'overlapping_4' :
@@ -520,7 +538,7 @@ def run(model,
               strength=0.25,
               window_count=window_count//4,
               )
-  elif use_type == 'overlapping_previous' or use_type == 'conv' or use_type == 'overlapping_previous_1':
+  elif use_type == 'overlapping_previous' or use_type == 'conv' or use_type == 'overlapping_previous_1' or use_type == 'overlapping_previous_2':
       if use_controlnet:
         # load 16 frames from the directory
         open_pose_path = Path("/mnt/newdrive/stable-diffusion-docker/output/dwpose")
@@ -585,8 +603,8 @@ def run(model,
                                   dtype=dtype,
                                   generator=generators,
                                   noise_image=encoded_video,
-                                  strength = 0.95,
-                                  noise_multiplier=1.0,
+                                  strength = 0.75,
+                                  noise_multiplier=0.5,
                                   )
           latents = latents.unsqueeze(0).permute(0, 2, 1, 3, 4)
           print("latents", latents.shape)
@@ -793,6 +811,47 @@ def run(model,
               last_n=last_n,
               window_size=window_count,
               video_length=frame_count).videos[0]
+  elif use_type == 'pix2pix_2':
+    # resize the image to the correct size
+    image = Image.open("mona-lisa-1.jpg")
+    image = image.resize((width, height))
+
+    # make a 
+    def f(x):
+      return 2.0 - 4*torch.exp(-1 / (1 - (x - 1) ** 2))
+
+    def sample_function(frame_count):
+        x_values = torch.linspace(0, 2, frame_count)
+        y_values = f(x_values)
+        return y_values
+
+
+    y_values_list = sample_function(frame_count).to(device=device, dtype=dtype)
+    print("y_values_list", y_values_list)
+
+    video = pipeline(prompt=prompt,
+            negative_prompt=negative_prompt,
+            num_inference_steps=num_inference_steps,
+            guidance_scale=guidance_scale,
+            image=image,
+            video_length=frame_count,
+            image_guidance_scale=y_values_list,
+              # width=width,
+              # height=height,
+              # window_size=window_count,
+            
+              )[0]
+    # convert the list of PIL.Image images to a tensor
+
+    # Convert each PIL.Image to a numpy array
+    transform = ToTensor()
+    tensors = [transform(img) for img in video]
+
+# Stack these tensors together
+    video = torch.stack(tensors, dim=0)
+    print("video", video.shape)
+
+    video = video.permute(1, 0, 2, 3)
 
   else:
     video = pipeline(prompt=prompt, 
@@ -808,7 +867,7 @@ def run(model,
 
     # save the tensor 
     # torch.save(video, output_path + ".pt")
-
+  print("video", video.shape)
   # tensor_to_video(video, output_path,                     fps=frame_count)
   # remove the images dir
   # check if the images dir exists
@@ -817,7 +876,7 @@ def run(model,
   os.makedirs(output_dir, exist_ok=True)
   filename = str(uuid.uuid4())
   output_path = os.path.join(output_dir, filename + ".gif")
-  fps = 8
+  fps = 30
   tensor_to_image_sequence(video, "images")
   images = glob.glob("images/*.png")
   images.sort()
@@ -831,7 +890,7 @@ def run(model,
 if __name__ == "__main__":
   # prompt = "photograph of a bald man laughing"
   # prompt = "photograph of a man scared"
-  # prompt = "A woman laughing"
+  prompt = "Make her smile"
   # prompt = "full body of a Girl swaying, red blouse, illustration by Wu guanzhong,China village,twojjbe trees in front of my chinese house,light orange, pink,white,blue ,8k"
   # prompt = "paint by frazetta, man dancing, mountain blue sky in background"
   # prompt = "1man dancing outside, clear blue sky sunny day, photography, award winning, highly detailed, bright, well lit"
@@ -840,7 +899,7 @@ if __name__ == "__main__":
   # prompt = "closeup of A woman dancing in front of a secret garden, upper body headshot, early renaissance paintings, Rogier van der Weyden paintings style"
   # prompt = "close up portrait of a woman in front of a lake artwork by Kawase Hasui"
   # prompt = "close up head shot of girl standing in a field of flowers, windy, long blonde hair in a blue dress smiling"
-  prompt = "RAW Photo, DSLR BREAK a young woman with bangs, (light smile:0.8), (smile:0.5), wearing relaxed shirt and trousers, causal clothes, (looking at viewer), focused, (modern and cozy office space), design agency office, spacious and open office, Scandinavian design space BREAK detailed, natural light"
+  # prompt = "RAW Photo, DSLR BREAK a young woman with bangs, (light smile:0.8), (smile:0.5), wearing relaxed shirt and trousers, causal clothes, (looking at viewer), focused, (modern and cozy office space), design agency office, spacious and open office, Scandinavian design space BREAK detailed, natural light"
   # prompt = "taken with iphone camera BREAK medium shot selfie of a pretty young woman BREAK (ombre:1.3) blonde pink BREAK film grain, medium quality"
   # prompt = "girl posing outside a bar on a rainy day, black clothes, street, neon sign, movie production still, high quality, neo-noir"
   # prompt = "cowboy shot, cyberpunk jacket, camera following woman walking and smoking down street on rainy night, led sign"
@@ -869,7 +928,8 @@ if __name__ == "__main__":
   # lora_file
   # model = "/mnt/newdrive/automatic1111/models/Stable-diffusion/dreamshaper_6BakedVae.safetensors"
   # model = "/mnt/newdrive/automatic1111/models/Stable-diffusion/dreamshaper_8.safetensors"
-  model = "/mnt/newdrive/automatic1111/models/Stable-diffusion/epicrealism_pureEvolutionV5.safetensors"
+  # model = "/mnt/newdrive/automatic1111/models/Stable-diffusion/epicrealism_pureEvolutionV5.safetensors"
+  model = "/mnt/newdrive/automatic1111/models/Stable-diffusion/instruct-pix2pix-00-22000.ckpt"
   # model = "/mnt/newdrive/automatic1111/models/Stable-diffusion/deliberate_v2.safetensors"
   # model = "/mnt/newdrive/automatic1111/models/Stable-diffusion/absolutereality_v181.safetensors"
   # model = "/mnt/newdrive/automatic1111/models/Stable-diffusion/neonskiesai_V10.safetensors"
@@ -880,9 +940,9 @@ if __name__ == "__main__":
       height=512,
       width=512,
       frame_count=32, # 288,
-      window_count=16,
+      window_count=32,
       num_inference_steps=20,
-      guidance_scale=7.0,
+      guidance_scale=7.5,
       last_n=23,
       seed=42,
       dtype=torch.float16,

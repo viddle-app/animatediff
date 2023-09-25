@@ -1,4 +1,4 @@
-from typing import List
+from typing import Any, List
 import torch
 from torch import FloatTensor
 from typing import List
@@ -237,6 +237,19 @@ class Slice3D:
 
     __repr__ = __str__
 
+class Offset3D:
+    def __init__(self,
+                 t: int, x: int, y: int):
+        self.t = t
+        self.x = x
+        self.y = y
+
+    def __str__(self):
+        return f"Offset3D(t={self.t}, x={self.x}, y={self.y})"
+    
+    __repr__ = __str__
+        
+
 # Assuming FloatTensor is a pre-defined type or class
 # If FloatTensor is a typo or if it's just an example, you can replace it with the correct type
 class WeightedSlice3D:
@@ -256,31 +269,44 @@ class WeightedSlice3D:
     
     __repr__ = __str__
 
+def compute_slices(region: Range, window: Range, offset: int, max_limit: int, wrap_around: bool):
+    slices = []
+    
+    # Starting position
+    pos = region.start
+    
+    # Keep track of the positions we have already processed to avoid infinite loops
+    processed_positions = set()
+    
+    while pos < region.end and pos not in processed_positions:
+        processed_positions.add(pos)
+        
+        end_pos = pos + window.end - window.start
+        
+        if wrap_around and end_pos > max_limit:
+            # Add the portion until max_limit
+            slices.append(Range(pos, max_limit))
+            
+            # Calculate the overflow and wrap around
+            overflow = end_pos - max_limit
+            slices.append(Range(region.start, region.start + overflow))
+            
+            # Next starting position considering the offset and wrap-around
+            pos = region.start + overflow
+        else:
+            slices.append(Range(pos, min(end_pos, region.end)))
+            pos += offset  # Move to the next starting position by the offset value
+            
+    return slices
 
-# returns a list of Slice3D objects
-# if wrap_around False then only a single Slice3D object is returned
-# otherwise potentially two Slice3D objects are returned
-# for regions that wrap around
-# the 
 
 
 
-def compute_slices(region: Range, window: Range, offset: Range, max_limit: int, wrap_around: bool):
-    start = region.start + offset.start
-    end = region.start + window.end + offset.start
 
-    # Split the slices if wrap_around is True and the slice exceeds the bounds.
-    if wrap_around and end > max_limit:
-        # Calculate the portion that exceeds the limit
-        overflow = end - max_limit
-        return [Range(start, max_limit), Range(region.start, overflow)]
-    else:
-        return [Range(max(0, start), min(end, max_limit))]
-
-def multi(whole_region: Slice3D, window: Slice3D, offset: Slice3D, wrap_around: bool):
-    ts_slices = compute_slices(whole_region.ts, window.ts, offset.ts, whole_region.ts.end, wrap_around)
-    xs_slices = compute_slices(whole_region.xs, window.xs, offset.xs, whole_region.xs.end, wrap_around)
-    ys_slices = compute_slices(whole_region.ys, window.ys, offset.ys, whole_region.ys.end, wrap_around)
+def multi(whole_region: Slice3D, window: Slice3D, offset: Offset3D, wrap_around: bool):
+    ts_slices = compute_slices(whole_region.ts, window.ts, offset.t, whole_region.ts.end, wrap_around)
+    xs_slices = compute_slices(whole_region.xs, window.xs, offset.x, whole_region.xs.end, wrap_around)
+    ys_slices = compute_slices(whole_region.ys, window.ys, offset.y, whole_region.ys.end, wrap_around)
     
     # Forming the slices
     slices = []
@@ -290,6 +316,7 @@ def multi(whole_region: Slice3D, window: Slice3D, offset: Slice3D, wrap_around: 
                 slices.append(Slice3D(t, x, y))
     
     return slices
+
 
 def compute_weights(slice_range: Range, window: Range, offset: Range, max_limit: int):
     # Calculate the overlap range
@@ -349,19 +376,70 @@ def partition_sliding(elementCount, windowSize, offset, index):
 
     return partitions
 
+def partition_sliding_2(elementCount, windowSize, offset):
+    if windowSize <= 0 or offset <= 0 or elementCount <= 0:
+        raise ValueError("Inputs must be positive integers.")
+
+    # Calculate how many steps to move forward after each window
+    step = windowSize - offset
+
+    # Initialize starting point of the window
+    start = 0
+    end = start + windowSize
+    windows = []
+
+    # Function to calculate the weights for a window
+    def calculate_weights(window_idx, total_windows):
+        weights = [1.0] * windowSize
+
+        # If it's not the first window, handle the overlap at the beginning
+        if window_idx > 0:
+            for i in range(offset):
+                blend_weight = i / float(offset)
+                weights[i] = blend_weight
+
+        # If it's not the last window, handle the overlap at the end
+        if window_idx < total_windows - 1:
+            for i in range(windowSize - offset, windowSize):
+                blend_weight = 1.0 - (i - (windowSize - offset)) / float(offset)
+                weights[i] = blend_weight
+
+        return weights
+
+    # First window
+    windows.append([start, end, calculate_weights(0, 2)])
+    start += step
+
+    window_idx = 1
+    while end + step < elementCount:
+        end = start + windowSize
+        windows.append([start, end, calculate_weights(window_idx, 3)])
+
+        # Move the window forward
+        start += step
+        window_idx += 1
+
+    # Last window, might be truncated
+    end = min(start + windowSize, elementCount)
+    windows.append([start, end, calculate_weights(window_idx, window_idx)])
+
+    return windows
+
+
+
 if __name__ == "__main__":
-    # element_count = 64
-    # window_size = 16
-    # index = 0
-    # offset = 4
-    # for i in range(20):
-    #     result = partition_sliding(element_count, window_size, offset, i)
-    #     print(result)
-
-    wrap_around = True
-    whole_region = Slice3D(Range(0, 4), Range(0, 4), Range(0, 4))
-    window = Slice3D(Range(0, 2), Range(0, 2), Range(0, 2))
-    offset = Slice3D(Range(0, 1), Range(0, 1), Range(0, 1))
-
-    result = multi(whole_region, window, offset, wrap_around)
+    element_count = 64
+    window_size = 16
+    index = 0
+    offset = 4
+    
+    result = partition_sliding_2(element_count, window_size, offset)
     print(result)
+
+    # wrap_around = True
+    # whole_region = Slice3D(Range(0, 4), Range(0, 4), Range(0, 4))
+    # window = Slice3D(Range(0, 2), Range(0, 2), Range(0, 2))
+    # offset = Offset3D(1, 1, 1)
+# 
+    # result = multi(whole_region, window, offset, wrap_around)
+    # print(result)
