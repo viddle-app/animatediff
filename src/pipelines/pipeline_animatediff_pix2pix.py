@@ -235,7 +235,7 @@ class AnimationPipeline(DiffusionPipeline, FromSingleFileMixin):
             # For classifier free guidance, we need to do two forward passes.
             # Here we concatenate the unconditional and text embeddings into a single batch
             # to avoid doing two forward passes
-            text_embeddings = torch.cat([text_embeddings, uncond_embeddings, uncond_embeddings])
+            text_embeddings = torch.cat([text_embeddings, uncond_embeddings, ])
 
         return text_embeddings
 
@@ -351,7 +351,7 @@ class AnimationPipeline(DiffusionPipeline, FromSingleFileMixin):
             batch_size = latents.shape[0]
         if isinstance(prompt, list):
             batch_size = len(prompt)
-rrq23342322
+
         device = self._execution_device
         # here `guidance_scale` is defined analog to the guidance weight `w` of equation (2)
         # of the Imagen paper: https://arxiv.org/pdf/2205.11487.pdf . `guidance_scale = 1`

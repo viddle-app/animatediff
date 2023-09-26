@@ -41,3 +41,11 @@ How can we train that?
 We need a data set that scores video clips by voting
 The goal is build a video voting system
 that makes data that is used to train a classifier
+
+we can acheive blending by sometimes
+have the window be different lengths
+
+don't shift a window
+shift how much they overlap. 
+
+The model for image 

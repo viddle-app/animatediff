@@ -2,14 +2,13 @@
 # Adapted from https://github.com/guoyww/AnimateDiff/blob/main/animatediff/pipelines/pipeline_animation.py
 
 import inspect
-from typing import Callable, List, Optional, Union
+from typing import Any, Callable, Dict, List, Optional, Union
 from dataclasses import dataclass
 
 import numpy as np
 import torch
 from tqdm import tqdm
 
-from diffusers.image_processor import VaeImageProcessor
 from diffusers.utils import is_accelerate_available
 from packaging import version
 from transformers import CLIPTextModel, CLIPTokenizer
@@ -26,16 +25,23 @@ from diffusers.schedulers import (
     LMSDiscreteScheduler,
     PNDMScheduler,
 )
-from diffusers.utils import deprecate, logging, BaseOutput, randn_tensor
-
+from diffusers.utils import deprecate, logging, BaseOutput
+from diffusers.image_processor import VaeImageProcessor
+from torch import randn
+from ..models.attention import BasicTransformerBlock
 from einops import rearrange
-from ..utils.partition_utils import partition_wrap_around_2, partitions, partitions_wrap_around
 
 from ..models.unet import UNet3DConditionModel
+import PIL
 
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
+def torch_dfs(model: torch.nn.Module):
+    result = [model]
+    for child in model.children():
+        result += torch_dfs(child)
+    return result
 
 @dataclass
 class AnimationPipelineOutput(BaseOutput):
@@ -110,7 +116,6 @@ class AnimationPipeline(DiffusionPipeline, FromSingleFileMixin):
             new_config["sample_size"] = 64
             unet._internal_dict = FrozenDict(new_config)
 
-        self.image_processor = VaeImageProcessor(vae_scale_factor=self.vae_scale_factor)
         self.register_modules(
             vae=vae,
             text_encoder=text_encoder,
@@ -119,6 +124,8 @@ class AnimationPipeline(DiffusionPipeline, FromSingleFileMixin):
             scheduler=scheduler,
         )
         self.vae_scale_factor = 2 ** (len(self.vae.config.block_out_channels) - 1)
+        self.image_processor = VaeImageProcessor(vae_scale_factor=self.vae_scale_factor,
+                                                 do_normalize=True)
 
     def enable_vae_slicing(self):
         self.vae.enable_slicing()
@@ -241,18 +248,17 @@ class AnimationPipeline(DiffusionPipeline, FromSingleFileMixin):
 
         return text_embeddings
 
-    def decode_latents(self, latents, device):
+    def decode_latents(self, latents):
         video_length = latents.shape[2]
         latents = 1 / 0.18215 * latents
         latents = rearrange(latents, "b c f h w -> (b f) c h w")
 
         video = []
         for frame_idx in tqdm(range(latents.shape[0])):
-            decoded = self.vae.decode(latents[frame_idx:frame_idx+1].to(device)).sample
-            decoded = (decoded / 2 + 0.5).clamp(0, 1)
-            video.append(decoded.to("cpu"))
+            video.append(self.vae.decode(latents[frame_idx:frame_idx+1]).sample)
         video = torch.cat(video)
         video = rearrange(video, "(b f) c h w -> b c f h w", f=video_length)
+        video = (video / 2 + 0.5).clamp(0, 1)
         # we always cast to float32 as this does not cause significant overhead and is compatible with bfloa16
         video = video.cpu().float().numpy()
         return video
@@ -289,9 +295,9 @@ class AnimationPipeline(DiffusionPipeline, FromSingleFileMixin):
                 f" {type(callback_steps)}."
             )
 
-    def prepare_latents(self, batch_size, num_channels_latents, video_length, height, width, dtype, device, generator, window_size, latents=None):
+    def prepare_latents(self, batch_size, num_channels_latents, video_length, height, width, dtype, device, generator, latents=None):
         shape = (batch_size, num_channels_latents, video_length, height // self.vae_scale_factor, width // self.vae_scale_factor)
-        if isinstance(generator, list) and len(generator) != batch_size * window_size:
+        if isinstance(generator, list) and len(generator) != batch_size:
             raise ValueError(
                 f"You have passed a list of generators of length {len(generator)}, but requested an effective batch"
                 f" size of {batch_size}. Make sure the batch size matches the length of the generators."
@@ -315,12 +321,67 @@ class AnimationPipeline(DiffusionPipeline, FromSingleFileMixin):
             latents = latents.to(device)
 
         # scale the initial noise by the standard deviation required by the scheduler
-        # check if the init_noise_sigma is a tensor
-        if isinstance(self.scheduler.init_noise_sigma, torch.Tensor):
-            latents = latents * self.scheduler.init_noise_sigma.to(device)
-        else:
-            latents = latents * self.scheduler.init_noise_sigma
+        latents = latents * self.scheduler.init_noise_sigma
         return latents
+
+
+
+    def prepare_image_latents(
+        self, image, batch_size, num_images_per_prompt, video_length, dtype, device, do_classifier_free_guidance, generator=None
+    ):
+        if not isinstance(image, (torch.Tensor, PIL.Image.Image, list)):
+            raise ValueError(
+                f"`image` has to be of type `torch.Tensor`, `PIL.Image.Image` or list but is {type(image)}"
+            )
+
+        image = image.to(device=device, dtype=dtype)
+
+        batch_size = batch_size * num_images_per_prompt * video_length
+
+        if image.shape[1] == 4:
+            image_latents = image
+        else:
+            if isinstance(generator, list) and len(generator) != batch_size:
+                raise ValueError(
+                    f"You have passed a list of generators of length {len(generator)}, but requested an effective batch"
+                    f" size of {batch_size}. Make sure the batch size matches the length of the generators."
+                )
+
+            if isinstance(generator, list):
+                image_latents = [self.vae.encode(image[i : i + 1]).latent_dist.mode() for i in range(batch_size)]
+                image_latents = torch.cat(image_latents, dim=0)
+            else:
+                image_latents = self.vae.encode(image).latent_dist.mode()
+                # image_latents = self.vae.encode(image).latent_dist.sample()
+
+        if batch_size > image_latents.shape[0] and batch_size % image_latents.shape[0] == 0:
+            # expand image_latents for batch_size
+            deprecation_message = (
+                f"You have passed {batch_size} text prompts (`prompt`), but only {image_latents.shape[0]} initial"
+                " images (`image`). Initial images are now duplicating to match the number of text prompts. Note"
+                " that this behavior is deprecated and will be removed in a version 1.0.0. Please make sure to update"
+                " your script to pass as many initial images as text prompts to suppress this warning."
+            )
+            deprecate("len(prompt) != len(image)", "1.0.0", deprecation_message, standard_warn=False)
+            additional_image_per_prompt = batch_size // image_latents.shape[0]
+            image_latents = torch.cat([image_latents] * additional_image_per_prompt, dim=0)
+        elif batch_size > image_latents.shape[0] and batch_size % image_latents.shape[0] != 0:
+            raise ValueError(
+                f"Cannot duplicate `image` of batch size {image_latents.shape[0]} to {batch_size} text prompts."
+            )
+        else:
+            image_latents = torch.cat([image_latents], dim=0)
+
+        image_latents = image_latents * 0.18215
+
+        image_latents = image_latents.unsqueeze(0).permute(0, 2, 1, 3, 4)
+        print("image latents shape", image_latents.shape)
+
+        if do_classifier_free_guidance:
+            uncond_image_latents = torch.zeros_like(image_latents)
+            image_latents = torch.cat([image_latents, uncond_image_latents], dim=0)
+
+        return image_latents
 
     @torch.no_grad()
     def __call__(
@@ -340,9 +401,12 @@ class AnimationPipeline(DiffusionPipeline, FromSingleFileMixin):
         return_dict: bool = True,
         callback: Optional[Callable[[int, int, torch.FloatTensor], None]] = None,
         callback_steps: Optional[int] = 1,
-        window_count=24,
-        **kwargs,
+        image = None,
+        image_weights = None,
+        noise_scheduler=None,
+        reference_attn=True,
 
+        **kwargs,
     ):
         # Default height and width to unet
         height = height or self.unet.config.sample_size * self.vae_scale_factor
@@ -377,10 +441,22 @@ class AnimationPipeline(DiffusionPipeline, FromSingleFileMixin):
         self.scheduler.set_timesteps(num_inference_steps, device=device)
         timesteps = self.scheduler.timesteps
 
-        # Prepare latent variables
-        cpu_device = torch.device("cpu")
-        window_length = min(video_length, window_count)
+        # 3. Preprocess image
+        image = self.image_processor.preprocess(image)
 
+        # 5. Prepare Image latents
+        image_latents = self.prepare_image_latents(
+            image,
+            batch_size,
+            1,
+            video_length,
+            text_embeddings.dtype,
+            device,
+            do_classifier_free_guidance,
+            generator,
+        )
+
+        # Prepare latent variables
         num_channels_latents = self.unet.in_channels
         latents = self.prepare_latents(
             batch_size * num_videos_per_prompt,
@@ -389,91 +465,190 @@ class AnimationPipeline(DiffusionPipeline, FromSingleFileMixin):
             height,
             width,
             text_embeddings.dtype,
-            cpu_device,
+            device,
             generator,
-            window_length,
             latents,
         )
         latents_dtype = latents.dtype
 
         # Prepare extra step kwargs.
         extra_step_kwargs = self.prepare_extra_step_kwargs(generator, eta)
-        
+        print("image_weights shape", image_weights.shape)
 
+        noise_scheduler.set_timesteps(num_inference_steps)
 
-        wrap_around = True
-        # wrong but close
-        remainder = 1 if video_length % window_length != 0 else 0
-        partition_count = video_length // window_length  + remainder
-        # Denoising loop
-        print("window_length: ", window_length)
-        print("video_length: ", video_length)
-        num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
-        with self.progress_bar(total=num_inference_steps * partition_count) as progress_bar:
-            for i, t in enumerate(timesteps):
-
-                print("t: ", t)
-                print("i: ", i)
-                
-                if wrap_around == True:
-                    indices = partition_wrap_around_2(video_length, window_length, i, 2)
+        MODE = "write"
+        def hacked_basic_transformer_inner_forward(
+                self,
+                hidden_states: torch.FloatTensor,
+                attention_mask: Optional[torch.FloatTensor] = None,
+                encoder_hidden_states: Optional[torch.FloatTensor] = None,
+                encoder_attention_mask: Optional[torch.FloatTensor] = None,
+                timestep: Optional[torch.LongTensor] = None,
+                cross_attention_kwargs: Dict[str, Any] = None,
+                class_labels: Optional[torch.LongTensor] = None,
+                video_length: Optional[int] = None,
+            ):
+                if self.use_ada_layer_norm:
+                    norm_hidden_states = self.norm1(hidden_states, timestep)
+                elif self.use_ada_layer_norm_zero:
+                    norm_hidden_states, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.norm1(
+                        hidden_states, timestep, class_labels, hidden_dtype=hidden_states.dtype
+                    )
                 else:
-                    indices = partitions(video_length, window_length, i)
-                print("indices: ", indices)
-                for partition_indices in indices:
-                    print("partition_indices: ", partition_indices)
-                    # check if the partition_indices is a list or a tuple
-                    if isinstance(partition_indices, tuple):
-                        # make a list of the partition indices
-                        start_interval = partition_indices[0]
-                        end_interval = partition_indices[1]
+                    norm_hidden_states = self.norm1(hidden_states)
 
-                        # turn the start interval into a list of indices
-                        start_indices = list(range(start_interval[0], start_interval[1]))
-                        end_indices = list(range(end_interval[0], end_interval[1]))
-                        # combine the lists
-                        partition_indices_expanded = end_indices + start_indices 
-                        print("partition_indices_expanded: ", partition_indices_expanded)
+                # 1. Self-Attention
+                cross_attention_kwargs = cross_attention_kwargs if cross_attention_kwargs is not None else {}
+                if self.only_cross_attention:
+                    attn_output = self.attn1(
+                        norm_hidden_states,
+                        encoder_hidden_states=encoder_hidden_states if self.only_cross_attention else None,
+                        attention_mask=attention_mask,
+                        **cross_attention_kwargs,
+                    )
+                else:
+                    # if MODE == "write":
+                    rearrange_norms = rearrange(norm_hidden_states, "(b f) d c -> b f d c", f=norm_hidden_states.shape[0] // 2)
+                    # to_save = rearrange_norms[:, 0:1, :, :].detach().clone().repeat(1, first_window_size, 1, 1)
+                    to_save = rearrange_norms[:, 0:1, :, :].detach().clone()
+                        # rearrange_to_save = rearrange(to_save, "b f d c -> (b f) d c")
+                    # self.bank = to_save
 
-                        latent_partition = latents[:, :, partition_indices_expanded].to(device)
-                    else:
-                        latent_partition = latents[:, :, partition_indices[0]:partition_indices[1]].to(device)
-                    print("latent_partition: ", latent_partition.shape)
+                    
+                    rearranged = rearrange(to_save.repeat(1, norm_hidden_states.shape[0] // 2, 1, 1), "b f d c -> (b f) d c")
+
+                    attn_output = self.attn1(
+                        norm_hidden_states,
+                        encoder_hidden_states=torch.cat([norm_hidden_states, rearranged] , dim=1),
+                        # attention_mask=attention_mask,
+                        **cross_attention_kwargs,
+                    )
 
 
-                    # expand the latents if we are doing classifier free guidance
-                    latent_model_input = torch.cat([latent_partition] * 2) if do_classifier_free_guidance else latent_partition
-                    latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
+                if self.use_ada_layer_norm_zero:
+                    attn_output = gate_msa.unsqueeze(1) * attn_output
+                hidden_states = attn_output + hidden_states
 
-                    # predict the noise residual
-                    noise_pred = self.unet(latent_model_input, 
-                                        t, 
-                                        encoder_hidden_states=text_embeddings
-                                        ).sample.to(dtype=latents_dtype)
-                    # perform guidance
-                    if do_classifier_free_guidance:
-                        noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
-                        noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
+                if self.attn2 is not None:
+                    norm_hidden_states = (
+                        self.norm2(hidden_states, timestep) if self.use_ada_layer_norm else self.norm2(hidden_states)
+                    )
 
-                    # compute the previous noisy sample x_t -> x_t-1
-                    latent_partition = self.scheduler.step(noise_pred, t, latent_partition, **extra_step_kwargs).prev_sample
+                    # 2. Cross-Attention
+                    attn_output = self.attn2(
+                        norm_hidden_states,
+                        encoder_hidden_states=encoder_hidden_states,
+                        attention_mask=encoder_attention_mask,
+                        **cross_attention_kwargs,
+                    )
+                    hidden_states = attn_output + hidden_states
 
-                    # update the latents
-                    if isinstance(partition_indices, tuple):
-                        latents[:, :, partition_indices_expanded] = latent_partition.to(cpu_device)
-                    else:
-                        latents[:, :, partition_indices[0]:partition_indices[1]] = latent_partition.to(cpu_device)
+                # 3. Feed-forward
+                norm_hidden_states = self.norm3(hidden_states)
 
-                    # call the callback, if provided
-                    if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
-                        progress_bar.update()
-                        if callback is not None and i % callback_steps == 0:
-                            callback(i, t, latent_partition)
-            
+                if self.use_ada_layer_norm_zero:
+                    norm_hidden_states = norm_hidden_states * (1 + scale_mlp[:, None]) + shift_mlp[:, None]
 
+                ff_output = self.ff(norm_hidden_states)
+
+                if self.use_ada_layer_norm_zero:
+                    ff_output = gate_mlp.unsqueeze(1) * ff_output
+
+                hidden_states = ff_output + hidden_states
+
+                return hidden_states
+
+        if reference_attn:
+            attn_modules = [module for module in torch_dfs(self.unet) if isinstance(module, BasicTransformerBlock)]
+            attn_modules = sorted(attn_modules, key=lambda x: -x.norm1.normalized_shape[0])
+
+            for i, module in enumerate(attn_modules):
+                module._original_inner_forward = module.forward
+                module.forward = hacked_basic_transformer_inner_forward.__get__(module, BasicTransformerBlock)
+                module.bank = []
+
+        # Denoising loop
+        num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
+        with self.progress_bar(total=num_inference_steps) as progress_bar:
+            for i, t in enumerate(timesteps):
+                # expand the latents if we are doing classifier free guidance
+                latent_model_input = torch.cat([latents] * 2) if do_classifier_free_guidance else latents
+                latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
+
+                # predict the noise residual
+                noise_pred = self.unet(latent_model_input, 
+                                       t, 
+                                       encoder_hidden_states=text_embeddings
+                                       ).sample.to(dtype=latents_dtype)
+                print("image_latents shape", image_latents.shape)
+                # weight with the image_latents noise_pred
+                # does it need to be scaled?
+                # alphas_cumprod = noise_scheduler.alphas_cumprod.to(device=latents.device, dtype=latents.dtype)
+                # long_timestep = t.to(dtype=torch.long)
+                # sqrt_alpha_prod = noise_scheduler.alphas_cumprod[long_timestep] ** 0.5
+                # sqrt_alpha_prod = sqrt_alpha_prod.flatten()
+                # while len(sqrt_alpha_prod.shape) < len(latents.shape):
+                #     sqrt_alpha_prod = sqrt_alpha_prod.unsqueeze(-1)
+                # sqrt_one_minus_alpha_prod = (1 - alphas_cumprod[long_timestep]) ** 0.5
+                # sqrt_one_minus_alpha_prod = sqrt_one_minus_alpha_prod.flatten()
+                # while len(sqrt_one_minus_alpha_prod.shape) < len(latents.shape):
+                #     sqrt_one_minus_alpha_prod = sqrt_one_minus_alpha_prod.unsqueeze(-1)
+# 
+                # print("latent.device", latents.device)
+                # print("sqrt_alpha_prod.device", sqrt_alpha_prod.device)
+                # sqrt_alpha_prod = sqrt_alpha_prod.to(device=latents.device)
+
+                # image_noise_pred = latent_model_input - sqrt_alpha_prod * image_latents
+                # image_noise_pred = image_noise_pred  / sqrt_one_minus_alpha_prod
+
+                #image_noise_pred = latent_model_input - image_latents
+#
+                #noise_pred_std = noise_pred.std()
+                #image_noise_pred_std = image_noise_pred.std()
+#
+                #print("image_noise_pred shape", image_noise_pred.shape)
+                #print("noise_pred mean and std: ", noise_pred.mean(), noise_pred_std)
+                #print("image_noise_pred mean and std: ", image_noise_pred.mean(), image_noise_pred_std)
+#
+                ## divide std and multiple by the other std to rescale 
+                #image_noise_pred = image_noise_pred * noise_pred_std / image_noise_pred_std
+                ## give it the same mean 
+                #image_noise_pred = image_noise_pred + noise_pred.mean() - image_noise_pred.mean()
+#
+                #print("image_noise_pred after mean and std: ", image_noise_pred.mean(), image_noise_pred.std())
+#
+                ## noise_pred = image_weights.reshape(1, 1, -1, 1, 1) * image_noise_pred + (1 - image_weights.reshape(1, 1, -1, 1, 1)) * noise_pred
+#
+                #noise_pred = image_noise_pred
+#
+                #print("noise_pred after mean and std: ", noise_pred.mean(), noise_pred.std())
+                      
+                # perform guidance
+                # TODO extend to 
+                if do_classifier_free_guidance:
+  
+                    noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+                    noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
+
+                    
+
+                # compute the previous noisy sample x_t -> x_t-1
+                latents = self.scheduler.step(noise_pred, t, latents, **extra_step_kwargs).prev_sample
+
+                noise = randn(latents.shape, generator=generator, device=latents.device, dtype=latents.dtype)
+                noised_image_latents = self.scheduler.add_noise(image_latents, noise, t.reshape(1,))
+
+                latents = image_weights.reshape(1, 1, -1, 1, 1) * noised_image_latents + (1 - image_weights.reshape(1, 1, -1, 1, 1)) * latents
+
+                # call the callback, if provided
+                if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
+                    progress_bar.update()
+                    if callback is not None and i % callback_steps == 0:
+                        callback(i, t, latents)
 
         # Post-processing
-        video = self.decode_latents(latents, device)
+        video = self.decode_latents(latents)
 
         # Convert to tensor
         if output_type == "tensor":

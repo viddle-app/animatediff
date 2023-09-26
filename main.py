@@ -8,7 +8,7 @@ import sys
 import uuid
 import torch.nn.functional as F
 use_ufree = False
-use_type = 'pix2pix_2'
+use_type = 'init_image_2'
 if use_type == 'overlapping':
   from src.pipelines.pipeline_animatediff_overlapping import AnimationPipeline
 elif use_type == 'conv':
@@ -36,7 +36,9 @@ elif use_type == "init_image":
 elif use_type == "ufree":
   from src.pipelines.pipeline_animatediff_ufree import AnimationPipeline
 elif use_type == "pix2pix_2":
-   from src.pipelines.pipeline_animatediff_pix2pix_2 import StableDiffusionInstructPix2PixPipeline
+  from src.pipelines.pipeline_animatediff_pix2pix_2 import StableDiffusionInstructPix2PixPipeline
+elif use_type == "init_image_2":
+  from src.pipelines.pipeline_animatediff_init_image_2 import AnimationPipeline
 else:
   from src.pipelines.pipeline_animatediff import AnimationPipeline
 from src.pipelines.pipeline_animatediff_controlnet import StableDiffusionControlNetPipeline
@@ -373,10 +375,10 @@ def run(model,
   device = "cuda" if torch.cuda.is_available() else "cpu"
 
   unet_additional_kwargs = {
-    "in_channels": 8,
+    "in_channels": 4,
     "unet_use_cross_frame_attention": False,
     "unet_use_temporal_attention": False,
-    "use_motion_module": False,
+    "use_motion_module": True,
     "motion_module_resolutions": [1, 2, 4, 8],
     "motion_module_mid_block": False,
     "motion_module_decoder_only": False,
@@ -420,7 +422,7 @@ def run(model,
   unet = unet.to(dtype=dtype) 
 
   use_controlnet = True
-
+  noise_scheduler=DDIMScheduler(**scheduler_kwargs)
 
   if (use_type == "overlapping_previous" or use_type == 'conv' or use_type == 'overlapping_previous_1' or use_type == 'overlapping_previous_2') and use_controlnet:
     # controlnet_path = Path("../models/ControlNet-v1-1/control_v11p_sd15_openpose.yaml")
@@ -486,12 +488,14 @@ def run(model,
   # motion_module_path = "motion-models/overlapping-attn-5e-7-1-5000-steps.ckpt"
   # motion_module_path = "motion-models/temporal-overlap-attn-5e-7-2-15000-steps.ckpt"
   motion_module_path = "motion-models/mm_sd_v15_v2.ckpt"
+  # motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/training-2023-09-25T15-22-21/checkpoints/checkpoint.ckpt"
+  # motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/training-2023-09-25T14-32-27/checkpoints/checkpoint.ckpt"
   # motion_module_path = "motion-models/temporal-attn-negative-pe-1e-6-1-5000-steps.ckpt"
   # motion_module_path = '../ComfyUI/custom_nodes/ComfyUI-AnimateDiff/models/animatediffMotion_v15.ckpt'
   motion_module_state_dict = torch.load(motion_module_path, map_location="cpu")
   missing, unexpected = pipeline.unet.load_state_dict(motion_module_state_dict, strict=False)
-  if "global_step" in motion_module_state_dict:
-    raise Exception("global_step present. Not sure how to handle that.")
+  # if "global_step" in motion_module_state_dict:
+  #  raise Exception("global_step present. Not sure how to handle that.")
   print("unexpected", unexpected)
   # assert len(unexpected) == 0
   print("missing", len(missing))
@@ -501,8 +505,8 @@ def run(model,
     seed = random.randint(-sys.maxsize, sys.maxsize)
 
   # generators = [torch.Generator().manual_seed(seed) for _ in range(frame_count)]
-  # generators = torch.Generator(device=device).manual_seed(seed)
-  generators = torch.Generator().manual_seed(seed)
+  generators = torch.Generator(device=device).manual_seed(seed)
+  # generators = torch.Generator().manual_seed(seed)
 
   do_upscale = False
   use_img2img = True
@@ -835,7 +839,8 @@ def run(model,
             guidance_scale=guidance_scale,
             image=image,
             video_length=frame_count,
-            image_guidance_scale=y_values_list,
+            image_guidance_scale=2.5,
+            # image_guidance_scale=y_values_list,
               # width=width,
               # height=height,
               # window_size=window_count,
@@ -853,6 +858,32 @@ def run(model,
 
     video = video.permute(1, 0, 2, 3)
 
+  elif use_type == "init_image_2": 
+    image = Image.open("mona-lisa-1.jpg")
+    image = image.resize((width, height))
+
+    image_weights = torch.linspace(1.0, 0.0, frame_count).to(device=device, dtype=dtype)
+    # start from one and divide by two each time
+    image_weights_list = []
+    for i in range(frame_count):
+      image_weights_list.append(1.0 / (2 ** i))
+    image_weights = torch.tensor(image_weights_list).to(device=device, dtype=dtype)
+    print("image_weights", image_weights.dtype)
+    print("image_weights", image_weights)
+
+    # image_weights = torch.ones(frame_count).to(device=device, dtype=dtype)
+
+    video = pipeline(prompt=prompt, 
+                  negative_prompt=negative_prompt, 
+                  num_inference_steps=num_inference_steps,
+                  guidance_scale=guidance_scale,
+                    width=width,
+                    height=height,
+                    generator= generators,
+                    video_length=frame_count,
+                    image=image,
+                    image_weights=image_weights,
+                    noise_scheduler=noise_scheduler).videos[0]
   else:
     video = pipeline(prompt=prompt, 
                   negative_prompt=negative_prompt, 
@@ -876,7 +907,7 @@ def run(model,
   os.makedirs(output_dir, exist_ok=True)
   filename = str(uuid.uuid4())
   output_path = os.path.join(output_dir, filename + ".gif")
-  fps = 30
+  fps = 8
   tensor_to_image_sequence(video, "images")
   images = glob.glob("images/*.png")
   images.sort()
@@ -890,7 +921,7 @@ def run(model,
 if __name__ == "__main__":
   # prompt = "photograph of a bald man laughing"
   # prompt = "photograph of a man scared"
-  prompt = "Make her smile"
+  prompt = "The mona list smiling"
   # prompt = "full body of a Girl swaying, red blouse, illustration by Wu guanzhong,China village,twojjbe trees in front of my chinese house,light orange, pink,white,blue ,8k"
   # prompt = "paint by frazetta, man dancing, mountain blue sky in background"
   # prompt = "1man dancing outside, clear blue sky sunny day, photography, award winning, highly detailed, bright, well lit"
@@ -926,10 +957,10 @@ if __name__ == "__main__":
 
   # lora_file=None
   # lora_file
-  # model = "/mnt/newdrive/automatic1111/models/Stable-diffusion/dreamshaper_6BakedVae.safetensors"
+  model = "/mnt/newdrive/automatic1111/models/Stable-diffusion/dreamshaper_6BakedVae.safetensors"
   # model = "/mnt/newdrive/automatic1111/models/Stable-diffusion/dreamshaper_8.safetensors"
   # model = "/mnt/newdrive/automatic1111/models/Stable-diffusion/epicrealism_pureEvolutionV5.safetensors"
-  model = "/mnt/newdrive/automatic1111/models/Stable-diffusion/instruct-pix2pix-00-22000.ckpt"
+  # model = "/mnt/newdrive/automatic1111/models/Stable-diffusion/instruct-pix2pix-00-22000.ckpt"
   # model = "/mnt/newdrive/automatic1111/models/Stable-diffusion/deliberate_v2.safetensors"
   # model = "/mnt/newdrive/automatic1111/models/Stable-diffusion/absolutereality_v181.safetensors"
   # model = "/mnt/newdrive/automatic1111/models/Stable-diffusion/neonskiesai_V10.safetensors"
@@ -939,13 +970,13 @@ if __name__ == "__main__":
       negative_prompt="clone, cloned, bad anatomy, wrong anatomy, mutated hands and fingers, mutation, mutated, amputation, 3d render, lowres, signs, memes, labels, text, error, mutant, worst quality, low quality, normal quality, jpeg artifacts, signature, watermark, username, blurry, made by children, caricature, ugly, boring, sketch, lacklustre, repetitive, cropped, (long neck), body horror, out of frame, mutilated, tiled, frame, border",
       height=512,
       width=512,
-      frame_count=32, # 288,
-      window_count=32,
+      frame_count=16, # 288,
+      window_count=16,
       num_inference_steps=20,
-      guidance_scale=7.5,
+      guidance_scale=0.0,
       last_n=23,
       seed=42,
-      dtype=torch.float16,
+      dtype=torch.float32,
       lora_folder="/mnt/newdrive/automatic1111/models/Lora",
       lora_files=lora_files)
 

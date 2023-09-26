@@ -156,6 +156,7 @@ class StableDiffusionInstructPix2PixPipeline(DiffusionPipeline, TextualInversion
         callback: Optional[Callable[[int, int, torch.FloatTensor], None]] = None,
         callback_steps: int = 1,
         video_length: int = 32,
+      
     ):
         r"""
         The call function to the pipeline for generation.
@@ -328,6 +329,7 @@ class StableDiffusionInstructPix2PixPipeline(DiffusionPipeline, TextualInversion
             device,
             generator,
             latents,
+            
         )
 
         # 7. Check that shapes of latents and image match the UNet channels
@@ -569,6 +571,13 @@ class StableDiffusionInstructPix2PixPipeline(DiffusionPipeline, TextualInversion
             prompt_embeds = torch.cat([prompt_embeds, negative_prompt_embeds, negative_prompt_embeds])
 
         return prompt_embeds
+    # Copied from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion.StableDiffusionPipeline.enable_vae_slicing
+    def enable_vae_slicing(self):
+        r"""
+        Enable sliced VAE decoding. When this option is enabled, the VAE will split the input tensor in slices to
+        compute decoding in several steps. This is useful to save some memory and allow larger batch sizes.
+        """
+        self.vae.enable_slicing()
 
     # Copied from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion.StableDiffusionPipeline.run_safety_checker
     def run_safety_checker(self, image, device, dtype):
@@ -715,7 +724,6 @@ class StableDiffusionInstructPix2PixPipeline(DiffusionPipeline, TextualInversion
             )
         else:
             image_latents = torch.cat([image_latents], dim=0)
-
 
         image_latents = image_latents.unsqueeze(0).permute(0, 2, 1, 3, 4)
         print("image latents shape", image_latents.shape)

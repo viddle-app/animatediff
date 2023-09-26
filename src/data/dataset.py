@@ -33,7 +33,6 @@ class WebVid10M(Dataset):
             transforms.RandomHorizontalFlip(),
             transforms.Resize(sample_size[0]),
             transforms.CenterCrop(sample_size),
-            transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5], inplace=True),
         ])
     
     def get_batch(self, idx):
@@ -73,6 +72,7 @@ class WebVid10M(Dataset):
                 idx = random.randint(0, self.length-1)
 
         pixel_values = self.pixel_transforms(pixel_values)
+        pixel_values = 2.0 * pixel_values - 1.0
         sample = dict(pixel_values=pixel_values, text=name)
         return sample
 
