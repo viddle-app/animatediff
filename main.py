@@ -8,7 +8,7 @@ import sys
 import uuid
 import torch.nn.functional as F
 use_ufree = False
-use_type = 'init_image_2'
+use_type = 'pix2pix_2'
 if use_type == 'overlapping':
   from src.pipelines.pipeline_animatediff_overlapping import AnimationPipeline
 elif use_type == 'conv':
@@ -351,7 +351,7 @@ def tensor_to_video(tensor, output_path, fps=30):
 
 def run(model,
         prompt="", 
-        negative_prompt="", 
+        negative_prompt=None, 
         frame_count=24,
         num_inference_steps=20,
         guidance_scale=7.5,
@@ -370,12 +370,13 @@ def run(model,
     "beta_start": 0.00085,
     "beta_end": 0.012,
     "beta_schedule": "linear",
+    # "clip_sample": False,
   }
 
   device = "cuda" if torch.cuda.is_available() else "cpu"
 
   unet_additional_kwargs = {
-    "in_channels": 4,
+    "in_channels": 8,
     "unet_use_cross_frame_attention": False,
     "unet_use_temporal_attention": False,
     "use_motion_module": True,
@@ -446,6 +447,7 @@ def run(model,
       tokenizer=tokenizer, 
       unet=unet,
       scheduler=EulerAncestralDiscreteScheduler(**scheduler_kwargs),
+      # scheduler=DDIMScheduler(**scheduler_kwargs),
       safety_checker=None,
       feature_extractor=None,
       requires_safety_checker=False,
@@ -460,6 +462,8 @@ def run(model,
         # scheduler=DDIMScheduler(**scheduler_kwargs),
         scheduler=EulerAncestralDiscreteScheduler(**scheduler_kwargs),
       ).to(device)
+
+  pipeline.enable_vae_slicing()
 
       # set_upcast_softmax_to_false(pipeline)
       # pipeline.enable_sequential_cpu_offload()
@@ -487,10 +491,17 @@ def run(model,
   # motion_module_path = "motion-models/temporal-attn-5e-7-3-40000-steps.ckpt"
   # motion_module_path = "motion-models/overlapping-attn-5e-7-1-5000-steps.ckpt"
   # motion_module_path = "motion-models/temporal-overlap-attn-5e-7-2-15000-steps.ckpt"
-  motion_module_path = "motion-models/mm_sd_v15_v2.ckpt"
+  # motion_module_path = "motion-models/mm_sd_v15_v2.ckpt"
+  # motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/training-2023-09-26T03-17-19/checkpoints/checkpoint-epoch-1.ckpt"
+  # motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/training-2023-09-26T03-17-19/mm.ckpt"
+  # motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/training-2023-09-26T08-56-44/checkpoints/checkpoint.ckpt"
+  # motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/training-2023-09-26T09-38-19/checkpoints/mm.ckpt"
   # motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/training-2023-09-25T15-22-21/checkpoints/checkpoint.ckpt"
   # motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/training-2023-09-25T14-32-27/checkpoints/checkpoint.ckpt"
   # motion_module_path = "motion-models/temporal-attn-negative-pe-1e-6-1-5000-steps.ckpt"
+  # motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/training-2023-09-26T12-50-02/checkpoints/mm.ckpt"
+  # motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/training-2023-09-26T14-32-35/checkpoints/mm.ckpt"
+  motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/training-2023-09-26T16-52-17/checkpoints/mm.ckpt"
   # motion_module_path = '../ComfyUI/custom_nodes/ComfyUI-AnimateDiff/models/animatediffMotion_v15.ckpt'
   motion_module_state_dict = torch.load(motion_module_path, map_location="cpu")
   missing, unexpected = pipeline.unet.load_state_dict(motion_module_state_dict, strict=False)
@@ -817,8 +828,22 @@ def run(model,
               video_length=frame_count).videos[0]
   elif use_type == 'pix2pix_2':
     # resize the image to the correct size
-    image = Image.open("mona-lisa-1.jpg")
-    image = image.resize((width, height))
+    # image = Image.open("mona-lisa-1.jpg")
+    # image = Image.open("biden.jpg")
+    # image = Image.open("byct.jpg")
+    # image = image.resize((width, height))
+
+    images = []
+    
+    background_frames_path = Path("/mnt/newdrive/stable-diffusion-docker/output/source_frames")
+    background_frames = glob.glob(os.path.join(background_frames_path, '*.png'))
+    background_frames = sorted(background_frames)
+    # get frame_count with a stride of 2
+    background_frames = background_frames[::2]
+    background_frames = background_frames[:frame_count]
+    for frame_path in background_frames:
+       frame = Image.open(frame_path).resize((width, height))
+       images.append(frame)
 
     # make a 
     def f(x):
@@ -832,14 +857,14 @@ def run(model,
 
     y_values_list = sample_function(frame_count).to(device=device, dtype=dtype)
     print("y_values_list", y_values_list)
-
     video = pipeline(prompt=prompt,
-            negative_prompt=negative_prompt,
+            # negative_prompt=negative_prompt,
             num_inference_steps=num_inference_steps,
             guidance_scale=guidance_scale,
-            image=image,
+            image=images,
             video_length=frame_count,
-            image_guidance_scale=2.5,
+            image_guidance_scale=0.9,
+            generator=generators,
             # image_guidance_scale=y_values_list,
               # width=width,
               # height=height,
@@ -907,7 +932,7 @@ def run(model,
   os.makedirs(output_dir, exist_ok=True)
   filename = str(uuid.uuid4())
   output_path = os.path.join(output_dir, filename + ".gif")
-  fps = 8
+  fps = 15
   tensor_to_image_sequence(video, "images")
   images = glob.glob("images/*.png")
   images.sort()
@@ -921,7 +946,9 @@ def run(model,
 if __name__ == "__main__":
   # prompt = "photograph of a bald man laughing"
   # prompt = "photograph of a man scared"
-  prompt = "The mona list smiling"
+  # prompt = "Make synthwave retrowave vaporware style, outside night time city skyline"
+  # prompt = "turn her into princess leia, side buns hairstyle"
+  # prompt = "make her open her mouth"
   # prompt = "full body of a Girl swaying, red blouse, illustration by Wu guanzhong,China village,twojjbe trees in front of my chinese house,light orange, pink,white,blue ,8k"
   # prompt = "paint by frazetta, man dancing, mountain blue sky in background"
   # prompt = "1man dancing outside, clear blue sky sunny day, photography, award winning, highly detailed, bright, well lit"
@@ -938,6 +965,8 @@ if __name__ == "__main__":
   # prompt = "Glowing jellyfish, calm, slow hypnotic undulations, 35mm Nature photography, award winning"
   # prompt = "synthwave retrowave vaporware back of a delorean driving on highway, dmc rear grill, neon lights, palm trees and sunset in background"
   # prompt = "a doodle of a bear dancing, scribble, messy, stickfigure, badly drawn"
+  # prompt = "make a painting by patrick nagel, gorgeous woman"
+  prompt = "make in the style illustration by Jean-Baptiste Monge + Emily Carr + Tsubasa Nakai"
   # prompt = "woman laughing"
   # prompt = "close up of Embrodery Elijah Wood smiling in front of a embroidery landscape"
   # prompt = "photo of a tom cruise statue made of ice, model shoot, empty black background"
@@ -957,26 +986,26 @@ if __name__ == "__main__":
 
   # lora_file=None
   # lora_file
-  model = "/mnt/newdrive/automatic1111/models/Stable-diffusion/dreamshaper_6BakedVae.safetensors"
+  # model = "/mnt/newdrive/automatic1111/models/Stable-diffusion/dreamshaper_6BakedVae.safetensors"
   # model = "/mnt/newdrive/automatic1111/models/Stable-diffusion/dreamshaper_8.safetensors"
   # model = "/mnt/newdrive/automatic1111/models/Stable-diffusion/epicrealism_pureEvolutionV5.safetensors"
-  # model = "/mnt/newdrive/automatic1111/models/Stable-diffusion/instruct-pix2pix-00-22000.ckpt"
+  model = "/mnt/newdrive/automatic1111/models/Stable-diffusion/instruct-pix2pix-00-22000.ckpt"
   # model = "/mnt/newdrive/automatic1111/models/Stable-diffusion/deliberate_v2.safetensors"
   # model = "/mnt/newdrive/automatic1111/models/Stable-diffusion/absolutereality_v181.safetensors"
   # model = "/mnt/newdrive/automatic1111/models/Stable-diffusion/neonskiesai_V10.safetensors"
   # model = "/mnt/newdrive/automatic1111/models/Stable-diffusion/synthwavepunk_v2.ckpt"
   run(model, 
       prompt=prompt,
-      negative_prompt="clone, cloned, bad anatomy, wrong anatomy, mutated hands and fingers, mutation, mutated, amputation, 3d render, lowres, signs, memes, labels, text, error, mutant, worst quality, low quality, normal quality, jpeg artifacts, signature, watermark, username, blurry, made by children, caricature, ugly, boring, sketch, lacklustre, repetitive, cropped, (long neck), body horror, out of frame, mutilated, tiled, frame, border",
-      height=512,
-      width=512,
+      # negative_prompt="clone, cloned, bad anatomy, wrong anatomy, mutated hands and fingers, mutation, mutated, amputation, 3d render, lowres, signs, memes, labels, text, error, mutant, worst quality, low quality, normal quality, jpeg artifacts, signature, watermark, username, blurry, made by children, caricature, ugly, boring, sketch, lacklustre, repetitive, cropped, (long neck), body horror, out of frame, mutilated, tiled, frame, border",
+      negative_prompt="",
+      height=256,
+      width=144,
       frame_count=16, # 288,
       window_count=16,
-      num_inference_steps=20,
-      guidance_scale=0.0,
+      num_inference_steps=50,
+      guidance_scale=7.0,
       last_n=23,
       seed=42,
-      dtype=torch.float32,
+      dtype=torch.float16,
       lora_folder="/mnt/newdrive/automatic1111/models/Lora",
       lora_files=lora_files)
-

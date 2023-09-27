@@ -280,6 +280,8 @@ class StableDiffusionInstructPix2PixPipeline(DiffusionPipeline, TextualInversion
         if isinstance(image_guidance_scale, torch.Tensor) and do_classifier_free_guidance:
             image_guidance_scale = image_guidance_scale.reshape(1, 1, -1, 1, 1)
 
+        do_classifier_free_guidance = True
+
         # check if scheduler is in sigmas space
         scheduler_is_in_sigma_space = hasattr(self.scheduler, "sigmas")
 
@@ -374,13 +376,21 @@ class StableDiffusionInstructPix2PixPipeline(DiffusionPipeline, TextualInversion
                     noise_pred = latent_model_input - sigma * noise_pred
 
                 # perform guidance
-                if do_classifier_free_guidance:
-                    noise_pred_text, noise_pred_image, noise_pred_uncond = noise_pred.chunk(3)
-                    noise_pred = (
-                        noise_pred_uncond
-                        + guidance_scale * (noise_pred_text - noise_pred_image)
-                        + image_guidance_scale * (noise_pred_image - noise_pred_uncond)
-                    )
+                if False: 
+                  if do_classifier_free_guidance:
+                      noise_pred_text, noise_pred_image, noise_pred_uncond = noise_pred.chunk(3)
+                      regular_noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_image)
+                      
+                      noise_pred = image_guidance_scale * noise_pred_image + (1 - image_guidance_scale) * regular_noise_pred
+
+                else:
+                  if do_classifier_free_guidance:
+                      noise_pred_text, noise_pred_image, noise_pred_uncond = noise_pred.chunk(3)
+                      noise_pred = (
+                          noise_pred_uncond
+                          + guidance_scale * (noise_pred_text - noise_pred_image)
+                          + image_guidance_scale * (noise_pred_image - noise_pred_uncond)
+                      )
 
                 # Hack:
                 # For karras style schedulers the model does classifer free guidance using the
