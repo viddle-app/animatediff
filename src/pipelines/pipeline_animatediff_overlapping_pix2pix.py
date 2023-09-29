@@ -254,7 +254,7 @@ class AnimationPipeline(DiffusionPipeline, FromSingleFileMixin):
             # For classifier free guidance, we need to do two forward passes.
             # Here we concatenate the unconditional and text embeddings into a single batch
             # to avoid doing two forward passes
-            text_embeddings = torch.cat([uncond_embeddings, text_embeddings])
+            text_embeddings = torch.cat([text_embeddings, uncond_embeddings, uncond_embeddings])
 
         return text_embeddings
 
@@ -305,6 +305,69 @@ class AnimationPipeline(DiffusionPipeline, FromSingleFileMixin):
                 f"`callback_steps` has to be a positive integer but is {callback_steps} of type"
                 f" {type(callback_steps)}."
             )
+    def prepare_image_latents(
+        self, image, batch_size, num_images_per_prompt, video_length, dtype, device, do_classifier_free_guidance, generator=None
+    ):
+        if not isinstance(image, (torch.Tensor, PIL.Image.Image, list)):
+            raise ValueError(
+                f"`image` has to be of type `torch.Tensor`, `PIL.Image.Image` or list but is {type(image)}"
+            )
+
+        image = image.to(device=device, dtype=dtype)
+
+        print("video length", video_length)
+        print("batch size", batch_size)
+
+        batch_size = batch_size * num_images_per_prompt * video_length
+
+        print("batch size affter", batch_size)
+
+        if image.shape[1] == 4:
+            image_latents = image
+        else:
+            if isinstance(generator, list) and len(generator) != batch_size:
+                raise ValueError(
+                    f"You have passed a list of generators of length {len(generator)}, but requested an effective batch"
+                    f" size of {batch_size}. Make sure the batch size matches the length of the generators."
+                )
+
+            if isinstance(generator, list):
+                print("generator list branch")
+                image_latents = [self.vae.encode(image[i : i + 1]).latent_dist.mode() for i in range(batch_size)]
+                image_latents = torch.cat(image_latents, dim=0)
+            else:
+                print("not in generator list branch")
+                print("image len", len(image))
+                image_latents = self.vae.encode(image).latent_dist.mode()
+
+        print("image latents shape", image_latents.shape)
+
+        if batch_size > image_latents.shape[0] and batch_size % image_latents.shape[0] == 0:
+            # expand image_latents for batch_size
+            deprecation_message = (
+                f"You have passed {batch_size} text prompts (`prompt`), but only {image_latents.shape[0]} initial"
+                " images (`image`). Initial images are now duplicating to match the number of text prompts. Note"
+                " that this behavior is deprecated and will be removed in a version 1.0.0. Please make sure to update"
+                " your script to pass as many initial images as text prompts to suppress this warning."
+            )
+            deprecate("len(prompt) != len(image)", "1.0.0", deprecation_message, standard_warn=False)
+            additional_image_per_prompt = batch_size // image_latents.shape[0]
+            image_latents = torch.cat([image_latents] * additional_image_per_prompt, dim=0)
+        elif batch_size > image_latents.shape[0] and batch_size % image_latents.shape[0] != 0:
+            raise ValueError(
+                f"Cannot duplicate `image` of batch size {image_latents.shape[0]} to {batch_size} text prompts."
+            )
+        else:
+            image_latents = torch.cat([image_latents], dim=0)
+
+        image_latents = image_latents.unsqueeze(0).permute(0, 2, 1, 3, 4)
+        print("image latents shape", image_latents.shape)
+
+        if do_classifier_free_guidance:
+            uncond_image_latents = torch.zeros_like(image_latents)
+            image_latents = torch.cat([image_latents, image_latents, uncond_image_latents], dim=0)
+
+        return image_latents
 
     def prepare_latents(self, batch_size, 
                         num_channels_latents, 
@@ -449,6 +512,7 @@ class AnimationPipeline(DiffusionPipeline, FromSingleFileMixin):
             List[PIL.Image.Image],
             List[np.ndarray],
         ]] = None,
+        pix2pix_image = None,
         controlnet_conditioning_scale: Union[float, List[float]] = 1.0,
         guess_mode: bool = False,
         control_guidance_start: Union[float, List[float]] = 0.0,
@@ -457,6 +521,7 @@ class AnimationPipeline(DiffusionPipeline, FromSingleFileMixin):
         cpu_device = torch.device("cpu"),
         cross_attention_kwargs: Optional[Dict[str, Any]] = None,
         reference_attn = False,
+        image_guidance_scale = 1.5,
         **kwargs,
 
     ):
@@ -497,7 +562,7 @@ class AnimationPipeline(DiffusionPipeline, FromSingleFileMixin):
         # Prepare latent variables
         window_length = min(video_length, window_count)
 
-        num_channels_latents = self.unet.in_channels
+        num_channels_latents = self.vae.config.latent_channels
         latents = self.prepare_latents(
             batch_size * num_videos_per_prompt,
             num_channels_latents,
@@ -573,7 +638,7 @@ class AnimationPipeline(DiffusionPipeline, FromSingleFileMixin):
                         do_classifier_free_guidance=do_classifier_free_guidance,
                         guess_mode=guess_mode,
                     )
-                    image_ = rearrange(image_, "(b f) c h w -> b c f h w", f=video_length)
+
                     images.append(image_)
 
                 image = images
@@ -680,6 +745,23 @@ class AnimationPipeline(DiffusionPipeline, FromSingleFileMixin):
                 module.forward = hacked_basic_transformer_inner_forward.__get__(module, BasicTransformerBlock)
                 module.bank = []
 
+
+        # 3. Preprocess image
+        pix2pix_image = self.image_processor.preprocess(pix2pix_image)
+
+        # 5. Prepare Image latents
+        image_latents = self.prepare_image_latents(
+            pix2pix_image,
+            batch_size,
+            num_images_per_prompt,
+            video_length,
+            text_embeddings.dtype,
+            device,
+            do_classifier_free_guidance,
+            generator,
+        )
+
+
         # start_
         # wrong but close
         remainder = 1 if video_length % window_length != 0 else 0
@@ -689,6 +771,8 @@ class AnimationPipeline(DiffusionPipeline, FromSingleFileMixin):
         min_offset = min(min_offset, max_offset)
         max_offset = max(min_offset, max_offset)
         images_partition = None
+
+        scheduler_is_in_sigma_space = hasattr(self.scheduler, "sigmas")
         # Denoising loop
         print("window_length: ", window_length)
         print("video_length: ", video_length)
@@ -740,43 +824,28 @@ class AnimationPipeline(DiffusionPipeline, FromSingleFileMixin):
                         print("partition_indices_expanded: ", partition_indices_expanded)
 
                         latent_partition = latents[:, :, partition_indices_expanded].to(device)
+                        image_latents_partition = image_latents[:, :, partition_indices_expanded].to(device)
                     else:
                         partition_indices_expanded = list(range(partition_indices[0], partition_indices[1]))
                         latent_partition = latents[:, :, partition_indices[0]:partition_indices[1]].to(device)
+                        image_latents_partition = image_latents[:, :, partition_indices[0]:partition_indices[1]].to(device)
                     print("latent_partition: ", latent_partition.shape)
 
 
                     # expand the latents if we are doing classifier free guidance
-                    latent_model_input = torch.cat([latent_partition] * 2) if do_classifier_free_guidance else latent_partition
-                    latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
+                    latent_model_input = torch.cat([latent_partition] * 3) if do_classifier_free_guidance else latent_partition
+                    scale_latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
+                    scale_latent_model_input = torch.cat([scale_latent_model_input, image_latents_partition], dim=1)
 
                     if controlnet is not None:
                         current_window_length = len(partition_indices_expanded) if isinstance(partition_indices, tuple) else partition_indices[1] - partition_indices[0]
                         print("current_window_length: ", current_window_length)
                         if isinstance(partition_indices, tuple):
-                            if isinstance(self.controlnet, MultiControlNetModel):
-                                image_partition = []
-                                for img in image:
-                                    
-                                    image_partition.append(img[:, :, partition_indices_expanded].to(device))
-                            else:
-                                images_partition = image[:, :, partition_indices_expanded].to(device)
+                            images_partition = image[:, :, partition_indices_expanded].to(device)
                         else:
-                            if isinstance(self.controlnet, MultiControlNetModel):
-                                image_partition = []
-                                for img in image:
-                                    print("img: ", img.shape)
-                                    image_partition.append(img[:, :, partition_indices[0]:partition_indices[1]].to(device))
-                            else:
-                                images_partition = image[:, :, partition_indices[0]:partition_indices[1]].to(device)
-                        if isinstance(self.controlnet, MultiControlNetModel):
-                            new_partition = []
-                            for img in image_partition:
-                                new_partition.append(rearrange(img, "b c f h w -> (b f) c h w"))
-                            
-                            images_partition = new_partition
-                        else:
-                            images_partition = rearrange(images_partition, "b c f h w -> (b f) c h w")
+                            images_partition = image[:, :, partition_indices[0]:partition_indices[1]].to(device)
+
+                        images_partition = rearrange(images_partition, "b c f h w -> (b f) c h w")
                         # controlnet(s) inference
                         if guess_mode and do_classifier_free_guidance:
                             # Infer ControlNet only for the conditional batch.
@@ -784,7 +853,7 @@ class AnimationPipeline(DiffusionPipeline, FromSingleFileMixin):
                             control_model_input = self.scheduler.scale_model_input(control_model_input, t)
                             controlnet_prompt_embeds = text_embeddings.chunk(2)[1]
                         else:
-                            control_model_input = latent_model_input
+                            control_model_input = scale_latent_model_input
                             controlnet_prompt_embeds = text_embeddings
 
                         if isinstance(controlnet_keep[i], list):
@@ -802,14 +871,10 @@ class AnimationPipeline(DiffusionPipeline, FromSingleFileMixin):
 
                         if isinstance(cond_scale, torch.Tensor):
                             cond_scale = cond_scale.to(device=device, dtype=controlnet.dtype)
-                            cond_scale = torch.cat([cond_scale] * 2) if do_classifier_free_guidance and not guess_mode else cond_scale
+                            cond_scale = torch.cat([cond_scale] * 3) if do_classifier_free_guidance and not guess_mode else cond_scale
 
                         print("control_model_input", control_model_input.shape, control_model_input.dtype)
-                        if isinstance(self.controlnet, MultiControlNetModel):
-                            print("images_partition", len(images_partition))
-                            print("control net count", len(self.controlnet.nets))
-                        else:
-                            print("images_partition", image.shape)
+                        print("images_partition", image.shape)
                         print("controlnet_prompt_embeds", controlnet_prompt_embeds.shape)
                         print("cond_scale", cond_scale)
                         down_block_res_samples, mid_block_res_sample = self.controlnet(
@@ -839,6 +904,9 @@ class AnimationPipeline(DiffusionPipeline, FromSingleFileMixin):
                             down_block_res_samples = [torch.cat([torch.zeros_like(d), d]) for d in down_block_res_samples]
                             mid_block_res_sample = torch.cat([torch.zeros_like(mid_block_res_sample), mid_block_res_sample])
 
+
+
+
                     step_percentage = i / len(timesteps)
                     should_use_ufree = 0.6 < step_percentage
                     backbone_scale_1 = 1.2 if should_use_ufree else 1.0
@@ -850,7 +918,7 @@ class AnimationPipeline(DiffusionPipeline, FromSingleFileMixin):
                     # predict the noise residual
                     if controlnet is not None:
                         noise_pred = self.unet(
-                                        latent_model_input,
+                                        scale_latent_model_input,
                                         t,
                                         encoder_hidden_states=text_embeddings,
                                         cross_attention_kwargs=cross_attention_kwargs,
@@ -866,7 +934,7 @@ class AnimationPipeline(DiffusionPipeline, FromSingleFileMixin):
 
                                     )[0]
                     else:
-                        noise_pred = self.unet(latent_model_input, 
+                        noise_pred = self.unet(scale_latent_model_input, 
                                             t, 
                                             encoder_hidden_states=text_embeddings,
                                             # backbone_scale_1=backbone_scale_1,
@@ -876,10 +944,23 @@ class AnimationPipeline(DiffusionPipeline, FromSingleFileMixin):
                                             # skip_scale_threshold_1=skip_scale_threshold_1,
                                             # skip_scale_threshold_2=skip_scale_threshold_2,
                                             ).sample.to(dtype=latents_dtype)
+                    
+                    
+                    if scheduler_is_in_sigma_space:
+                        step_index = (self.scheduler.timesteps == t).nonzero()[0].item()
+                        sigma = self.scheduler.sigmas[step_index]
+                        noise_pred = latent_model_input - sigma * noise_pred
                     # perform guidance
                     if do_classifier_free_guidance:
-                        noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
-                        noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
+                        noise_pred_text, noise_pred_image, noise_pred_uncond = noise_pred.chunk(3)
+                        noise_pred = (
+                            noise_pred_uncond
+                            + guidance_scale * (noise_pred_text - noise_pred_image)
+                            + image_guidance_scale * (noise_pred_image - noise_pred_uncond)
+                        )
+                    
+                    if scheduler_is_in_sigma_space:
+                        noise_pred = (noise_pred - latent_partition) / (-sigma)
 
                     # compute the previous noisy sample x_t -> x_t-1
                     if isinstance(generator, list):

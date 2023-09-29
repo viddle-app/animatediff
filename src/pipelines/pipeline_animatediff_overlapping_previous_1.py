@@ -573,7 +573,7 @@ class AnimationPipeline(DiffusionPipeline, FromSingleFileMixin):
                         do_classifier_free_guidance=do_classifier_free_guidance,
                         guess_mode=guess_mode,
                     )
-
+                    image_ = rearrange(image_, "(b f) c h w -> b c f h w", f=video_length)
                     images.append(image_)
 
                 image = images
@@ -765,11 +765,29 @@ class AnimationPipeline(DiffusionPipeline, FromSingleFileMixin):
                         current_window_length = len(partition_indices_expanded) if isinstance(partition_indices, tuple) else partition_indices[1] - partition_indices[0]
                         print("current_window_length: ", current_window_length)
                         if isinstance(partition_indices, tuple):
-                            images_partition = image[:, :, partition_indices_expanded].to(device)
+                            if isinstance(self.controlnet, MultiControlNetModel):
+                                image_partition = []
+                                for img in image:
+                                    
+                                    image_partition.append(img[:, :, partition_indices_expanded].to(device))
+                            else:
+                                images_partition = image[:, :, partition_indices_expanded].to(device)
                         else:
-                            images_partition = image[:, :, partition_indices[0]:partition_indices[1]].to(device)
-
-                        images_partition = rearrange(images_partition, "b c f h w -> (b f) c h w")
+                            if isinstance(self.controlnet, MultiControlNetModel):
+                                image_partition = []
+                                for img in image:
+                                    print("img: ", img.shape)
+                                    image_partition.append(img[:, :, partition_indices[0]:partition_indices[1]].to(device))
+                            else:
+                                images_partition = image[:, :, partition_indices[0]:partition_indices[1]].to(device)
+                        if isinstance(self.controlnet, MultiControlNetModel):
+                            new_partition = []
+                            for img in image_partition:
+                                new_partition.append(rearrange(img, "b c f h w -> (b f) c h w"))
+                            
+                            images_partition = new_partition
+                        else:
+                            images_partition = rearrange(images_partition, "b c f h w -> (b f) c h w")
                         # controlnet(s) inference
                         if guess_mode and do_classifier_free_guidance:
                             # Infer ControlNet only for the conditional batch.
@@ -798,7 +816,6 @@ class AnimationPipeline(DiffusionPipeline, FromSingleFileMixin):
                             cond_scale = torch.cat([cond_scale] * 2) if do_classifier_free_guidance and not guess_mode else cond_scale
 
                         print("control_model_input", control_model_input.shape, control_model_input.dtype)
-                        print("images_partition", image.shape)
                         print("controlnet_prompt_embeds", controlnet_prompt_embeds.shape)
                         print("cond_scale", cond_scale)
                         down_block_res_samples, mid_block_res_sample = self.controlnet(

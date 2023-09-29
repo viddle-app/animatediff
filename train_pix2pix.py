@@ -1,4 +1,5 @@
 # originally copied from: 
+from collections import OrderedDict
 import os
 import math
 import wandb
@@ -15,10 +16,6 @@ from einops import rearrange
 from omegaconf import OmegaConf
 from safetensors import safe_open
 from typing import Dict, Optional, Tuple
-
-from accelerate import Accelerator
-from accelerate.logging import get_logger
-from accelerate.utils import set_seed
 
 import torch
 import torchvision
@@ -38,16 +35,13 @@ from diffusers.utils.import_utils import is_xformers_available
 
 import transformers
 from transformers import CLIPTextModel, CLIPTokenizer
-# from torch.utils.tensorboard import SummaryWriter
-
+from PIL import Image
 
 from src.models.unet import UNet3DConditionModel
-# from src.pipelines.pipeline_animatediff import AnimationPipeline
-from src.pipelines.pipeline_animatediff_overlapping_previous_2 import AnimationPipeline
+from src.pipelines.pipeline_animatediff_pix2pix_2 import StableDiffusionInstructPix2PixPipeline
 from src.utils.util import save_videos_grid, zero_rank_print
-from src.data.dataset_overlapping import WebVid10M
-# from src.data.dataset import WebVid10M
-from collections import OrderedDict
+from src.data.dataset import WebVid10M
+from torchvision.transforms import ToTensor
 
 def extract_motion_module(unet):
     mm_state_dict = OrderedDict()
@@ -59,10 +53,8 @@ def extract_motion_module(unet):
 
     return mm_state_dict
 
-
 def init_dist(launcher="slurm", backend='nccl', port=29500, **kwargs):
     """Initializes distributed environment."""
-    print("launcher: ", launcher)
     if launcher == 'pytorch':
         rank = int(os.environ['RANK'])
         num_gpus = torch.cuda.device_count()
@@ -145,8 +137,6 @@ def main(
 ):
     check_min_version("0.10.0.dev0")
 
-    # writer = SummaryWriter()
-
     # Initialize distributed training
     local_rank      = init_dist(launcher=launcher)
     global_rank     = dist.get_rank()
@@ -185,47 +175,37 @@ def main(
     # Load scheduler, tokenizer and models.
     dtype = torch.float32
     noise_scheduler = DDIMScheduler(**OmegaConf.to_container(noise_scheduler_kwargs))
-    noise_scheduler.set_timesteps(noise_scheduler.num_train_timesteps)
 
-    if True:
-        pipeline = StableDiffusionPipeline.from_single_file(pretrained_model_path, torch_dtype=dtype)
-      
-        tokenizer = pipeline.tokenizer  
-        text_encoder = pipeline.text_encoder
-        vae = pipeline.vae
-        unet = UNet3DConditionModel.from_unet2d(pipeline.unet, 
-                                                unet_additional_kwargs=unet_additional_kwargs)
-    else: 
-        tokenizer    = CLIPTokenizer.from_pretrained(pretrained_model_path, subfolder="tokenizer", torch_dtype=dtype)
-        text_encoder = CLIPTextModel.from_pretrained(pretrained_model_path, subfolder="text_encoder", torch_dtype=dtype)
-        vae          = AutoencoderKL.from_pretrained(pretrained_model_path, subfolder="vae", torch_dtype=dtype)            
-        unet         = UNet3DConditionModel.from_pretrained_2d(pretrained_model_path, 
-                                                          subfolder="unet", 
-                                                          unet_additional_kwargs=unet_additional_kwargs)
-        
-    print(f"state_dict keys: {list(unet.config.keys())[:10]}")
+    pipeline = StableDiffusionPipeline.from_single_file(pretrained_model_path, torch_dtype=dtype)
+  
+    tokenizer = pipeline.tokenizer  
+    text_encoder = pipeline.text_encoder
+    vae = pipeline.vae
+    unet = UNet3DConditionModel.from_unet2d(pipeline.unet, 
+                                             unet_additional_kwargs=OmegaConf.to_container(unet_additional_kwargs))
 
-    global_step = 0
-
-    # motion_module_path = "motion-models/mm-Stabilized_high.pth"
-    # motion_module_path = "models/mm-1000.pth"
-    # motion_module_path = "models/motionModel_v03anime.ckpt"
-    # motion_module_path = "models/mm_sd_v14.ckpt"
-    motion_module_path = "motion-models/mm_sd_v15_v2.ckpt"
-    # motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/training-2023-09-28T14-37-24/checkpoints/checkpoint.ckpt"
-    # motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/training-2023-09-28T15-46-14/checkpoints/checkpoint.ckpt"
-    # motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/training-2023-09-28T10-57-52/checkpoints/checkpoint.ckpt"
-    # motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/training-2023-09-28T11-39-21/checkpoints/checkpoint.ckpt"
-    # motion_module_path = "motion-models/temporal-attn-pe-5e-7-4-50000-steps.ckpt"
+    # else:
+    #    unet = UNet2DConditionModel.from_pretrained(pretrained_model_path, subfolder="unet")
+    global_step = 5000
+    # motion_module_path = "motion-models/mm_sd_v15_v2.ckpt"
+    # motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/training-2023-09-26T09-38-19/checkpoints/mm.ckpt"
+    # motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/training-2023-09-26T12-50-02/checkpoints/mm.ckpt"
+    motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/training-2023-09-26T14-32-35/checkpoints/mm.ckpt"
+    # motion_module_path = "motion-models/temporal-attn-5e-7-2-15000-steps.ckpt"
+    # motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/training-2023-09-19T10-06-51/checkpoints/checkpoint.ckpt"
     # motion_module_path = '../ComfyUI/custom_nodes/ComfyUI-AnimateDiff/models/animatediffMotion_v15.ckpt'
     motion_module_state_dict = torch.load(motion_module_path, map_location="cpu")
+    # update_pe(motion_module_state_dict)
     missing, unexpected = unet.load_state_dict(motion_module_state_dict, strict=False)
     if "global_step" in motion_module_state_dict:
-      raise Exception("global_step present. Not sure how to handle that.")
+      global_step = int(motion_module_state_dict["global_step"])
     print("unexpected", unexpected)
     # assert len(unexpected) == 0
     print("missing", len(missing))
     print("missing", missing)
+
+    print(f"state_dict keys: {list(unet.config.keys())[:10]}")
+
 
     # Load pretrained unet weights
     if unet_checkpoint_path != "":
@@ -244,7 +224,7 @@ def main(
     # Freeze vae and text_encoder
     vae.requires_grad_(False)
     text_encoder.requires_grad_(False)
-
+    
     # Set unet trainable parameters
     unet.requires_grad_(False)
     for name, param in unet.named_parameters():
@@ -325,8 +305,11 @@ def main(
 
     # Validation pipeline
     if not image_finetune:
-        validation_pipeline = AnimationPipeline(
+        validation_pipeline = StableDiffusionInstructPix2PixPipeline(
             unet=unet, vae=vae, tokenizer=tokenizer, text_encoder=text_encoder, scheduler=noise_scheduler,
+            safety_checker=None,
+            feature_extractor=None,
+            requires_safety_checker=False,
         ).to("cuda")
     else:
         validation_pipeline = StableDiffusionPipeline.from_pretrained(
@@ -337,7 +320,7 @@ def main(
 
     # DDP warpper
     unet.to(local_rank)
-    # unet = DDP(unet, device_ids=[local_rank], output_device=local_rank)
+    unet = DDP(unet, device_ids=[local_rank], output_device=local_rank)
 
     # We need to recalculate our total training steps as the size of the training dataloader may have changed.
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / gradient_accumulation_steps)
@@ -355,7 +338,6 @@ def main(
         logging.info(f"  Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size}")
         logging.info(f"  Gradient Accumulation steps = {gradient_accumulation_steps}")
         logging.info(f"  Total optimization steps = {max_train_steps}")
-    
     first_epoch = 0
 
     # Only show the progress bar once on each machine.
@@ -368,13 +350,9 @@ def main(
     for epoch in range(first_epoch, num_train_epochs):
         train_dataloader.sampler.set_epoch(epoch)
         unet.train()
-
-        print(f"epoch: {epoch}, global_step: {global_step}, max_train_steps: {max_train_steps}")
         
         for step, batch in enumerate(train_dataloader):
-            unet.clear_last_encoder_hidden_states()
-            print(f"step: {step}")
-
+            
 
             if cfg_random_null_text:
                 batch['text'] = [name if random.random() > cfg_random_null_text_ratio else "" for name in batch['text']]
@@ -392,28 +370,18 @@ def main(
                         pixel_value = pixel_value / 2. + 0.5
                         torchvision.utils.save_image(pixel_value, f"{output_dir}/sanity_check/{'-'.join(text.replace('/', '').split()[:10]) if not text == '' else f'{global_rank}-{idx}'}.png")
                     
-
-                    
-
+            ### >>>> Training >>>> ###
+            
             # Convert videos to latent space            
             pixel_values = batch["pixel_values"].to(local_rank)
             video_length = pixel_values.shape[1]
-            print("video_length: ", video_length)
-
-            if video_length == 16:
-                overlapping_step = False
-            elif video_length == 32:
-                overlapping_step = True
-            else:
-                print("video_length: ", video_length)
-                overlapping_step = False
-
             with torch.no_grad():
                 if not image_finetune:
                     pixel_values = rearrange(pixel_values, "b f c h w -> (b f) c h w")
                     latents = vae.encode(pixel_values).latent_dist
                     latents = latents.sample()
                     latents = rearrange(latents, "(b f) c h w -> b c f h w", f=video_length)
+
                 else:
                     latents = vae.encode(pixel_values).latent_dist
                     latents = latents.sample()
@@ -423,17 +391,20 @@ def main(
             # Sample noise that we'll add to the latents
             noise = torch.randn_like(latents)
             bsz = latents.shape[0]
-
-            # keeping things simply for now
-            assert(bsz == 1)
             
-            # set the number of inference steps
-
             # Sample a random timestep for each video
             timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (bsz,), device=latents.device)
             timesteps = timesteps.long()
+            
+            # Add noise to the latents according to the noise magnitude at each timestep
+            # (this is the forward diffusion process)
+            noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
 
-            # get a random timestep for each video
+            # add repeat the first frame of the latents and concatenate to the noisy latents
+            first_frame = latents[:, :, 0:1, :, :] / 0.18215
+            repeated_first_frame = first_frame.repeat(1, 1, latents.shape[2], 1, 1)
+            noisy_latents = torch.cat([noisy_latents, repeated_first_frame], dim=1)
+
 
             # Get the text embedding for conditioning
             with torch.no_grad():
@@ -449,156 +420,34 @@ def main(
                 raise NotImplementedError
             else:
                 raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
-            
-            # Add noise to the latents according to the noise magnitude at each timestep
-            # (this is the forward diffusion process)
-            noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
-
-            def ddim_step(model_output: torch.FloatTensor,
-                         timestep: int,
-                         sample: torch.FloatTensor,
-                         prev_timestep: int):
-                eta = 0
-                alpha_prod_t = noise_scheduler.alphas_cumprod[timestep]
-                alpha_prod_t_prev = noise_scheduler.alphas_cumprod[prev_timestep] if prev_timestep >= 0 else self.final_alpha_cumprod
-
-                beta_prod_t = 1 - alpha_prod_t
-
-                # 3. compute predicted original sample from predicted noise also called
-                # "predicted x_0" of formula (12) from https://arxiv.org/pdf/2010.02502.pdf
-                
-                pred_original_sample = (sample - beta_prod_t ** (0.5) * model_output) / alpha_prod_t ** (0.5)
-                pred_epsilon = model_output
-          
-
-                # 4. Clip or threshold "predicted x_0"
-                if noise_scheduler.config.thresholding:
-                    pred_original_sample = noise_scheduler._threshold_sample(pred_original_sample)
-                elif noise_scheduler.config.clip_sample:
-                    pred_original_sample = pred_original_sample.clamp(
-                        -noise_scheduler.config.clip_sample_range, noise_scheduler.config.clip_sample_range
-                    )
-
-                # 5. compute variance: "sigma_t(η)" -> see formula (16)
-                # σ_t = sqrt((1 − α_t−1)/(1 − α_t)) * sqrt(1 − α_t/α_t−1)
-                variance = noise_scheduler._get_variance(timestep, prev_timestep)
-                std_dev_t = eta * variance ** (0.5)
-
-
-                # 6. compute "direction pointing to x_t" of formula (12) from https://arxiv.org/pdf/2010.02502.pdf
-                pred_sample_direction = (1 - alpha_prod_t_prev - std_dev_t**2) ** (0.5) * pred_epsilon
-
-                # 7. compute x_t without "random noise" of formula (12) from https://arxiv.org/pdf/2010.02502.pdf
-                return alpha_prod_t_prev ** (0.5) * pred_original_sample + pred_sample_direction
-            
-            the_timestep = timesteps[0].item()
-            if overlapping_step and the_timestep > 2:
-                # with torch.no_grad():
-                    noisy_latents_1 = noisy_latents[:, :, :16].detach()
-                    noisy_latents_2 = noisy_latents[:, :, 16:].detach()
-
-                    model_pred_1 = unet(noisy_latents_1, timesteps, encoder_hidden_states).sample
-                    unet.swap_next_to_last()
-                    print("model_pred_1 mean and std", model_pred_1.mean(), model_pred_1.std())
-                    model_pred_2 = unet(noisy_latents_2, timesteps, encoder_hidden_states).sample
-                    unet.clear_last_encoder_hidden_states()
-                    
-                    print("model_pred_2 mean and std", model_pred_2.mean(), model_pred_2.std())
-
-                    # how to randomly step
-                    # just picking a random num inference steps won't work
-                    # it might not have the current time step.
-                    # I might want to start by picking a num inference steps
-                    # then pick a random timestep from there 
-                    # then step to the next timestep
-
-
-                    # previous_step = torch.randint(1, 
-                    #                               the_timestep - 1, 
-                    #                              (1,), 
-                    #                              device=latents.device)
-                    # previous_step = previous_step.long().item()
-                    previous_step = the_timestep - 1
-                    # DDIM step 
-                    noisy_latents_1 = ddim_step(model_pred_1, the_timestep, noisy_latents_1, previous_step)
-                    noisy_latents_2 = ddim_step(model_pred_2, the_timestep, noisy_latents_2, previous_step)
-                    # noisy_latents_1 = noise_scheduler.step(noisy_latents_1, the_timestep, model_pred_1).prev_sample
-                    # noisy_latents_2 = noise_scheduler.step(noisy_latents_2, the_timestep, model_pred_2).prev_sample
-                    
-
-                    # take the last 8 frames from the first part and the first 8 frames from the second part
-                    noisy_latents = torch.cat([noisy_latents_1[:, :, 8:], noisy_latents_2[:, :, :8]], dim=2)
-                    # take the middle 16 frames for the latents
-                    latents = latents[:, :, 8:24]
-
-                    print("timesteps before: ", timesteps)
-                    # convert the previous_step to a tensor the same shape as timesteps
-                    timesteps = torch.full_like(timesteps, previous_step)
-                    the_timestep = previous_step
-
-                    print("timesteps after: ", timesteps)
-                    alphas_cumprod = noise_scheduler.alphas_cumprod.to(device=latents.device, dtype=latents.dtype)
-                    sqrt_alpha_prod = noise_scheduler.alphas_cumprod[the_timestep] ** 0.5
-                    sqrt_alpha_prod = sqrt_alpha_prod.flatten()
-                    while len(sqrt_alpha_prod.shape) < len(latents.shape):
-                        sqrt_alpha_prod = sqrt_alpha_prod.unsqueeze(-1)
-
-                    sqrt_one_minus_alpha_prod = (1 - alphas_cumprod[the_timestep]) ** 0.5
-                    sqrt_one_minus_alpha_prod = sqrt_one_minus_alpha_prod.flatten()
-                    while len(sqrt_one_minus_alpha_prod.shape) < len(latents.shape):
-                        sqrt_one_minus_alpha_prod = sqrt_one_minus_alpha_prod.unsqueeze(-1)
-
-                    print("latent.device", latents.device)
-                    print("sqrt_alpha_prod.device", sqrt_alpha_prod.device)
-                    sqrt_alpha_prod = sqrt_alpha_prod.to(device=latents.device)
-                    recovered_noisy_samples = noisy_latents - sqrt_alpha_prod * latents 
-                    print("target before mean: ", target.mean())
-                    print("target before std: ", target.std())
-                    target = recovered_noisy_samples  / sqrt_one_minus_alpha_prod
-
-
-                # noisy_latents = noisy_latents.clone().detach().requires_grad_(True) 
-            else: 
-                # slice the latents and target to 16 frames
-                noisy_latents = noisy_latents[:, :, :16]
-                target = target[:, :, :16]
-            
-            print("target after mean: ", target.mean())
-            print("target after std: ", target.std())
-
-                # clone the noisy_latents to have gradients
 
             # Predict the noise residual and compute loss
             # Mixed-precision training
-            # unet.clear_last_encoder_hidden_states()
             with torch.cuda.amp.autocast(enabled=mixed_precision_training):
                 model_pred = unet(noisy_latents, timesteps, encoder_hidden_states).sample
-                print("model_pred mean and std", model_pred.mean(), model_pred.std())
                 loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
 
-            unet.clear_last_encoder_hidden_states()
+            optimizer.zero_grad()
 
-            if step % gradient_accumulation_steps == gradient_accumulation_steps - 1:
-                # Backpropagate
-                if mixed_precision_training:
-                    scaler.scale(loss).backward()
-                    """ >>> gradient clipping >>> """
-                    scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(unet.parameters(), max_grad_norm)
-                    """ <<< gradient clipping <<< """
-                    scaler.step(optimizer)
-                    scaler.update()
-                else:
-                    loss.backward()
-                    """ >>> gradient clipping >>> """
-                    torch.nn.utils.clip_grad_norm_(unet.parameters(), max_grad_norm)
-                    """ <<< gradient clipping <<< """
-                    optimizer.step()
+            # Backpropagate
+            if mixed_precision_training:
+                scaler.scale(loss).backward()
+                """ >>> gradient clipping >>> """
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(unet.parameters(), max_grad_norm)
+                """ <<< gradient clipping <<< """
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                loss.backward()
+                """ >>> gradient clipping >>> """
+                torch.nn.utils.clip_grad_norm_(unet.parameters(), max_grad_norm)
+                """ <<< gradient clipping <<< """
+                optimizer.step()
 
-                optimizer.zero_grad()
-                lr_scheduler.step()
-                progress_bar.update(1)
-                global_step += 1
+            lr_scheduler.step()
+            progress_bar.update(1)
+            global_step += 1
             
             ### <<<< Training <<<< ###
             
@@ -610,18 +459,22 @@ def main(
             if is_main_process and (global_step % checkpointing_steps == 0 or step == len(train_dataloader) - 1):
                 save_path = os.path.join(output_dir, f"checkpoints")
                 motion_module = extract_motion_module(unet)
+                state_dict = {
+                    "epoch": epoch,
+                    "global_step": global_step,
+                    "state_dict": motion_module,
+                }
                 if step == len(train_dataloader) - 1:
-                    torch.save(motion_module, os.path.join(save_path, f"checkpoint-epoch-{epoch+1}.ckpt"))
+                    torch.save(state_dict, os.path.join(save_path, f"checkpoint-epoch-{epoch+1}.ckpt"))
                 else:
-                    torch.save(motion_module, os.path.join(save_path, f"checkpoint.ckpt"))
+                    torch.save(state_dict, os.path.join(save_path, f"checkpoint.ckpt"))
                 logging.info(f"Saved state to {save_path} (global_step: {global_step})")
                 
             # Periodically validation
-            if is_main_process and (step % validation_steps == 0 or step in validation_steps_tuple) and step > 2:
+            if is_main_process and (global_step % validation_steps == 0 or global_step in validation_steps_tuple):
                 samples = []
                 
-                # generator = torch.Generator(device=latents.device)
-                generator = torch.Generator(device="cpu")
+                generator = torch.Generator(device=latents.device)
                 generator.manual_seed(global_seed)
                 
                 height = train_data.sample_size[0] if not isinstance(train_data.sample_size, int) else train_data.sample_size
@@ -631,24 +484,29 @@ def main(
 
                 for idx, prompt in enumerate(prompts):
                     if not image_finetune:
-                        window_length = train_data.sample_n_frames
                         sample = validation_pipeline(
                             prompt,
                             generator    = generator,
-                            video_length = train_data.sample_n_frames * 2,
-                            height       = 512,
-                            width        = 512,
-                            window_count = window_length,
-                            wrap_around=True,
-                            alternate_direction=True,
-                            min_offset = window_length // 2,
-                            max_offset = window_length // 2,
-                            **validation_data,
-                        ).videos
+                            video_length = train_data.sample_n_frames,
+                            image = Image.open("mona-lisa-1.jpg").resize((256, 256)),
+                            num_inference_steps = validation_data.get("num_inference_steps", 25),
+                        )[0]
+
+                        transform = ToTensor()
+                        tensors = [transform(img) for img in sample]
+
+                        # Stack these tensors together
+                        sample = torch.stack(tensors, dim=0)
+                        print("video", sample.shape)
+
+                        sample = sample.permute(1, 0, 2, 3).unsqueeze(0)
                         output_path = f"{output_dir}/samples/sample-{global_step}/{idx}.gif"
                         save_videos_grid(sample, output_path)
                         samples.append(sample)
+                        # Assuming 'images' is a list of PIL Image objects or numpy arrays
+                        # and 'labels' is a list of corresponding labels or captions  
                         wandb.log({"validation_images": wandb.Image(output_path)})
+
                         
                     else:
                         sample = validation_pipeline(

@@ -7,10 +7,15 @@ import shutil
 import sys
 import uuid
 import torch.nn.functional as F
+# from src.pipelines.multicontrolnet import MultiControlNetModel
+from diffusers.pipelines.controlnet.multicontrolnet import MultiControlNetModel
+
 use_ufree = False
-use_type = 'pix2pix_2'
+use_type = 'overlapping_previous_2'
 if use_type == 'overlapping':
   from src.pipelines.pipeline_animatediff_overlapping import AnimationPipeline
+elif use_type == 'pix2pix_overlapping':
+  from src.pipelines.pipeline_animatediff_overlapping_pix2pix import AnimationPipeline
 elif use_type == 'conv':
   from src.pipelines.pipeline_animatediff_conv import AnimationPipeline
 elif use_type == 'overlapping_noise_pred':
@@ -376,7 +381,7 @@ def run(model,
   device = "cuda" if torch.cuda.is_available() else "cpu"
 
   unet_additional_kwargs = {
-    "in_channels": 8,
+    "in_channels": 4,
     "unet_use_cross_frame_attention": False,
     "unet_use_temporal_attention": False,
     "use_motion_module": True,
@@ -422,15 +427,22 @@ def run(model,
 
   unet = unet.to(dtype=dtype) 
 
-  use_controlnet = True
+  use_controlnet =True
   noise_scheduler=DDIMScheduler(**scheduler_kwargs)
 
   if (use_type == "overlapping_previous" or use_type == 'conv' or use_type == 'overlapping_previous_1' or use_type == 'overlapping_previous_2') and use_controlnet:
     # controlnet_path = Path("../models/ControlNet-v1-1/control_v11p_sd15_openpose.yaml")
-    controlnet_path = "lllyasviel/control_v11p_sd15_openpose"
+    controlnet_path_0 = "lllyasviel/control_v11p_sd15_openpose"
+    controlnet_path_1 = "lllyasviel/control_v11e_sd15_ip2p"
     # controlnet_path = "lllyasviel/control_v11f1e_sd15_tile"
-    controlnet = ControlNetModel.from_pretrained(controlnet_path, torch_dtype=dtype)
-    controlnet = controlnet.to(device=device)
+    controlnet_0 = ControlNetModel.from_pretrained(controlnet_path_0, torch_dtype=dtype)
+    controlnet_0 = controlnet_0.to(device=device)
+
+    controlnet_1 = ControlNetModel.from_pretrained(controlnet_path_1, torch_dtype=dtype)
+    controlnet_1 = controlnet_1.to(device=device)
+
+    controlnet = MultiControlNetModel([controlnet_0, controlnet_1])
+    print("controlnet", len(controlnet.nets))
 
     pipeline = AnimationPipeline(
       vae=vae, 
@@ -438,6 +450,7 @@ def run(model,
       tokenizer=tokenizer, 
       unet=unet,
       scheduler=EulerAncestralDiscreteScheduler(**scheduler_kwargs),
+      # scheduler=DDIMScheduler(**scheduler_kwargs),
       controlnet=controlnet,
     ).to(device)
   elif use_type == "pix2pix_2":
@@ -474,6 +487,7 @@ def run(model,
   # motion_module_path = "models/checkpoint.ckpt"
   # motion_module_path = "motion-models/overlapping-1e-6-1-20000-steps.ckpt"
   # motion_module_path = "motion-models/overlapping-5e-7-1-40000-steps.ckpt"
+  # motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/training-2023-09-28T02-06-28/checkpoints/checkpoint.ckpt"
   # motion_module_path = "models/overlapping-1e-5-100-steps.pth"
   # motion_module_path = "models/overlapping-1e-5-3-20000-steps.pth"
   # motion_module_path = "models/overlapping-1e-5-2-100-steps.pth"
@@ -491,7 +505,7 @@ def run(model,
   # motion_module_path = "motion-models/temporal-attn-5e-7-3-40000-steps.ckpt"
   # motion_module_path = "motion-models/overlapping-attn-5e-7-1-5000-steps.ckpt"
   # motion_module_path = "motion-models/temporal-overlap-attn-5e-7-2-15000-steps.ckpt"
-  # motion_module_path = "motion-models/mm_sd_v15_v2.ckpt"
+  motion_module_path = "motion-models/mm_sd_v15_v2.ckpt"
   # motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/training-2023-09-26T03-17-19/checkpoints/checkpoint-epoch-1.ckpt"
   # motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/training-2023-09-26T03-17-19/mm.ckpt"
   # motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/training-2023-09-26T08-56-44/checkpoints/checkpoint.ckpt"
@@ -501,8 +515,12 @@ def run(model,
   # motion_module_path = "motion-models/temporal-attn-negative-pe-1e-6-1-5000-steps.ckpt"
   # motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/training-2023-09-26T12-50-02/checkpoints/mm.ckpt"
   # motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/training-2023-09-26T14-32-35/checkpoints/mm.ckpt"
-  motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/training-2023-09-26T16-52-17/checkpoints/mm.ckpt"
+  # motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/training-2023-09-26T16-52-17/checkpoints/mm.ckpt"
   # motion_module_path = '../ComfyUI/custom_nodes/ComfyUI-AnimateDiff/models/animatediffMotion_v15.ckpt'
+  # motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/training-2023-09-28T09-41-25/checkpoints/checkpoint.ckpt"
+  # motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/training-2023-09-28T10-57-52/checkpoints/checkpoint.ckpt"
+  # motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/training-2023-09-28T11-39-21/checkpoints/checkpoint.ckpt"
+  # motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/training-2023-09-28T19-12-07/checkpoints/checkpoint.ckpt"
   motion_module_state_dict = torch.load(motion_module_path, map_location="cpu")
   missing, unexpected = pipeline.unet.load_state_dict(motion_module_state_dict, strict=False)
   # if "global_step" in motion_module_state_dict:
@@ -516,11 +534,11 @@ def run(model,
     seed = random.randint(-sys.maxsize, sys.maxsize)
 
   # generators = [torch.Generator().manual_seed(seed) for _ in range(frame_count)]
-  generators = torch.Generator(device=device).manual_seed(seed)
-  # generators = torch.Generator().manual_seed(seed)
+  # generators = torch.Generator(device=device).manual_seed(seed)
+  generators = torch.Generator().manual_seed(seed)
 
   do_upscale = False
-  use_img2img = True
+  use_img2img = False
 
 
   if use_type == 'overlapping' or use_type == 'overlapping_noise_pred' or use_type == 'overlapping_2' or use_type == 'overlapping_3' or use_type == 'overlapping_4' :
@@ -556,21 +574,33 @@ def run(model,
   elif use_type == 'overlapping_previous' or use_type == 'conv' or use_type == 'overlapping_previous_1' or use_type == 'overlapping_previous_2':
       if use_controlnet:
         # load 16 frames from the directory
-        open_pose_path = Path("/mnt/newdrive/stable-diffusion-docker/output/dwpose")
+        # open_pose_path = Path("/mnt/newdrive/stable-diffusion-docker/output/dwpose")
+        images_0 = []
+        
+        background_frames_path = Path("/mnt/newdrive/stable-diffusion-docker/output/dwpose")
+        background_frames = glob.glob(os.path.join(background_frames_path, '*.png'))
+        background_frames = sorted(background_frames)
+        # get frame_count with a stride of 2
+        # background_frames = background_frames[::2]
+        background_frames = background_frames[:frame_count]
+        for frame_path in background_frames:
+          frame = Image.open(frame_path).resize((width, height))
+          images_0.append(frame)
 
-        # get the directory files and sort them using Glob
-        png_files = glob.glob(os.path.join(open_pose_path, '*.png'))
+        images_1 = []
         
-        # Sort the png files
-        sorted_files = sorted(png_files)
-        
-        # get the first 16 frames
-        sorted_files = sorted_files[:frame_count]
-        
-        # load the images
-        images = []
-        for file in sorted_files:
-          images.append(Image.open(file))
+        # background_frames_path = Path("/mnt/newdrive/stable-diffusion-docker/output/source_frames")
+        background_frames_path = Path("/mnt/newdrive/stable-diffusion-docker/output/background_frames")
+        background_frames = glob.glob(os.path.join(background_frames_path, '*.png'))
+        background_frames = sorted(background_frames)
+        # get frame_count with a stride of 2
+        # background_frames = background_frames[::2]
+        background_frames = background_frames[:frame_count]
+        for frame_path in background_frames:
+          frame = Image.open(frame_path).resize((width, height))
+          images_1.append(frame)
+
+        images = [images_0, images_1]
 
 
         controlnet_conditioning_scale = 1.0
@@ -597,7 +627,7 @@ def run(model,
           background_frames = background_frames[:frame_count]
           for frame_path in background_frames:
           
-            frame = Image.open(frame_path)
+            frame = Image.open(frame_path).resize((width, height))
             frame_tensor = pipeline.image_processor.preprocess(frame).to(device=device, dtype=dtype)
             print("frame_tensor", frame_tensor.shape)
             with torch.no_grad():
@@ -618,8 +648,8 @@ def run(model,
                                   dtype=dtype,
                                   generator=generators,
                                   noise_image=encoded_video,
-                                  strength = 0.75,
-                                  noise_multiplier=0.5,
+                                  strength = 0.99,
+                                  noise_multiplier=1.0,
                                   )
           latents = latents.unsqueeze(0).permute(0, 2, 1, 3, 4)
           print("latents", latents.shape)
@@ -652,11 +682,11 @@ def run(model,
               window_count=window_count,
               video_length=frame_count,
               generator=generators,
-              wrap_around=False,
+              wrap_around=True,
               alternate_direction=False,
               guess_mode=guess_mode,
               image=images,
-              controlnet_conditioning_scale=controlnet_conditioning_scale,
+              controlnet_conditioning_scale=[controlnet_conditioning_scale, 1.0],
               min_offset = 8,
               max_offset = 8,
               latents=latents,
@@ -697,6 +727,41 @@ def run(model,
               strength=0.25,
               window_count=window_count//4,
               )
+  elif use_type == 'pix2pix_overlapping':
+    images = []
+    
+    # background_frames_path = Path("/mnt/newdrive/stable-diffusion-docker/output/dwpose")
+    background_frames_path = Path("/mnt/newdrive/stable-diffusion-docker/output/background_frames")
+    background_frames = glob.glob(os.path.join(background_frames_path, '*.png'))
+    background_frames = sorted(background_frames)
+    # get frame_count with a stride of 2
+    # background_frames = background_frames[::2]
+    background_frames = background_frames[:frame_count]
+    for frame_path in background_frames:
+       frame = Image.open(frame_path).resize((width, height))
+       images.append(frame)
+
+
+
+
+    video = pipeline(prompt=prompt, 
+      negative_prompt=negative_prompt, 
+      num_inference_steps=num_inference_steps,
+      guidance_scale=guidance_scale,
+        width=width,
+        height=height,
+        window_count=window_count,
+        video_length=frame_count,
+        generator=generators,
+        wrap_around=True,
+        alternate_direction=False,
+        min_offset = 3,
+        max_offset = 5,
+        image_guidance_scale=0.9,
+        pix2pix_image=images,
+        # cpu_device=torch.device("cuda"),
+        ).videos[0]
+
   elif use_type == "init_image":
     init_image = Image.open("mona-lisa-1.jpg")
 
@@ -932,7 +997,7 @@ def run(model,
   os.makedirs(output_dir, exist_ok=True)
   filename = str(uuid.uuid4())
   output_path = os.path.join(output_dir, filename + ".gif")
-  fps = 15
+  fps = 24
   tensor_to_image_sequence(video, "images")
   images = glob.glob("images/*.png")
   images.sort()
@@ -955,7 +1020,7 @@ if __name__ == "__main__":
   # prompt = "Cute Chunky anthropomorphic Siamese cat dressed in rags walking down a rural road, mindblowing illustration by Jean-Baptiste Monge + Emily Carr + Tsubasa Nakai"
   # prompt = "close up of A man walking, movie production, cinematic, photography, designed by daniel arsham, glowing white, futuristic, white liquid, highly detailed, 35mm"
   # prompt = "closeup of A woman dancing in front of a secret garden, upper body headshot, early renaissance paintings, Rogier van der Weyden paintings style"
-  # prompt = "close up portrait of a woman in front of a lake artwork by Kawase Hasui"
+  prompt = "Close Up portrait of a woman swaying in front of a lake artwork by Kawase Hasui"
   # prompt = "close up head shot of girl standing in a field of flowers, windy, long blonde hair in a blue dress smiling"
   # prompt = "RAW Photo, DSLR BREAK a young woman with bangs, (light smile:0.8), (smile:0.5), wearing relaxed shirt and trousers, causal clothes, (looking at viewer), focused, (modern and cozy office space), design agency office, spacious and open office, Scandinavian design space BREAK detailed, natural light"
   # prompt = "taken with iphone camera BREAK medium shot selfie of a pretty young woman BREAK (ombre:1.3) blonde pink BREAK film grain, medium quality"
@@ -966,7 +1031,8 @@ if __name__ == "__main__":
   # prompt = "synthwave retrowave vaporware back of a delorean driving on highway, dmc rear grill, neon lights, palm trees and sunset in background"
   # prompt = "a doodle of a bear dancing, scribble, messy, stickfigure, badly drawn"
   # prompt = "make a painting by patrick nagel, gorgeous woman"
-  prompt = "make in the style illustration by Jean-Baptiste Monge + Emily Carr + Tsubasa Nakai"
+  # prompt = "make it oil painting, thick brush strokes, impasto, colorful"
+  # prompt = "make it a charcoal sketch, minimal, simple line drawing, rough thick lines"
   # prompt = "woman laughing"
   # prompt = "close up of Embrodery Elijah Wood smiling in front of a embroidery landscape"
   # prompt = "photo of a tom cruise statue made of ice, model shoot, empty black background"
@@ -986,26 +1052,28 @@ if __name__ == "__main__":
 
   # lora_file=None
   # lora_file
-  # model = "/mnt/newdrive/automatic1111/models/Stable-diffusion/dreamshaper_6BakedVae.safetensors"
+  model = "/mnt/newdrive/automatic1111/models/Stable-diffusion/dreamshaper_6BakedVae.safetensors"
   # model = "/mnt/newdrive/automatic1111/models/Stable-diffusion/dreamshaper_8.safetensors"
   # model = "/mnt/newdrive/automatic1111/models/Stable-diffusion/epicrealism_pureEvolutionV5.safetensors"
-  model = "/mnt/newdrive/automatic1111/models/Stable-diffusion/instruct-pix2pix-00-22000.ckpt"
+  # model = "/mnt/newdrive/automatic1111/models/Stable-diffusion/instruct-pix2pix-00-22000.ckpt"
   # model = "/mnt/newdrive/automatic1111/models/Stable-diffusion/deliberate_v2.safetensors"
   # model = "/mnt/newdrive/automatic1111/models/Stable-diffusion/absolutereality_v181.safetensors"
   # model = "/mnt/newdrive/automatic1111/models/Stable-diffusion/neonskiesai_V10.safetensors"
   # model = "/mnt/newdrive/automatic1111/models/Stable-diffusion/synthwavepunk_v2.ckpt"
+  # model = "/mnt/newdrive/models/miniSD"
   run(model, 
       prompt=prompt,
       # negative_prompt="clone, cloned, bad anatomy, wrong anatomy, mutated hands and fingers, mutation, mutated, amputation, 3d render, lowres, signs, memes, labels, text, error, mutant, worst quality, low quality, normal quality, jpeg artifacts, signature, watermark, username, blurry, made by children, caricature, ugly, boring, sketch, lacklustre, repetitive, cropped, (long neck), body horror, out of frame, mutilated, tiled, frame, border",
       negative_prompt="",
-      height=256,
-      width=144,
-      frame_count=16, # 288,
+      height=512,
+      width=288,
+      frame_count=240, # 288,
       window_count=16,
-      num_inference_steps=50,
+      num_inference_steps=20,
       guidance_scale=7.0,
       last_n=23,
       seed=42,
+      use_single_file=True,
       dtype=torch.float16,
       lora_folder="/mnt/newdrive/automatic1111/models/Lora",
       lora_files=lora_files)

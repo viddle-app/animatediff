@@ -66,7 +66,7 @@ def create_mp4_from_images(images_folder, output_path, fps=15):
     os.system(cmd)
 
 if __name__ == "__main__":
-    fps = 8
+    fps = 24
     create_mp4_from_images("images", "output.mp4", fps=fps)
     images = glob.glob("images/*.png")
     images.sort()
