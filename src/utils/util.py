@@ -11,6 +11,36 @@ from tqdm import tqdm
 from einops import rearrange
 
 
+def save_power_spectrum_as_gif(frames, save_path):
+    # List to store processed frames
+    frames = rearrange(frames, "b c t h w -> (b t) c h w")
+    power_spectra = []
+
+    # Iterate over each frame
+    for i in range(frames.shape[0]):
+        # Placeholder for combined channels
+        combined_spectrum = np.zeros((frames.shape[2], frames.shape[3], 3), dtype=np.uint8)
+        
+        # Process each channel
+        for j in range(3):  # Since RGB has 3 channels
+            # Compute the 2D FFT
+            f_transform = np.fft.fftshift(np.fft.fft2(frames[i, j]))
+
+            # Compute the power spectrum
+            power_spectrum = np.abs(f_transform) ** 2
+
+            # Normalize for visualization
+            normalized_spectrum = np.log1p(power_spectrum)
+            normalized_spectrum = normalized_spectrum / normalized_spectrum.max() * 255.0
+            normalized_spectrum = normalized_spectrum.astype(np.uint8)
+
+            combined_spectrum[..., j] = normalized_spectrum
+
+        power_spectra.append(combined_spectrum)
+
+    # Save the frames as a GIF
+    imageio.mimsave(save_path, power_spectra, duration=0.1, loop=0)
+
 def zero_rank_print(s):
     if (not dist.is_initialized()) and (dist.is_initialized() and dist.get_rank() == 0): print("### " + s)
 
@@ -28,7 +58,7 @@ def save_videos_grid(videos: torch.Tensor, path: str, rescale=False, n_rows=6, f
 
     os.makedirs(os.path.dirname(path), exist_ok=True)
     duration = 1000 * 1/fps
-    imageio.mimsave(path, outputs, duration=duration)
+    imageio.mimsave(path, outputs, duration=duration, loop=0)
 
 
 # DDIM Inversion

@@ -1,7 +1,7 @@
 image_finetune: false
 
 output_dir: "outputs"
-pretrained_model_path: "/mnt/newdrive/automatic1111/models/Stable-diffusion/dreamshaper_6BakedVae.safetensors"
+pretrained_model_path: "/mnt/newdrive/models/miniSD"
 
 unet_additional_kwargs:
   in_channels: 4
@@ -46,15 +46,16 @@ trainable_modules:
 
 unet_checkpoint_path: ""
 
-learning_rate:    5.e-6
+learning_rate:    1.e-5
 train_batch_size: 1
 gradient_checkpointing: True
 gradient_accumulation_steps: 1
+adam_weight_decay: 1.e-2
 
-max_train_epoch:      -1
-max_train_steps:      10000
+max_train_epoch:      4
+max_train_steps:      -1
 checkpointing_epochs: -1
-checkpointing_steps:  100
+checkpointing_steps:  500
 
 validation_steps:       100
 validation_steps_tuple: []

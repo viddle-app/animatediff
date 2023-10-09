@@ -49,3 +49,20 @@ don't shift a window
 shift how much they overlap. 
 
 The model for image 
+We need to train a model that get the extra channels and tries to predict the sequence of frames.
+It should get some subset of frames and predict the rest.
+
+The spectrogram should remain the same after fine-tuning
+the average should stay the same
+and the variance
+
+because weight not
+I should have added pe to the input frames
+I need a way to add a list of pe
+I should only every have a 16 by itself if it is tzero. 
+
+I should train in a range otherwise. Because it can't really resolve really deal with a difference. 
+I might need to evaluate to that point. 
+It needs to learn how to handle repeated diffusion steps or is it idepotent
+
+

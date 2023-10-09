@@ -428,18 +428,18 @@ def partition_sliding_2(elementCount, windowSize, offset):
 
 
 if __name__ == "__main__":
-    element_count = 64
-    window_size = 16
-    index = 0
-    offset = 4
-    
-    result = partition_sliding_2(element_count, window_size, offset)
-    print(result)
-
-    # wrap_around = True
-    # whole_region = Slice3D(Range(0, 4), Range(0, 4), Range(0, 4))
-    # window = Slice3D(Range(0, 2), Range(0, 2), Range(0, 2))
-    # offset = Offset3D(1, 1, 1)
-# 
-    # result = multi(whole_region, window, offset, wrap_around)
+    # element_count = 64
+    # window_size = 16
+    # index = 0
+    # offset = 4
+    # 
+    # result = partition_sliding_2(element_count, window_size, offset)
     # print(result)
+
+    wrap_around = True
+    whole_region = Slice3D(Range(0, 2), Range(0, 2), Range(0, 2))
+    window = Slice3D(Range(0, 1), Range(0, 1), Range(0, 1))
+    offset = Offset3D(1, 1, 1)
+# 
+    result = multi(whole_region, window, offset, wrap_around)
+    print(result)

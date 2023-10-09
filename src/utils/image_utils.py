@@ -3,6 +3,7 @@ import numpy as np
 import cv2
 import os
 from PIL import Image
+import torch
 
 def tensor_to_image_sequence(tensor, output_dir):
     """
@@ -64,6 +65,63 @@ def create_gif(image_files, output_file, duration=500, loop=0):
 def create_mp4_from_images(images_folder, output_path, fps=15):
     cmd = f"ffmpeg -r {fps} -i {images_folder}/%04d.png -c:v libx264 -profile:v high -crf 20 -pix_fmt yuv420p {output_path}"
     os.system(cmd)
+
+def compute_spectrum(input_seq):
+    # Assume input_seq is of shape [16, H, W, 3]
+    # Perform FFT along the first dimension (time dimension)
+    input_seq = input_seq.permute(1, 2, 3, 0)
+    print("Input shape:", input_seq.shape)
+    spectrum = torch.fft.fft(input_seq, dim=0)
+
+    print("Spectrum shape:", spectrum.shape)
+    
+    # Compute the magnitude
+    magnitude = torch.abs(spectrum)
+    
+    # Reorder dimensions so we get [H, W, 3, 16] and take log-scale for visualization
+    magnitude = magnitude.permute(1, 2, 3, 0)
+    magnitude = torch.log(1 + magnitude)
+    
+    # Normalize the magnitude values to [0, 1] range for visualization
+    magnitude = (magnitude - magnitude.min()) / (magnitude.max() - magnitude.min())
+
+    return magnitude
+def save_spectrum_images(magnitude, output_folder):
+    magnitude = magnitude.permute(3, 0, 1, 2)
+    # Ensure the directory exists
+    os.makedirs(output_folder, exist_ok=True)
+    
+    # Making sure magnitude is in [0, 1] range
+    magnitude = (magnitude - magnitude.min()) / (magnitude.max() - magnitude.min())
+    
+    # Iterating over the first dimension (frequencies) and saving images
+    for i in range(min(8, magnitude.shape[0])):
+        # Extracting i-th frame from the magnitude tensor
+        img = magnitude[i]
+        
+        # Rescale to [0, 255] and convert to uint8
+        img_np = (img.numpy() * 255).astype(np.uint8)
+        
+        # Ensure that array shape is (H, W, C)
+        img_np = np.squeeze(img_np)
+        
+        # Save the image using Pillow
+        img_pil = Image.fromarray(img_np)
+        img_pil.save(os.path.join(output_folder, f'spectrum_{i}.png'))
+
+def save_statistics(magnitude, output_folder):
+    _, _, _, C = magnitude.shape
+    stats = []
+    for i in range(min(8, C//2)):
+        band = magnitude[..., 2*i:2*i+3]
+        mean = torch.mean(band)
+        std_dev = torch.std(band)
+        stats.append((mean.item(), std_dev.item()))
+    # Save the statistics into a file
+    with open(os.path.join(output_folder, 'statistics.txt'), 'w') as file:
+        for i, (mean, std_dev) in enumerate(stats):
+            file.write(f'Frequency {i}:\n Mean: {mean:.6f}, Standard Deviation: {std_dev:.6f}\n\n')
+            
 
 if __name__ == "__main__":
     fps = 24
