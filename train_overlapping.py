@@ -2,6 +2,8 @@
 import os
 import math
 from src.utils.util import save_power_spectrum_as_gif
+from src.utils.image_utils import load_video_as_tensor, save_gif_from_tensor, tensor_to_image_sequence
+from src.utils.valiation_utils import compute_2d_fft_batch
 import wandb
 import random
 import logging
@@ -45,6 +47,7 @@ import numpy as np
 import csv
 import pandas as pd
 from transformers import Adafactor
+import torch.nn as nn
 
 
 from src.models.unet import UNet3DConditionModel
@@ -53,10 +56,153 @@ from src.models.unet import UNet3DConditionModel
 # from src.pipelines.pipeline_animatediff_overlapping_previous import AnimationPipeline
 from src.pipelines.pipeline_animatediff import AnimationPipeline
 from src.utils.util import save_videos_grid, zero_rank_print
-from src.data.dataset_overlapping import WebVid10M
-# from src.data.dataset import WebVid10M
+# from src.data.dataset_overlapping import WebVid10M
+from src.data.dataset import WebVid10M
 from collections import OrderedDict
 
+def loss_scaler(timestep, the_step):
+    percent = the_step / 100000
+    if the_step < 100000:
+        return (1 - percent) * (1 / (1 + timestep)) + percent
+    else:
+        return 1.0
+
+def validate_prediction(data,
+                        noise_scheduler,
+                        vae,
+                        output_dir,
+                        the_timestep,
+                        latents, 
+                        pixel_values, 
+                        noisy_latents, 
+                        model_pred, 
+                        target, 
+                        key, 
+                        actual_step,
+                        save_images,):
+    alphas_cumprod = noise_scheduler.alphas_cumprod.to(device=noisy_latents.device, dtype=noisy_latents.dtype)
+    sqrt_alpha_prod = noise_scheduler.alphas_cumprod[the_timestep] ** 0.5
+    sqrt_alpha_prod = sqrt_alpha_prod.flatten()
+    while len(sqrt_alpha_prod.shape) < len(noisy_latents.shape):
+        sqrt_alpha_prod = sqrt_alpha_prod.unsqueeze(-1)
+
+    sqrt_one_minus_alpha_prod = (1 - alphas_cumprod[the_timestep]) ** 0.5
+    sqrt_one_minus_alpha_prod = sqrt_one_minus_alpha_prod.flatten()
+    while len(sqrt_one_minus_alpha_prod.shape) < len(noisy_latents.shape):
+        sqrt_one_minus_alpha_prod = sqrt_one_minus_alpha_prod.unsqueeze(-1)
+
+    # print("latent.device", latents.device)
+    # print("sqrt_alpha_prod.device", sqrt_alpha_prod.device)
+    sqrt_alpha_prod = sqrt_alpha_prod.to(device=noisy_latents.device)
+    # log the predicted and target videos
+    # decode the latents of the predicted
+    print("sqrt_alpha_prod: ", sqrt_alpha_prod)
+
+    # noisy_samples = sqrt_alpha_prod * original_samples + sqrt_one_minus_alpha_prod * noise
+
+    pred = (noisy_latents - model_pred * sqrt_one_minus_alpha_prod ) / sqrt_alpha_prod   
+    # compute the video_frame_diff error
+    
+    # save the decoded_pred as a gif
+    error_tensor = (target - model_pred)**2
+
+    # compute the video_frame_diff error
+    pred_diff = pred[:, :, 1:] - pred[:, :, :-1]
+    latent_diff = latents[:, :, 1:] - latents[:, :, :-1]
+
+    model_pred_diff = model_pred[:, :, 1:] - model_pred[:, :, :-1]
+    target_diff = target[:, :, 1:] - target[:, :, :-1]
+
+    # compute the error of the diffs 
+    diff_noise_error = (model_pred_diff - target_diff)**2
+    print("pred_diff.shape: ", pred_diff.shape)
+    print("latent_diff: ", latent_diff.shape)
+    diff_error = (pred_diff - latent_diff)**2
+    print("diff_error max", diff_error.max())
+    print("diff_error min", diff_error.min())
+    print("diff_error mean", diff_error.mean())
+    print("diff_error std", diff_error.std())
+
+
+    reconstruction_loss = error_tensor.mean()
+    noisy_diff_loss = diff_noise_error.mean()
+    diff_loss = loss_scaler(the_timestep, 0)*diff_error.mean()
+    loss = 0.5 * reconstruction_loss + 0.5*(diff_loss + noisy_diff_loss)
+    # TODO log the losses
+    
+    data[f"validation_reconstruction_loss_{the_timestep}"] = reconstruction_loss.item()
+    data[f"validation_noisy_diff_loss_{the_timestep}"] = noisy_diff_loss.item()
+    data[f"validation_diff_loss_{the_timestep}"] = diff_loss.item()
+    data[f"validation_loss_{the_timestep}"] = loss.item()
+
+    if save_images:
+        # create a folder for debug outputs
+        folder_path = f"{output_dir}/{key}"
+        os.makedirs(folder_path, exist_ok=True)
+        pred_latents = 1 / vae.config.scaling_factor * pred
+        pred_latents = rearrange(pred_latents, "b c f h w -> (b f) c h w")
+        pred = vae.decode(pred_latents, return_dict=False)[0]
+
+        target_pixels = noisy_latents
+        target_pixels = 1 / vae.config.scaling_factor * target_pixels
+        target_pixels = rearrange(target_pixels, "b c f h w -> (b f) c h w")
+        target_pixels = vae.decode(target_pixels, return_dict=False)[0]
+
+        # decode the diff error
+        print("diff_error.shape: ", diff_error.shape)
+        diff_error = 1 / vae.config.scaling_factor * diff_error
+        diff_error = rearrange(diff_error, "b c f h w -> (b f) c h w")
+        diff_error = vae.decode(diff_error, return_dict=False)[0]
+        
+        # add black to the first frame 
+        diff_error = torch.cat([torch.zeros_like(diff_error[0]).unsqueeze(0), diff_error], dim=0)
+        
+        # decode the diff noise error
+        diff_noise_error = 1 / vae.config.scaling_factor * diff_noise_error
+        diff_noise_error = rearrange(diff_noise_error, "b c f h w -> (b f) c h w")
+        diff_noise_error = vae.decode(diff_noise_error, return_dict=False)[0]
+
+        diff_noise_error = torch.cat([torch.zeros_like(diff_noise_error[0]).unsqueeze(0), diff_noise_error], dim=0)
+
+        # decode the error tensor
+        error_tensor = 1 / vae.config.scaling_factor * error_tensor
+        error_tensor = rearrange(error_tensor, "b c f h w -> (b f) c h w")
+        error_tensor = vae.decode(error_tensor, return_dict=False)[0]
+
+        # compute the 2d fft log spectrum for the pixel values and the pred and the error
+
+        pixel_values = (pixel_values / 2 + 0.5).clamp(0, 1)
+        target = (target / 2 + 0.5).clamp(0, 1)
+        pred = (pred / 2 + 0.5).clamp(0, 1)
+        diff_error_pixels = (diff_error / 2).clamp(0, 1)
+        diff_noise_error_pixels = (diff_noise_error / 2).clamp(0, 1)
+        error_tensor_pixels = (error_tensor / 2).clamp(0, 1)
+        target_pixels = (target_pixels / 2 + 0.5).clamp(0, 1)
+
+        # concat the tensors along the W dimension
+        combined = torch.cat([pixel_values, 
+                            target_pixels, 
+                            pred, 
+                            error_tensor_pixels, 
+                            diff_error_pixels,
+                            diff_noise_error_pixels,
+                            ], dim=3)
+
+        output_path = f"{folder_path}/{actual_step}_{the_timestep}.gif"
+        save_gif_from_tensor(combined, output_path)
+        # save a folder of images
+        image_folder_path = f"{folder_path}/{actual_step}_{the_timestep}"
+        tensor_to_image_sequence(combined.permute(1, 0, 2, 3), image_folder_path)
+
+        wandb.log({key: wandb.Image(output_path)})
+
+
+
+
+
+
+
+    
 def load_loss_data(file_path):
     """
     Load loss data from a CSV file into a dictionary.
@@ -369,6 +515,105 @@ def get_lr_4(timestep, min_lr, max_lr, max_lr_2=5e-7, max_timestep=1000):
         lr_length = max_lr_2 - min_lr
         lr_percent = 4 * (timestep_ratio - 0.5)**2
         return min_lr + lr_percent * lr_length
+    
+def get_lr_5(timestep, max_lr, min_lr, min_lr_2=1e-6, max_timestep=1000):
+    timestep_ratio = timestep / max_timestep
+
+    if timestep_ratio < 0.5:
+        if min_lr > max_lr:
+            min_lr, max_lr = max_lr, min_lr
+
+        lr_length = max_lr - min_lr
+        lr_percent = -4 * (timestep_ratio - 0.5)**2 + 1
+        return min_lr + lr_percent * lr_length
+    else:
+        if min_lr_2 > max_lr:
+            min_lr_2, max_lr = max_lr, min_lr_2
+
+        lr_length = max_lr - min_lr_2
+        lr_percent = -4 * (timestep_ratio - 0.5)**2 + 1
+        return min_lr_2 + lr_percent * lr_length
+
+def get_lr_6_b(timestep):
+    if timestep < 100:
+        return 8e-7
+    elif timestep < 200:
+        return 5e-7
+    elif timestep < 300:
+        return 3e-7
+    elif timestep < 400:
+        return 1e-7
+    elif timestep < 500:
+        return 5e-8
+    elif timestep < 600:
+        return 3e-8
+    elif timestep < 700:
+        return 8e-9
+    elif timestep < 800:
+        return 8e-10
+    elif timestep < 850: 
+        return 1e-10
+    elif timestep < 900:
+        return 8e-11
+    elif timestep < 950:
+        return 1e-11
+    elif timestep < 975:        
+        return 1e-12
+    elif timestep < 985:
+        return 1e-15
+    elif timestep < 995:
+        return 1e-17
+    elif timestep < 998:
+        return 1e-19
+    else:
+        return 1e-23 
+        
+def get_lr_6(timestep):
+    return 1e-7
+
+def cubic_resampling(x):
+    """
+    Calculate the expression (1 - (x/1000)^3) * 1000
+    
+    Parameters:
+    x (float): Input to the function
+    
+    Returns:
+    float: Result of the expression
+    """
+    return (1 - (x/1000)**3) * 1000
+
+def inverse_cubic_resampling(x):
+    """
+    Calculate the inverse of the expression (1 - (x/1000)^3) * 1000
+    
+    Parameters:
+    x (float): Input to the function
+    
+    Returns:
+    float: Result of the expression
+    """
+    return 1000 * (1 - (1 - x/1000)**(1/3))
+
+def compute_frequency_energies(input):
+    # Assume input is (batch, channels, frames, height, width)
+    # Compute the FFT along the frames dimension
+    spectrum = torch.fft.fft(input, dim=2)
+    # Compute the magnitude
+    spectrum1d = torch.abs(spectrum)
+    
+    frequency_energies = []
+    for i in range(spectrum1d.shape[2]//2 + 1):  # +1 to include the nyquist frequency
+        # Extract the ith frequency band energy for all pixels
+        img = spectrum1d[:, :, i, :, :]
+        img = torch.log1p(img)
+        # Summing energy across all pixels and channels
+        summed_energy = img.sum(dim=[0, 1, 2, 3])  # summing over batch, channels, height, and width
+        frequency_energies.append(summed_energy.item())  # Assuming you want to return python scalar
+    
+    return frequency_energies
+
+slow_validation_steps = 100
 
 def main(
     image_finetune: bool,
@@ -485,11 +730,11 @@ def main(
             unet = UNet2DConditionModel.from_pretrained(pretrained_model_path, subfolder="unet", torch_dtype=dtype)
         else:      
             
-            # fine_tuned_unet = torch.load("/mnt/newdrive/viddle-animatediff/outputs/training-2023-10-06T16-45-02/checkpoints/checkpoint-epoch-9.ckpt", map_location="cpu")
-            # unet = UNet3DConditionModel.from_unet2d(fine_tuned_unet, unet_additional_kwargs=unet_additional_kwargs)
-            unet = UNet3DConditionModel.from_pretrained_2d(pretrained_model_path, 
-                                                           subfolder="unet",
-                                                           unet_additional_kwargs=unet_additional_kwargs,)
+            fine_tuned_unet = torch.load("/mnt/newdrive/viddle-animatediff/outputs/training-2023-10-11T11-46-02/checkpoints/checkpoint-epoch-1.ckpt", map_location="cpu")
+            unet = UNet3DConditionModel.from_unet2d(fine_tuned_unet, unet_additional_kwargs=unet_additional_kwargs)
+            # unet = UNet3DConditionModel.from_pretrained_2d(pretrained_model_path, 
+            #                                                subfolder="unet",
+            #                                               unet_additional_kwargs=unet_additional_kwargs,)
         
     print(f"state_dict keys: {list(unet.config.keys())[:10]}")
 
@@ -510,6 +755,8 @@ def main(
         # motion_module_path = "motion-models/temporal-attn-pe-5e-7-4-50000-steps.ckpt"
         # motion_module_path = '../ComfyUI/custom_nodes/ComfyUI-AnimateDiff/models/animatediffMotion_v15.ckpt'
         # motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/training-2023-10-05T18-29-30/checkpoints/checkpoint.ckpt"
+        # motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/training-2023-10-12T19-32-53/checkpoints/checkpoint.ckpt"
+        # motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/training-2023-10-13T03-04-19/checkpoints/checkpoint.ckpt"
         
 
         motion_module_state_dict = torch.load(motion_module_path, map_location="cpu")
@@ -553,7 +800,7 @@ def main(
                     break
 
     trainable_params = list(filter(lambda p: p.requires_grad, unet.parameters()))
-    if False:
+    if True:
         optimizer = torch.optim.AdamW(
             trainable_params,
             lr=learning_rate,
@@ -561,7 +808,7 @@ def main(
             weight_decay=adam_weight_decay,
             eps=adam_epsilon,
         )
-    else:
+    elif False:
         optimizer = Adafactor(
             trainable_params,
             lr=learning_rate,  # Note: AdaFactor adjusts learning rates dynamically and doesn't require a fixed learning rate
@@ -573,6 +820,12 @@ def main(
             scale_parameter=True,  # Whether to scale the learning rate
             relative_step=False,  # Whether to compute the learning rate relative to the step
             warmup_init=False  # Whether to initialize the learning rate as 0 during warm-up
+        )
+    else: 
+        optimizer = torch.optim.SGD(
+            trainable_params,
+            lr=learning_rate,
+            weight_decay=adam_weight_decay,  # Optional: if you want to use weight decay
         )
 
     if is_main_process:
@@ -685,8 +938,10 @@ def main(
     
     step_index = 0
     direction = 1
+    prev_grad = None
+    angle = 0
 
-    optimizer_states = {}
+    # optimizer_states = {}
 
     stdDevAccum = RunningAverages()
 
@@ -765,18 +1020,18 @@ def main(
             if image_finetune:
                 timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (bsz,), device=latents.device)
             else:
-                timesteps = torch.tensor([step_index]).repeat(bsz) 
+                # timesteps = torch.tensor([step_index]).repeat(bsz) 
+                timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (bsz,), device=latents.device)
 
-                if (step_index//100) in optimizer_states:
-                    optimizer.load_state_dict(optimizer_states[step_index // 100])
+                # timesteps = cubic_resampling(timesteps.float())
 
-                # update the lr of the optimizer. I'm assuming no gradient accumulation here
-                lr = get_lr_3(step_index, 5e-8, learning_rate)
+                # clamp to the 0 and noise_scheduler.config.num_train_timesteps
+                timesteps = torch.clamp(timesteps, 0, noise_scheduler.config.num_train_timesteps - 1)
 
-                print("lr: ", lr)
+                # if (step_index//100) in optimizer_states:
+                #     optimizer.load_state_dict(optimizer_states[step_index // 100])
 
-                for param_group in optimizer.param_groups:
-                    param_group['lr'] = lr
+
 
             # timesteps = torch.tensor([0])
             timesteps = timesteps.long()
@@ -802,6 +1057,13 @@ def main(
             # Add noise to the latents according to the noise magnitude at each timestep
             # (this is the forward diffusion process)
             noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
+
+            # I think some amount of time I need to add more noise
+            # take a random int and mod it by 10
+            # if it's 0, then add more noise
+
+            # if step % 10 == 0:
+            #    noisy_latents = noisy_latents + 0.1 * torch.randn_like(noisy_latents)
 
             def ddim_step(model_output: torch.FloatTensor,
                          timestep: int,
@@ -841,6 +1103,14 @@ def main(
                 return alpha_prod_t_prev ** (0.5) * pred_original_sample + pred_sample_direction
             
             the_timestep = timesteps[0].item()
+
+            # update the lr of the optimizer. I'm assuming no gradient accumulation here
+            # lr = get_lr_5(the_timestep, 5e-7, 2e-7, 5e-9)
+
+            # print("lr: ", lr)
+
+            # for param_group in optimizer.param_groups:
+            #    param_group['lr'] = lr
 
             # if the_timestep != 0 and video_length == 16:
             #    continue
@@ -970,28 +1240,65 @@ def main(
                 # actual_normalized_spectrum_entropy = entropy_of_normalized_frequency_spectrum(target)
                 if not image_finetune:
                     predicted_normalized_spectrum_entropy = entropy_of_normalized_frequency_spectrum(model_pred)
+                    predicted_frequency_energies = compute_frequency_energies(model_pred)
+                    target_frequency_energies = compute_frequency_energies(target)
                 else:
                     predicted_normalized_spectrum_entropy = torch.tensor(0.0).to(model_pred_std.device).float()
-                # print("actual_normalized_spectrum_entropy: ", actual_normalized_spectrum_entropy)
-                # print("predicted_normalized_spectrum_entropy: ", predicted_normalized_spectrum_entropy)
-                # entropy_loss = F.mse_loss(predicted_normalized_spectrum_entropy.float(), actual_normalized_spectrum_entropy.float(), reduction="mean")
-                # entropy_loss = 0 
+
+
+
                 sum_of_entropy_mag = predicted_normalized_spectrum_entropy.sum()
                 print("sum_of_entropy_mag: ", sum_of_entropy_mag)
 
                 # need to get the x_0
                 
-                the_frame_diff_loss = video_diff_loss(model_pred, target)
+                alphas_cumprod = noise_scheduler.alphas_cumprod.to(device=latents.device, dtype=latents.dtype)
+                sqrt_alpha_prod = noise_scheduler.alphas_cumprod[the_timestep] ** 0.5
+                sqrt_alpha_prod = sqrt_alpha_prod.flatten()
+                while len(sqrt_alpha_prod.shape) < len(latents.shape):
+                    sqrt_alpha_prod = sqrt_alpha_prod.unsqueeze(-1)
+
+                sqrt_one_minus_alpha_prod = (1 - alphas_cumprod[the_timestep]) ** 0.5
+                sqrt_one_minus_alpha_prod = sqrt_one_minus_alpha_prod.flatten()
+                while len(sqrt_one_minus_alpha_prod.shape) < len(latents.shape):
+                    sqrt_one_minus_alpha_prod = sqrt_one_minus_alpha_prod.unsqueeze(-1)
+
+                # print("latent.device", latents.device)
+                # print("sqrt_alpha_prod.device", sqrt_alpha_prod.device)
+                sqrt_alpha_prod = sqrt_alpha_prod.to(device=latents.device)
+                # log the predicted and target videos
+                # decode the latents of the predicted
+                print("sqrt_alpha_prod: ", sqrt_alpha_prod)
+
+                # noisy_samples = sqrt_alpha_prod * original_samples + sqrt_one_minus_alpha_prod * noise
+
+                pred = (noisy_latents - model_pred * sqrt_one_minus_alpha_prod ) / sqrt_alpha_prod                
+
+                the_frame_diff_loss_noise = video_diff_loss(model_pred, target)
+
+                the_loss_scaler = loss_scaler(the_timestep, actual_step)
+                print("the_loss_scaler", the_loss_scaler)
+                the_frame_diff_loss = the_loss_scaler * F.mse_loss(pred.float(), latents.float(), reduction="mean")
+                # the_frame_diff_loss_noise = nn.L1Loss()(pred.float(), latents.float())
 
                 # the loss is the two losses dot producted
          
                 # loss = normality_loss + the_frame_diff_loss
-                # loss = 0.5 * reconstruction_loss + 0.5 * the_frame_diff_loss
-                loss = reconstruction_loss
+                if not image_finetune:
+                    loss = 0.5 * reconstruction_loss + 0.5 * (the_frame_diff_loss + the_frame_diff_loss_noise)
+                else:
+                    loss = reconstruction_loss
+                
+                # loss = reconstruction_loss
 
                 # print("entropy_loss: ", entropy_loss)
                 # spectrum_loss = l2_spectrum_loss(model_pred, target)
                 # loss = reconstruction_loss + spectrum_loss
+
+        
+
+
+                
 
 
             # unet.clear_last_encoder_hidden_states()
@@ -1004,7 +1311,7 @@ def main(
             # elif step_index == 0:
             #    direction = 100
             
-            step_index += 100
+            step_index += 200
 
             if step_index > noise_scheduler.num_train_timesteps - 1:
                 step_index += 1
@@ -1029,9 +1336,15 @@ def main(
                     optimizer.step()
 
                 # Compute statistics
+                if actual_step % 200 == 199:
+                    for name, param in unet.named_parameters():
+                        if param.grad is not None:
+                            wandb.log({f"gradients/{name}": wandb.Histogram(param.grad.cpu().detach().numpy())})
+                    
                 for param in unet.parameters():
                     if param.grad is not None:
                         grad_magnitudes.append(torch.norm(param.grad).item())
+                
                 if len(grad_magnitudes) > 0:
                     print("before grad mag sum")
                     mean_grad = sum(grad_magnitudes) / len(grad_magnitudes)
@@ -1041,36 +1354,17 @@ def main(
                     mean_grad = -1
                     var_grad = -1
 
+
                 optimizer.zero_grad()
                 lr_scheduler.step()
                 progress_bar.update(1)
                 global_step += 1
-                optimizer_states[step_index//100] = optimizer.state_dict()
-            
-            # compute the fft
-            if False:
-                with torch.no_grad():
-                    # save out the predicted noise and the target
-                    
-
-
-                    pred_fft_state = compute_fft_and_update_state(model_pred.detach(), pred_fft_state)
-                    target_fft_state = compute_fft_and_update_state(target.detach(), target_fft_state)
-
-                    fft_comparison_path = f"{output_dir}/fft_comparison.png"
-
-                    pred_fft_ratios = f"{output_dir}/pred_fft_ratios.png"
-
-                    plot_comparison(pred_fft_state, target_fft_state, fft_comparison_path)
-                    plot_self_ratio(pred_fft_state, pred_fft_ratios)
-
-                    stdDevAccum.update(actual_step % 1000, model_pred_std.item())
-                    stdDevAccum.graph_averages(f"{output_dir}/stdDevAccum.png")
-
+                # optimizer_states[step_index//100] = optimizer.state_dict()
 
 
             ### <<<< Training <<<< ###
             actual_step += 1
+
             # Wandb logging
             if is_main_process and (not is_debug) and use_wandb:
                 wandb.log
@@ -1094,7 +1388,6 @@ def main(
                 var_weight = weight_squared_sum / n_weights - mean_weight * mean_weight
 
 
-
                 # take the fft of the weights
                 # take the fft of the gradients
 
@@ -1103,32 +1396,124 @@ def main(
                 # var_weight = sum((x - mean_weight) ** 2 for x in weights) / len(weights)
 
                 # Log statistics to wandb
-                modded_actual_step = actual_step % data_loader_steps
-                print("modded_actual_step: ", modded_actual_step)
 
-                wandb.log({
-                    "train_loss": loss.item(),
-                    "train_loss_diff": default_losses[modded_actual_step] - loss.item(),
-                    "train_loss_ratio": loss.item() / default_losses[modded_actual_step],
-                    "reconstruction_loss": reconstruction_loss,
-                    "predicted_normalized_spectrum_entropy": sum_of_entropy_mag.item(),
-                    "the_frame_diff_loss": the_frame_diff_loss,
-                    "normality_loss": normality_loss,
-                    # "spectrum_loss": spectrum_loss.item(),
-                    # "entropy_loss": entropy_loss.item(),
-                    "mean_gradient": mean_grad, 
-                    "max_gradient": max(grad_magnitudes) if len(grad_magnitudes) > 0 else -1,
-                    "min_gradient": min(grad_magnitudes) if len(grad_magnitudes) > 0 else -1,
-                    "variance_gradient": var_grad,
-                    "mean_weights": mean_weight, 
-                    "variance_weights": var_weight, 
-                    "max_weights": weights_max,
-                    "min_weights": weights_min,
-                    "lr": lr,
-                    }, step=actual_step)
+                # TODO fast validation
+                # compare the per pixel total spectrum of
+                # each frequency band
+                # compute the spatial spectrum of each frame, predicted and target
+                # create a histogram of the errors of the spectrum grouping by high and low frequencies
+
+                # compute other metrics like the activations and 
+                # attention heat maps
+
+                if the_timestep < 100:
+                    prefix = "0_99_"
+                elif the_timestep < 200:
+                    prefix = "100_199_"
+                elif the_timestep < 300:
+                    prefix = "200_299_"
+                elif the_timestep < 400:
+                    prefix = "300_399_"
+                elif the_timestep < 500:
+                    prefix = "400_499_"
+                elif the_timestep < 600:
+                    prefix = "500_599_"
+                elif the_timestep < 700:
+                    prefix = "600_699_"
+                elif the_timestep < 800:
+                    prefix = "700_799_"
+                elif the_timestep < 900:
+                    prefix = "800_899_"
+                elif the_timestep < 1000:
+                    prefix = "900_999_"
+
+                data = {
+                    f"{prefix}train_loss": loss.item(),
+                    # f"{prefix}train_loss_ratio": loss_after.item() / loss.item(),
+                    f"{prefix}reconstruction_loss": reconstruction_loss,
+                    f"{prefix}predicted_normalized_spectrum_entropy": sum_of_entropy_mag.item(),
+                    f"{prefix}the_frame_diff_loss": the_frame_diff_loss,
+                    f"{prefix}the_frame_diff_loss_noise": the_frame_diff_loss_noise,
+                    f"{prefix}normality_loss": normality_loss,
+                    f"{prefix}mean_gradient": mean_grad, 
+                    f"{prefix}max_gradient": max(grad_magnitudes) if len(grad_magnitudes) > 0 else -1,
+                    f"{prefix}min_gradient": min(grad_magnitudes) if len(grad_magnitudes) > 0 else -1,
+                    f"{prefix}variance_gradient": var_grad,
+                    f"{prefix}mean_weights": mean_weight, 
+                    f"{prefix}variance_weights": var_weight, 
+                    f"{prefix}max_weights": weights_max,
+                    f"{prefix}min_weights": weights_min,
+                    f"{prefix}timestep": the_timestep,
+                    f"{prefix}lr": lr,
+                    }
                 
+                # for each predicted_frequency_energy and target_frequency_energy
+                # add an entry to data
+
+    
                 csv_path = f"{output_dir}/stats.csv"
                 append_loss_to_csv(actual_step, loss.item(), csv_path)
+
+                if True:
+                    # load mp4 from data/validation_videos/000352b9-5884-4f82-8153-7ef794979ee5.mp4
+                    video_length = 16
+                    pixel_values = load_video_as_tensor("data/validation_videos/000352b9-5884-4f82-8153-7ef794979ee5.mp4",
+                                                        max_frames=video_length*4,).to("cuda")
+                    print("pixel_values.shape: ", pixel_values.shape)
+
+                    # assume (B, C, F, H, W)
+                    # crop to 256 x 256
+                    pixel_values = pixel_values[:, :, :video_length, :256, :256]
+                    print("pixel_values.shape: ", pixel_values.shape)
+
+                    
+                    # encode it to latents
+                    with torch.no_grad():
+                        validate_timesteps = [999, 998, 997]
+
+                        pixel_values = rearrange(pixel_values, "b c f h w -> (b f) c h w")
+                        latents = vae.encode(pixel_values).latent_dist
+                        latents = latents.sample()
+                        latents = latents * 0.18215
+                        latents = rearrange(latents, "(b f) c h w -> b c f h w", f=video_length)
+                        
+
+                        for the_timestep in validate_timesteps:
+
+                            timesteps = torch.tensor([the_timestep])
+
+                            key = f"debug_output_{the_timestep}"
+
+                            # create the target noise
+                            target = torch.randn_like(latents)
+
+                            # add noise to the latents
+                            noisy_latents = noise_scheduler.add_noise(latents, target, timesteps)
+
+                            # predict the noise
+                            model_pred = unet(noisy_latents, the_timestep, encoder_hidden_states).sample
+
+                            # call validate_prediction
+                            validate_prediction(
+                                data=data,
+                                noise_scheduler=noise_scheduler,
+                                vae=vae,
+                                output_dir=output_dir,
+                                the_timestep=the_timestep,
+                                latents=latents,
+                                pixel_values=pixel_values,
+                                noisy_latents=noisy_latents,
+                                model_pred=model_pred,
+                                target=target,
+                                key=key,
+                                actual_step=actual_step,
+                                save_images=actual_step % 100 == 1)
+                
+                print("data ", data)
+                wandb.log(data, step=actual_step)
+
+
+
             # Save checkpoint
             if is_main_process and (global_step % checkpointing_steps == 0 or step == len(train_dataloader) - 1) and global_step != 0:
                 save_path = os.path.join(output_dir, f"checkpoints")
@@ -1164,8 +1549,8 @@ def main(
                             prompt,
                             generator    = generator,
                             video_length = train_data.sample_n_frames,
-                            height       = 512,
-                            width        = 512,
+                            height       = 256,
+                            width        = 256,
                             # window_count = window_length,
                             # wrap_around=True,
                             # alternate_direction=False,
@@ -1180,6 +1565,7 @@ def main(
                         save_power_spectrum_as_gif(sample, fft_output_path)
                         samples.append(sample)
                         wandb.log({"validation_images": wandb.Image(output_path)})
+                        wandb.log({"validation_fft": wandb.Image(fft_output_path)})
                         
                     else:
                         sample = validation_pipeline(

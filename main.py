@@ -427,7 +427,7 @@ def run(model,
 
   unet = unet.to(dtype=dtype) 
 
-  use_controlnet = True
+  use_controlnet = False
   noise_scheduler=DDIMScheduler(**scheduler_kwargs)
 
   if (use_type == "overlapping_previous" or use_type == 'conv' or use_type == 'overlapping_previous_1' or use_type == 'overlapping_previous_2') and use_controlnet:
@@ -540,9 +540,35 @@ def run(model,
   # motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/training-2023-10-07T02-19-36/checkpoints/checkpoint.ckpt"
   # motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/training-2023-10-07T15-59-37/checkpoints/checkpoint.ckpt"
   # motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/training-2023-10-07T20-44-16/checkpoints/checkpoint.ckpt"
+  # diff no special unet
   # motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/training-2023-10-08T02-47-37/checkpoints/checkpoint.ckpt"
   # motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/training-2023-10-08T09-42-25/checkpoints/checkpoint.ckpt"
-  motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/training-2023-10-08T15-33-03/checkpoints/checkpoint.ckpt"
+  # no diff loss
+  # motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/training-2023-10-08T15-33-03/checkpoints/checkpoint.ckpt"
+  # motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/training-2023-10-08T22-25-25/checkpoints/checkpoint.ckpt"
+  # motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/training-2023-10-09T14-51-47/checkpoints/checkpoint.ckpt"
+  # motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/training-2023-10-09T15-19-35/checkpoints/checkpoint.ckpt"
+  # motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/training-2023-10-09T15-50-05/checkpoints/checkpoint.ckpt"
+  # motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/training-2023-10-09T16-20-14/checkpoints/checkpoint.ckpt"
+  # motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/training-2023-10-09T20-11-53/checkpoints/checkpoint.ckpt"
+  # motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/training-2023-10-10T01-03-36/checkpoints/checkpoint.ckpt"
+  # motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/training-2023-10-10T08-23-30/checkpoints/checkpoint.ckpt"
+  # motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/training-2023-10-10T08-47-36/checkpoints/checkpoint.ckpt"
+  # motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/training-2023-10-10T09-23-28/checkpoints/checkpoint.ckpt"
+  # motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/training-2023-10-10T09-45-17/checkpoints/checkpoint.ckpt"
+  # motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/training-2023-10-10T10-47-18/checkpoints/checkpoint-epoch-1.ckpt"
+  # motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/training-2023-10-10T21-30-43/checkpoints/checkpoint.ckpt"
+  # motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/training-2023-10-10T22-32-48/checkpoints/checkpoint.ckpt"
+  # motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/training-2023-10-10T23-27-25/checkpoints/checkpoint-epoch-1.ckpt"
+  # motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/training-2023-10-11T15-10-52/checkpoints/checkpoint.ckpt"
+  # motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/training-2023-10-11T19-53-19/checkpoints/checkpoint.ckpt"
+  # motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/training-2023-10-12T00-58-07/checkpoints/checkpoint.ckpt"
+  # motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/training-2023-10-12T01-49-42/checkpoints/checkpoint.ckpt"
+  # motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/training-2023-10-12T15-25-47/checkpoints/checkpoint.ckpt"
+  # motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/training-2023-10-12T21-35-54/checkpoints/checkpoint.ckpt"
+  # motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/training-2023-10-13T01-14-56/checkpoints/checkpoint.ckpt"
+  # motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/training-2023-10-13T03-04-19/checkpoints/checkpoint.ckpt"
+  motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/training-2023-10-13T22-49-22/checkpoints/checkpoint.ckpt"
   motion_module_state_dict = torch.load(motion_module_path, map_location="cpu")
   missing, unexpected = pipeline.unet.load_state_dict(motion_module_state_dict, strict=False)
   # if "global_step" in motion_module_state_dict:
@@ -708,7 +734,7 @@ def run(model,
               window_count=window_count,
               video_length=frame_count,
               generator=generators,
-              wrap_around=True,
+              wrap_around=False,
               alternate_direction=False,
               guess_mode=guess_mode,
               image=images,
@@ -731,7 +757,7 @@ def run(model,
                 window_count=window_count,
                 video_length=frame_count,
                 generator=generators,
-                wrap_around=True,
+                wrap_around=False,
                 alternate_direction=False,
                 min_offset = 3,
                 max_offset = 5,
@@ -1031,11 +1057,12 @@ def run(model,
   filename = str(uuid.uuid4())
   output_path = os.path.join(output_dir, filename + ".gif")
   fps = 8
-  tensor_to_image_sequence(video, "images")
-  images = glob.glob("images/*.png")
+  images_folder = f"{output_dir}/{filename}"
+  tensor_to_image_sequence(video, images_folder)
+  images = glob.glob(f"{images_folder}/*.png")
   images.sort()
   create_gif(images, output_path, duration=1000/fps, loop=0)
-  create_mp4_from_images("images", output_path.replace(".gif", ".mp4"), fps=fps)
+  create_mp4_from_images(images_folder, output_path.replace(".gif", ".mp4"), fps=fps)
   spectrum = compute_spectrum(video)
   spectrum_uuid = str(uuid.uuid4())
   save_spectrum_images(spectrum, f"spectrum-images/{spectrum_uuid}")
@@ -1052,13 +1079,13 @@ if __name__ == "__main__":
   # prompt = "Make synthwave retrowave vaporware style, outside night time city skyline"
   # prompt = "turn her into princess leia, side buns hairstyle"
   # prompt = "make her open her mouth"
-  # prompt = "full body of a Girl swaying, red blouse, illustration by Wu guanzhong,China village,twojjbe trees in front of my chinese house,light orange, pink,white,blue ,8k"
+  # prompt = "close up of a Girl swaying, red blouse, illustration by Wu guanzhong,China village,twojjbe trees in front of my chinese house,light orange, pink,white,blue ,8k"
   # prompt = "paint by frazetta, man dancing, mountain blue sky in background"
   # prompt = "1man dancing outside, clear blue sky sunny day, photography, award winning, highly detailed, bright, well lit"
   # prompt = "Cute Chunky anthropomorphic Siamese cat dressed in rags walking down a rural road, mindblowing illustration by Jean-Baptiste Monge + Emily Carr + Tsubasa Nakai"
   # prompt = "close up of A man walking, movie production, cinematic, photography, designed by daniel arsham, glowing white, futuristic, white liquid, highly detailed, 35mm"
   # prompt = "closeup of A woman dancing in front of a secret garden, upper body headshot, early renaissance paintings, Rogier van der Weyden paintings style"
-  # prompt = "Close Up portrait of a woman swaying in front of a lake artwork by Kawase Hasui"
+  # prompt = "Close Up portrait of a woman turning in front of a lake artwork by Kawase Hasui"
   # prompt = "close up head shot of girl standing in a field of flowers, windy, long blonde hair in a blue dress smiling"
   prompt = "RAW Photo, DSLR BREAK a young woman with bangs, (light smile:0.8), (smile:0.5), wearing relaxed shirt and trousers, causal clothes, (looking at viewer), focused, (modern and cozy office space), design agency office, spacious and open office, Scandinavian design space BREAK detailed, natural light"
   # prompt = "taken with iphone camera BREAK medium shot selfie of a pretty young woman BREAK (ombre:1.3) blonde pink BREAK film grain, medium quality"
@@ -1091,8 +1118,8 @@ if __name__ == "__main__":
   # lora_file=None
   # lora_file
   # model = "/mnt/newdrive/automatic1111/models/Stable-diffusion/dreamshaper_6BakedVae.safetensors"
-  model = "/mnt/newdrive/automatic1111/models/Stable-diffusion/dreamshaper_8.safetensors"
-  # model = "/mnt/newdrive/automatic1111/models/Stable-diffusion/epicrealism_pureEvolutionV5.safetensors"
+  # model = "/mnt/newdrive/automatic1111/models/Stable-diffusion/dreamshaper_8.safetensors"
+  model = "/mnt/newdrive/automatic1111/models/Stable-diffusion/epicrealism_pureEvolutionV5.safetensors"
   # model = "/mnt/newdrive/automatic1111/models/Stable-diffusion/instruct-pix2pix-00-22000.ckpt"
   # model = "/mnt/newdrive/automatic1111/models/Stable-diffusion/deliberate_v2.safetensors"
   # model = "/mnt/newdrive/automatic1111/models/Stable-diffusion/absolutereality_v181.safetensors"
@@ -1103,8 +1130,8 @@ if __name__ == "__main__":
       prompt=prompt,
       # negative_prompt="clone, cloned, bad anatomy, wrong anatomy, mutated hands and fingers, mutation, mutated, amputation, 3d render, lowres, signs, memes, labels, text, error, mutant, worst quality, low quality, normal quality, jpeg artifacts, signature, watermark, username, blurry, made by children, caricature, ugly, boring, sketch, lacklustre, repetitive, cropped, (long neck), body horror, out of frame, mutilated, tiled, frame, border",
       negative_prompt="",
-      height=1024,
-      width=576,
+      height=512,
+      width=512,
       frame_count=16, # 288,
       window_count=16,
       num_inference_steps=20,

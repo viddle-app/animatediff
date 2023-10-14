@@ -701,7 +701,7 @@ class AnimationPipeline(DiffusionPipeline, FromSingleFileMixin):
                 if hasattr(self.unet, 'clear_last_encoder_hidden_states'):
                     self.unet.clear_last_encoder_hidden_states()
                 
-                if video_length == window_length:
+                if video_length == window_length and wrap_around == False:
                     offset = 0
                 else:
                     if min_offset == max_offset:

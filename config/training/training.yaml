@@ -32,7 +32,7 @@ train_data:
   csv_path:        "data/output.csv"
   video_folder:    "data/videos"
   sample_size:     256
-  sample_stride:   1
+  sample_stride:   4
   sample_n_frames: 16
 
 validation_data:
@@ -46,18 +46,18 @@ trainable_modules:
 
 unet_checkpoint_path: ""
 
-learning_rate:    1.e-5
+learning_rate:    1.e-7
 train_batch_size: 1
 gradient_checkpointing: True
 gradient_accumulation_steps: 1
 adam_weight_decay: 1.e-2
 
-max_train_epoch:      4
+max_train_epoch:      2
 max_train_steps:      -1
 checkpointing_epochs: -1
 checkpointing_steps:  500
 
-validation_steps:       100
+validation_steps:       1000
 validation_steps_tuple: []
 
 global_seed: 42

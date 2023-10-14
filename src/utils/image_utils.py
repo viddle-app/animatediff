@@ -4,6 +4,8 @@ import cv2
 import os
 from PIL import Image
 import torch
+import imageio
+
 
 def tensor_to_image_sequence(tensor, output_dir):
     """
@@ -39,6 +41,29 @@ def tensor_to_image_sequence(tensor, output_dir):
         frame = tensor[i]
         image_path = os.path.join(output_dir, f"{i:04d}.png")
         cv2.imwrite(image_path, frame)
+
+def save_gif_from_tensor(tensor, filename):
+    """
+    Save a gif from a tensor.
+    
+    :param tensor: a (F, C, H, W) shaped torch.Tensor. 
+                   B = batch size, C = num channels, 
+                   F = num frames, H = image height, W = image width
+    :param filename: path and filename to save the gif
+    """
+    # Ensure the tensor is on the CPU
+    tensor = tensor.cpu()
+    
+    # Convert the PyTorch tensor to NumPy array and 
+    # transpose it to (F, H, W, C) for imageio
+    gif_np = tensor.numpy().transpose(0, 2, 3, 1)
+    
+    # Normalize the gif to be between 0 and 255 and convert type to uint8
+    gif_np = gif_np * 255
+    gif_np = gif_np.astype('uint8')
+    
+    # Save the gif
+    imageio.mimwrite(filename, [f for f in gif_np], duration=1/8, loop=0)
 
 def create_gif(image_files, output_file, duration=500, loop=0):
     """
@@ -86,6 +111,8 @@ def compute_spectrum(input_seq):
     magnitude = (magnitude - magnitude.min()) / (magnitude.max() - magnitude.min())
 
     return magnitude
+
+# TODO normalize all the outputs
 def save_spectrum_images(magnitude, output_folder):
     magnitude = magnitude.permute(3, 0, 1, 2)
     # Ensure the directory exists
@@ -121,7 +148,51 @@ def save_statistics(magnitude, output_folder):
     with open(os.path.join(output_folder, 'statistics.txt'), 'w') as file:
         for i, (mean, std_dev) in enumerate(stats):
             file.write(f'Frequency {i}:\n Mean: {mean:.6f}, Standard Deviation: {std_dev:.6f}\n\n')
-            
+        
+def load_video_as_tensor(video_path, skip_frame=4, max_frames=None):
+    """
+    Load video and convert it to a PyTorch tensor.
+
+    Parameters:
+    - video_path (str): Path to the video file.
+    - skip_frame (int): Number of frames to skip.
+    - max_frames (int or None): Max number of frames to load.
+
+    Returns:
+    torch.Tensor: Tensor with shape (B, C, F, H, W).
+    """
+    cap = cv2.VideoCapture(video_path)
+    frames = []
+
+    frame_count = 0
+    while True:
+        ret, frame = cap.read()
+        if not ret or (max_frames is not None and frame_count >= max_frames):
+            break
+        
+        # Skip frames as per `skip_frame` value
+        if frame_count % skip_frame != 0:
+            frame_count += 1
+            continue
+        
+        # Convert the frame from BGR to RGB
+        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+        # Convert to tensor and normalize pixel values from [0, 255] to [-1, 1]
+        frame_tensor = torch.from_numpy(frame).float().permute(2, 0, 1) / 127.5 - 1
+
+        frames.append(frame_tensor)
+        frame_count += 1
+    
+    cap.release()
+
+    # Stack frames into a single tensor
+    video_tensor = torch.stack(frames)
+
+    # Add batch dimension and reorder the dimensions to (B, C, F, H, W)
+    video_tensor = video_tensor.unsqueeze(0).permute(0, 2, 1, 3, 4)
+
+    return video_tensor
 
 if __name__ == "__main__":
     fps = 24
