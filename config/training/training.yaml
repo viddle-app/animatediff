@@ -1,7 +1,7 @@
 image_finetune: false
 
 output_dir: "outputs"
-pretrained_model_path: "/mnt/newdrive/models/miniSD"
+pretrained_model_path: "/mnt/newdrive/models/v1-5"
 
 unet_additional_kwargs:
   in_channels: 4
@@ -46,16 +46,19 @@ trainable_modules:
 
 unet_checkpoint_path: ""
 
-learning_rate:    1.e-7
+learning_rate:    8.e-7
 train_batch_size: 1
 gradient_checkpointing: True
 gradient_accumulation_steps: 1
 adam_weight_decay: 1.e-2
+lr_scheduler: "piecewise_constant"
+lr_warmup_steps: 500
+scale_lr: true
 
-max_train_epoch:      2
+max_train_epoch:      4
 max_train_steps:      -1
 checkpointing_epochs: -1
-checkpointing_steps:  500
+checkpointing_steps:  200
 
 validation_steps:       1000
 validation_steps_tuple: []

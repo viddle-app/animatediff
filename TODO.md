@@ -1,3 +1,19 @@
+TODO now
+Frame Interpolator
+- prepare the data set for training the 8 channel unet
+- get the diffusers training code
+
+Try training without the 1/sqrt(snr)
+Try training with a unet that has been fine-tuned for 1/sqrt(snr)
+Compare miniSD and non-miniSD fine-tuned with data set and not
+Fine-tune the dreamshaper with 1/sqrt(snr) for use after
+Contain training from scratch with old loss 4
+refactor code to make it easier to switch out losses for validation
+use more videos for validation
+prepare the trailer dataset
+
+
+OLD:
 - Clean up the partition code
 - Add to controlnet flow
 - Enable img2img flow
