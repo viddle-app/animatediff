@@ -20,10 +20,6 @@ WORKDIR /home/huggingface
 
 RUN mkdir -p /home/huggingface/data
 
-COPY data/stable-diffusion-xl-base-1.0 /home/huggingface/data/stable-diffusion-xl-base-1.0/
-COPY data/stable-diffusion-xl-refiner-1.0 /home/huggingface/data/stable-diffusion-xl-refiner-1.0/
-COPY data/whisper-large-v2 /home/huggingface/data/whisper-large-v2
-
 RUN python -m pip install pip --upgrade
 COPY requirements.txt /home/huggingface
 RUN pip install -r requirements.txt 
@@ -36,9 +32,7 @@ RUN mkdir -p /home/huggingface/.cache/huggingface \
 
 COPY src/ /home/huggingface/src/
 
-COPY watermark.png /home/huggingface/watermark.png
-
-COPY run.sh /home/huggingface/run.sh
+COPY run.sh /home/huggingface
 
 ENV PATH="/home/huggingface/.local/bin:${PATH}"
 

@@ -26,6 +26,7 @@ from .unet_blocks import (
     get_up_block,
 )
 from .resnet import InflatedConv3d, InflatedGroupNorm
+from safetensors.torch import load_file
 
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
@@ -680,12 +681,17 @@ class UNet3DConditionModel(ModelMixin, ConfigMixin):
         ]
         config["mid_block_type"] = "UNetMidBlock3DCrossAttn"
 
-        from diffusers.utils import WEIGHTS_NAME
+        from diffusers.utils import WEIGHTS_NAME, SAFETENSORS_WEIGHTS_NAME
         model = cls.from_config(config, **unet_additional_kwargs)
         model_file = os.path.join(pretrained_model_path, WEIGHTS_NAME)
+        model_file_safetensors = os.path.join(pretrained_model_path, SAFETENSORS_WEIGHTS_NAME)
         if not os.path.isfile(model_file):
-            raise RuntimeError(f"{model_file} does not exist")
-        state_dict = torch.load(model_file, map_location="cpu")
+            if not os.path.isfile(model_file_safetensors):
+                raise RuntimeError(f"{model_file} does not exist")
+            else:
+                state_dict = load_file(model_file_safetensors)
+        else:
+            state_dict = torch.load(model_file, map_location="cpu")
 
         m, u = model.load_state_dict(state_dict, strict=False)
         print(f"### missing keys: {len(m)}; \n### unexpected keys: {len(u)};")

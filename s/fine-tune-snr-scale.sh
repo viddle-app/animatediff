@@ -1,0 +1,24 @@
+python train_unet.py \
+  --learning_rate "1e-7" \
+  --scale_lr \
+  --dataset_name "laion_6plus" \
+  --output_dir "output_dreamshaper_8" \
+  --validation_prompt "Close Up portrait of a woman swaying in front of a lake artwork by Kawase Hasui" \
+  --seed 42 \
+  --resolution 512 \
+  --train_batch_size 16 \
+  --max_train_steps 100 \
+  --gradient_accumulation_steps 1 \
+  --gradient_checkpointing \
+  --use_8bit_adam \
+  --checkpointing_steps 5000 \
+  --pretrained_model_name_or_path "Lykon/dreamshaper-8" \
+  --input_perturbation 0.0 \
+  --mixed_precision "bf16" \
+  --image_column "URL" \
+  --caption_column "TEXT" \
+  --report_to "wandb" \
+  --validation_steps 5000 \
+  --noise_offset 0.1 \
+  --snr_scaling
+  

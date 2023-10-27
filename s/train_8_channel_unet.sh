@@ -1,0 +1,24 @@
+python train_8_channel_2.py \
+  --learning_rate "1e-7" \
+  --scale_lr \
+  --dataset_name "laion_6plus" \
+  --output_dir "output_8_channel" \
+  --validation_prompt "The mona lisa" \
+  --seed 42 \
+  --resolution 256 \
+  --train_batch_size 64 \
+  --num_train_epochs 10 \
+  --gradient_accumulation_steps 16 \
+  --gradient_checkpointing \
+  --use_8bit_adam \
+  --checkpointing_steps 100 \
+  --pretrained_model_name_or_path "/mnt/newdrive/models/v1-5" \
+  --input_perturbation 0.1 \
+  --mixed_precision "no" \
+  --image_column "URL" \
+  --caption_column "TEXT" \
+  --report_to "wandb" \
+  --validation_steps 10 \
+  --snr_scaling \
+  --val_image_url './mona-lisa-1.jpg' \
+  --conditioning_dropout_prob 0.5

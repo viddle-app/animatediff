@@ -16,7 +16,7 @@ from transformers import CLIPTextModel, CLIPTokenizer
 from diffusers.loaders import FromSingleFileMixin
 from diffusers.configuration_utils import FrozenDict
 from diffusers.models import AutoencoderKL
-from diffusers.pipeline_utils import DiffusionPipeline
+from diffusers.pipelines.pipeline_utils import DiffusionPipeline
 from diffusers.schedulers import (
     DDIMScheduler,
     DPMSolverMultistepScheduler,
@@ -404,13 +404,20 @@ class AnimationPipeline(DiffusionPipeline, FromSingleFileMixin):
                     noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
 
                 # compute the previous noisy sample x_t -> x_t-1
-                latents = self.scheduler.step(noise_pred, t, latents, **extra_step_kwargs).prev_sample
+                result = self.scheduler.step(noise_pred, t, latents, **extra_step_kwargs, return_dict=True)
+                latents = result.prev_sample
 
                 # call the callback, if provided
                 if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
                     progress_bar.update()
                     if callback is not None and i % callback_steps == 0:
-                        callback(i, t, latents)
+                        
+                        step_idx = i // getattr(self.scheduler, "order", 1)
+                        x_0 = None
+                        if hasattr(result, 'pred_original_sample'):
+                            x_0 = result.pred_original_sample
+                        
+                        callback(step_idx, t, latents, noise_pred, x_0)
 
         # Post-processing
         video = self.decode_latents(latents)

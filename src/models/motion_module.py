@@ -12,6 +12,8 @@ from diffusers.models.modeling_utils import ModelMixin
 from diffusers.utils import BaseOutput
 from diffusers.utils.import_utils import is_xformers_available
 from diffusers.models.attention import Attention, FeedForward
+import xformers
+import xformers.ops
 
 from einops import rearrange, repeat
 import math
@@ -59,6 +61,7 @@ class VanillaTemporalModule(nn.Module):
         temporal_position_encoding_max_len = 24,
         temporal_attention_dim_div         = 1,
         zero_initialize                    = True,
+        upcast_attention                   = False,
     ):
         super().__init__()
         
@@ -71,6 +74,7 @@ class VanillaTemporalModule(nn.Module):
             cross_frame_attention_mode=cross_frame_attention_mode,
             temporal_position_encoding=temporal_position_encoding,
             temporal_position_encoding_max_len=temporal_position_encoding_max_len,
+            upcast_attention=upcast_attention,
         )
         
         if zero_initialize:
@@ -338,9 +342,23 @@ class VersatileAttention(Attention):
         #    else:
         #        hidden_states = self._sliced_attention(query, key, value, sequence_length, dim, attention_mask)
 
+        # update the scale to using
+        # numerator = math.log(sequence_length) / math.log(sequence_length//4)
+        if not self.training:
+            numerator = math.log(sequence_length) / math.log(sequence_length//4)
+            # numerator = 1
+            self.scale = math.sqrt(numerator / (self.inner_dim // self.heads))
+
+
+        if query.dtype == torch.float16:
+            hidden_states = xformers.ops.memory_efficient_attention(
+                query, key, value, attn_bias=attention_mask, op=None, scale=self.scale
+            )
+            hidden_states = hidden_states.to(query.dtype)
+        else:
+            attention_probs = self.get_attention_scores(query, key, attention_mask)
+            hidden_states = torch.bmm(attention_probs, value)
         
-        attention_probs = self.get_attention_scores(query, key, attention_mask)
-        hidden_states = torch.bmm(attention_probs, value)
         hidden_states = self.batch_to_head_dim(hidden_states)
         
         # linear proj

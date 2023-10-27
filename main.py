@@ -9,9 +9,10 @@ import uuid
 import torch.nn.functional as F
 # from src.pipelines.multicontrolnet import MultiControlNetModel
 from diffusers.pipelines.controlnet.multicontrolnet import MultiControlNetModel
+from einops import rearrange
 
 use_ufree = False
-use_type = 'overlapping_previous'
+use_type = 'regular'
 if use_type == 'overlapping':
   from src.pipelines.pipeline_animatediff_overlapping import AnimationPipeline
 elif use_type == 'pix2pix_overlapping':
@@ -47,7 +48,7 @@ elif use_type == "init_image_2":
 else:
   from src.pipelines.pipeline_animatediff import AnimationPipeline
 from src.pipelines.pipeline_animatediff_controlnet import StableDiffusionControlNetPipeline
-from diffusers import AutoencoderKL, EulerAncestralDiscreteScheduler, DDIMScheduler, StableDiffusionPipeline
+from diffusers import AutoencoderKL, EulerAncestralDiscreteScheduler, DDIMScheduler, UniPCMultistepScheduler, StableDiffusionPipeline, HeunDiscreteScheduler
 import torch
 from transformers import CLIPTextModel, CLIPTokenizer
 if use_type == "ufree" or use_ufree == True:
@@ -59,8 +60,16 @@ import cv2
 from src.models.controlnet import ControlNetModel
 from PIL import Image
 from src.utils.image_utils import compute_spectrum, create_gif, create_mp4_from_images, save_spectrum_images, tensor_to_image_sequence
-from diffusers.utils import randn_tensor
+from diffusers.utils.torch_utils import randn_tensor
 from torchvision.transforms import ToTensor
+from safetensors.torch import load_file
+
+image_render = True
+
+if image_render:
+   from src.pipelines.pipeline_stable_diffusion import StableDiffusionPipeline
+
+print("use_type", use_type) 
 
 class AttentionProcessorController:
     def __init__(self) -> None:
@@ -354,6 +363,34 @@ def tensor_to_video(tensor, output_path, fps=30):
 
     out.release()
 
+def compute_x_0(scheduler, timesteps, noisy_latents, prediction):
+    
+    if hasattr(scheduler, "sigmas"):
+      # step_index = (scheduler.timesteps == timesteps).nonzero()[0].item()
+      step_index = scheduler._step_index
+      sigma = scheduler.sigmas[step_index]
+      print("sigma", sigma)
+      return noisy_latents - sigma * prediction
+    else:
+
+      alphas_cumprod = scheduler.alphas_cumprod.to(device=noisy_latents.device, dtype=noisy_latents.dtype)
+      sqrt_alpha_prod = scheduler.alphas_cumprod[timesteps] ** 0.5
+      sqrt_alpha_prod = sqrt_alpha_prod.flatten()
+      while len(sqrt_alpha_prod.shape) < len(noisy_latents.shape):
+          sqrt_alpha_prod = sqrt_alpha_prod.unsqueeze(-1)
+
+      sqrt_one_minus_alpha_prod = (1 - alphas_cumprod[timesteps]) ** 0.5
+      sqrt_one_minus_alpha_prod = sqrt_one_minus_alpha_prod.flatten()
+      while len(sqrt_one_minus_alpha_prod.shape) < len(noisy_latents.shape):
+          sqrt_one_minus_alpha_prod = sqrt_one_minus_alpha_prod.unsqueeze(-1)
+
+      sqrt_alpha_prod = sqrt_alpha_prod.to(device=noisy_latents.device)
+
+      print("sqrt_alpha_prod", sqrt_alpha_prod)
+      print("sqrt_one_minus_alpha_prod", sqrt_one_minus_alpha_prod)
+
+      return (noisy_latents - prediction * sqrt_one_minus_alpha_prod ) / sqrt_alpha_prod  
+
 def run(model,
         prompt="", 
         negative_prompt=None, 
@@ -369,13 +406,15 @@ def run(model,
         lora_folder=None,
         lora_files=None,
         seed=None,
-        last_n=21):
+        last_n=21,
+        unet_override=None,
+        debug_latents=False,):
   scheduler_kwargs = {
-    "num_train_timesteps": 1000,
-    "beta_start": 0.00085,
-    "beta_end": 0.012,
-    "beta_schedule": "linear",
-    # "clip_sample": False,
+   "num_train_timesteps": 1000,
+   "beta_start": 0.00085,
+   "beta_end": 0.012,
+   "beta_schedule": "scaled_linear",
+   # "clip_sample": False,
   }
 
   device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -386,7 +425,7 @@ def run(model,
     "unet_use_temporal_attention": False,
     "use_motion_module": True,
     "motion_module_resolutions": [1, 2, 4, 8],
-    "motion_module_mid_block": False,
+    "motion_module_mid_block": True,
     "motion_module_decoder_only": False,
     "motion_module_type": "Vanilla",
     "motion_module_kwargs": {
@@ -397,6 +436,7 @@ def run(model,
         "temporal_position_encoding_max_len": 32,
         "temporal_attention_dim_div": 1,
         "zero_initialize" : False,
+        "upcast_attention": True,
 
     },
   }
@@ -414,7 +454,17 @@ def run(model,
     tokenizer = pipeline.tokenizer  
     text_encoder = pipeline.text_encoder
     vae = pipeline.vae
-    unet = UNet3DConditionModel.from_unet2d(pipeline.unet, 
+    if scheduler_kwargs is not None:
+      scheduler = EulerAncestralDiscreteScheduler(**scheduler_kwargs)
+    else:
+      scheduler = EulerAncestralDiscreteScheduler.from_config(pipeline.scheduler.config)
+    if unet_override is not None:
+      unet = UNet3DConditionModel.from_pretrained_2d(unet_override, 
+                                                          subfolder="unet", 
+                                                          unet_additional_kwargs=unet_additional_kwargs)
+
+    else:
+      unet = UNet3DConditionModel.from_unet2d(pipeline.unet, 
                                             unet_additional_kwargs=unet_additional_kwargs)
 
   else:
@@ -428,7 +478,7 @@ def run(model,
   unet = unet.to(dtype=dtype) 
 
   use_controlnet = False
-  noise_scheduler=DDIMScheduler(**scheduler_kwargs)
+  # noise_scheduler=DDIMScheduler(**scheduler_kwargs)
 
   if (use_type == "overlapping_previous" or use_type == 'conv' or use_type == 'overlapping_previous_1' or use_type == 'overlapping_previous_2') and use_controlnet:
     # controlnet_path = Path("../models/ControlNet-v1-1/control_v11p_sd15_openpose.yaml")
@@ -446,15 +496,20 @@ def run(model,
 
     controlnet = controlnet_0
 
+    print("before initialization")
+
     pipeline = AnimationPipeline(
       vae=vae, 
       text_encoder=text_encoder, 
       tokenizer=tokenizer, 
       unet=unet,
       scheduler=EulerAncestralDiscreteScheduler(**scheduler_kwargs),
+      # scheduler=DDIMScheduler(pipe.scheduler.config),
       # scheduler=DDIMScheduler(**scheduler_kwargs),
       controlnet=controlnet,
     ).to(device)
+
+    pipeline.scheduler = EulerAncestralDiscreteScheduler.from_config(pipeline.scheduler.config)
   elif use_type == "pix2pix_2":
     pipeline = StableDiffusionInstructPix2PixPipeline(
       vae=vae, 
@@ -468,17 +523,23 @@ def run(model,
       requires_safety_checker=False,
     ).to(device)
   else:
+      # if image_render:
+         
+      # else:
+        pipeline = AnimationPipeline(
+          vae=vae, 
+          text_encoder=text_encoder, 
+          tokenizer=tokenizer, 
+          unet=unet,
+          # scheduler=HeunDiscreteScheduler(**scheduler_kwargs),
+          scheduler=scheduler,
+          # scheduler=UniPCMultistepScheduler(**scheduler_kwargs),
+        ).to(device)
 
-      pipeline = AnimationPipeline(
-        vae=vae, 
-        text_encoder=text_encoder, 
-        tokenizer=tokenizer, 
-        unet=unet,
-        # scheduler=DDIMScheduler(**scheduler_kwargs),
-        scheduler=EulerAncestralDiscreteScheduler(**scheduler_kwargs),
-      ).to(device)
+       
 
   pipeline.enable_vae_slicing()
+  pipeline.unet.eval()
 
       # set_upcast_softmax_to_false(pipeline)
       # pipeline.enable_sequential_cpu_offload()
@@ -578,7 +639,21 @@ def run(model,
   # motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/training-2023-10-16T10-18-52/checkpoints/checkpoint.ckpt"
   # motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/training-2023-10-16T11-56-35/checkpoints/checkpoint.ckpt"
   # motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/training-2023-10-17T00-09-45/checkpoints/checkpoint.ckpt"
-  motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/training-2023-10-17T00-52-56/checkpoints/checkpoint.ckpt"
+  # motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/training-2023-10-17T00-52-56/checkpoints/checkpoint.ckpt"
+  # motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/training-2023-10-17T11-22-06/checkpoints/checkpoint.ckpt"
+  # motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/training-2023-10-17T22-57-34/checkpoints/checkpoint.ckpt"
+  # motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/training-2023-10-18T06-58-55/checkpoints/checkpoint.ckpt"
+  # motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/training-2023-10-19T15-46-06/checkpoints/checkpoint.ckpt"
+  # motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/training-2023-10-19T19-53-19/checkpoints/checkpoint.ckpt"
+  # motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/training-2023-10-21T15-05-53/checkpoints/checkpoint.ckpt"
+  # motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/training-2023-10-21T22-28-02/checkpoints/checkpoint.ckpt"
+  # motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/training-2023-10-22T12-22-42/checkpoints/checkpoint.ckpt"
+  # motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/training-2023-10-22T17-14-57/checkpoints/checkpoint.ckpt"
+  # motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/training-2023-10-23T10-15-05/checkpoints/checkpoint.ckpt"
+  # motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/training-2023-10-23T17-19-54/checkpoints/checkpoint.ckpt"
+  # motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/training-2023-10-24T00-15-29/checkpoints/checkpoint.ckpt"
+  # motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/training-2023-10-25T02-06-38/checkpoints/checkpoint.ckpt"
+  # motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/training-2023-10-25T16-22-30/checkpoints/checkpoint.ckpt"
   motion_module_state_dict = torch.load(motion_module_path, map_location="cpu")
   missing, unexpected = pipeline.unet.load_state_dict(motion_module_state_dict, strict=False)
   # if "global_step" in motion_module_state_dict:
@@ -600,6 +675,59 @@ def run(model,
 
   do_upscale = False
   use_img2img = False
+
+  combined_callback_images = []
+  cpu_device = torch.device("cpu")
+  def callback(step, timestep, latents, prediction, x_0=None):
+    latents = latents[:, :, 0:1]
+    prediction = prediction[:, :, 0:1]
+    
+    timestep = timestep.to(device=cpu_device).long()
+    # save the latents and compute the x_o and save that too
+    if x_0 is not None:
+      print("has x_0")
+      x_0 = x_0[:, :, 0:1]
+    else:
+      x_0 = compute_x_0(pipeline.scheduler, 
+                        timestep, 
+                        latents, 
+                        prediction).to(dtype=dtype)
+    
+    x_0 = rearrange(x_0, 'b c f h w -> (b f) c h w')
+    x_0 = 1 / vae.config.scaling_factor * x_0
+    
+    x_0 = vae.decode(x_0, return_dict=False)[0]
+    # convert to PIL image
+    x_0 = (x_0 / 2 + 0.5).clamp(0, 1)
+
+    # print("latents.std", latents.std())
+    # print("latents.mean", latents.mean())
+    # print("prediction.std", prediction.std())
+    # print("prediction.mean", prediction.mean())
+          
+
+    latents = 1 / vae.config.scaling_factor * latents
+    latents = rearrange(latents, 'b c f h w -> (b f) c h w')
+    latents = vae.decode(latents, return_dict=False)[0]
+    # convert to PIL image
+    latents = (latents / 2 + 0.5).clamp(0, 1)
+    
+    prediction = 1 / vae.config.scaling_factor * prediction
+    prediction = rearrange(prediction, 'b c f h w -> (b f) c h w')
+    prediction = vae.decode(prediction, return_dict=False)[0]
+    # convert to PIL image
+    prediction = (prediction / 2 + 0.5).clamp(0, 1)
+
+    # concat the tensors along the W dimension
+    combined = torch.cat([latents, 
+                          prediction, 
+                          x_0, 
+                          ], dim=3)
+
+    combined_callback_images.append(combined)
+
+  if not debug_latents:
+     callback = None
 
 
   if use_type == 'overlapping' or use_type == 'overlapping_noise_pred' or use_type == 'overlapping_2' or use_type == 'overlapping_3' or use_type == 'overlapping_4' :
@@ -633,6 +761,8 @@ def run(model,
               window_count=window_count//4,
               )
   elif use_type == 'overlapping_previous' or use_type == 'conv' or use_type == 'overlapping_previous_1' or use_type == 'overlapping_previous_2':
+
+      
       if use_controlnet:
         # load 16 frames from the directory
         # open_pose_path = Path("/mnt/newdrive/stable-diffusion-docker/output/dwpose")
@@ -758,6 +888,7 @@ def run(model,
               ).videos[0]
 
       else:
+        
         video = pipeline(prompt=prompt, 
               negative_prompt=negative_prompt, 
               num_inference_steps=num_inference_steps,
@@ -767,10 +898,11 @@ def run(model,
                 window_count=window_count,
                 video_length=frame_count,
                 generator=generators,
-                wrap_around=True,
+                wrap_around=False,
                 alternate_direction=False,
                 min_offset = 3,
                 max_offset = 5,
+                callback=callback,
                 # cpu_device=torch.device("cuda"),
                 ).videos[0]
       
@@ -789,6 +921,8 @@ def run(model,
               strength=0.25,
               window_count=window_count//4,
               )
+        
+
   elif use_type == 'pix2pix_overlapping':
     images = []
     
@@ -1044,7 +1178,8 @@ def run(model,
                     width=width,
                     height=height,
                     generator= generators,
-                    video_length=frame_count).videos[0]
+                    video_length=frame_count,
+                    callback=callback).videos[0]
       
 
 
@@ -1076,6 +1211,15 @@ def run(model,
   spectrum = compute_spectrum(video)
   spectrum_uuid = str(uuid.uuid4())
   save_spectrum_images(spectrum, f"spectrum-images/{spectrum_uuid}")
+  os.makedirs("latents", exist_ok=True)
+  if len(combined_callback_images) > 0:
+     combined = torch.cat(combined_callback_images, dim=2)
+     # TODO save the images as GIFs and image sequences
+     # output_path = f"{output_folder}/{step}.gif"
+     # save_gif_from_tensor(combined, output_path)
+     # save a folder of images
+     image_folder_path = f"latents/{spectrum_uuid}"
+     tensor_to_image_sequence(combined.permute(1, 0, 2, 3), image_folder_path)
 
   # TODO save the video spectrum
 
@@ -1089,40 +1233,43 @@ if __name__ == "__main__":
   # prompt = "Make synthwave retrowave vaporware style, outside night time city skyline"
   # prompt = "turn her into princess leia, side buns hairstyle"
   # prompt = "make her open her mouth"
-  # prompt = "close up of a Girl swaying, red blouse, illustration by Wu guanzhong,China village,twojjbe trees in front of my chinese house,light orange, pink,white,blue ,8k"
+  prompt = "close up of a Girl swaying, red blouse, illustration by Wu guanzhong,China village,twojjbe trees in front of my chinese house,light orange, pink,white,blue ,8k"
   # prompt = "paint by frazetta, man dancing, mountain blue sky in background"
   # prompt = "1man dancing outside, clear blue sky sunny day, photography, award winning, highly detailed, bright, well lit"
   # prompt = "Cute Chunky anthropomorphic Siamese cat dressed in rags walking down a rural road, mindblowing illustration by Jean-Baptiste Monge + Emily Carr + Tsubasa Nakai"
   # prompt = "close up of A man walking, movie production, cinematic, photography, designed by daniel arsham, glowing white, futuristic, white liquid, highly detailed, 35mm"
   # prompt = "closeup of A woman dancing in front of a secret garden, upper body headshot, early renaissance paintings, Rogier van der Weyden paintings style"
   # prompt = "Close Up portrait of a woman turning in front of a lake artwork by Kawase Hasui"
+  # prompt = "guy working at his computer"
+  # prompt = "little boy plays with marbles"
   # prompt = "close up head shot of girl standing in a field of flowers, windy, long blonde hair in a blue dress smiling"
   # prompt = "RAW Photo, DSLR BREAK a young woman with bangs, (light smile:0.8), (smile:0.5), wearing relaxed shirt and trousers, causal clothes, (looking at viewer), focused, (modern and cozy office space), design agency office, spacious and open office, Scandinavian design space BREAK detailed, natural light"
   # prompt = "taken with iphone camera BREAK medium shot selfie of a pretty young woman BREAK (ombre:1.3) blonde pink BREAK film grain, medium quality"
   # prompt = "girl posing outside a bar on a rainy day, black clothes, street, neon sign, movie production still, high quality, neo-noir"
   # prompt = "cowboy shot, cyberpunk jacket, camera following woman walking and smoking down street on rainy night, led sign"
   # prompt = "A lego ninja bending down to pick a flower in the style of the lego movie. High quality render by arnold. Animal logic. 3D soft focus"
-  # prompt = "Glowing jellyfish, calm, slow hypnotic undulations, 35mm Nature photography, award winning"
-  prompt = "synthwave retrowave vaporware back of a delorean driving on highway, dmc rear grill, neon lights, palm trees and sunset in background"
+  prompt = "Glowing jellyfish, calm, slow hypnotic undulations, 35mm Nature photography, award winning"
+  # prompt = "synthwave retrowave vaporware back of a delorean driving on highway, dmc rear grill, neon lights, palm trees and sunset in background, clear, high definition, sharp"
+  # prompt = "dog walking in the flower, in the style of geometric graffiti"
   # prompt = "a doodle of a bear dancing, scribble, messy, stickfigure, badly drawn"
   # prompt = "make a painting by patrick nagel, gorgeous woman"
   # prompt = "make it oil painting, thick brush strokes, impasto, colorful"
   # prompt = "make it a charcoal sketch, minimal, simple line drawing, rough thick lines"
   # prompt = "woman laughing"
   # prompt = "close up of Embrodery Elijah Wood smiling in front of a embroidery landscape"
-  # prompt = "photo of a tom cruise statue made of ice, model shoot, empty black background"
+  # prompt = "tom cruise statue made of ice dancing empty black background"
   # prompt = "watermeloncarving, Terra Cotta Warriors,full body dancing"
   # prompt = "A doll walking in the forest jan svankmajer, brother quay style stop action animation"
   # model = Path("../models/dreamshaper-6")
   # model = Path("../models/deliberate_v2")
   # lora_file="Frazetta.safetensors"
-  lora_files=["retrowave_0.12.safetensors", "dmc12-000006.safetensors"]
+  # lora_files=["retrowave_0.12.safetensors", "dmc12-000006.safetensors"]
   # lora
   # lora_files = ["doodle.safetensors"]
   # lora_files = ["kEmbroideryRev.safetensors"]
   # lora_files = ["made_of_ice.safetensors"]
   # lora_files = ["watermeloncarving-000004.safetensors"]
-  # lora_files=[]
+  lora_files=[]
   # TODO the multidiffusion successor probably has the answer for duration
 
   # lora_file=None
@@ -1136,19 +1283,24 @@ if __name__ == "__main__":
   # model = "/mnt/newdrive/automatic1111/models/Stable-diffusion/neonskiesai_V10.safetensors"
   # model = "/mnt/newdrive/automatic1111/models/Stable-diffusion/synthwavepunk_v2.ckpt"
   # model = "/mnt/newdrive/models/miniSD"
+  # model = "/mnt/newdrive/models/v1-5"
+  # model = "/mnt/newdrive/viddle-animatediff/output_dreamshaper_8"
   run(model, 
       prompt=prompt,
-      negative_prompt="clone, cloned, bad anatomy, wrong anatomy, mutated hands and fingers, mutation, mutated, amputation, 3d render, lowres, signs, memes, labels, text, error, mutant, worst quality, low quality, normal quality, jpeg artifacts, signature, watermark, username, blurry, made by children, caricature, ugly, boring, sketch, lacklustre, repetitive, cropped, (long neck), body horror, out of frame, mutilated, tiled, frame, border",
+      negative_prompt="compression artifacts, blurry, worst quality, low quality, normal quality, jpeg artifacts, signature, watermark, username, blurry, made by children, caricature, ugly, boring, sketch, lacklustre, repetitive, cropped, (long neck), body horror, out of frame, mutilated, tiled, frame, border",
       # negative_prompt="",
       height=512,
       width=512,
-      frame_count=32, # 288,
+      frame_count=16, # 288,
       window_count=16,
-      num_inference_steps=40,
+      num_inference_steps=20,
       guidance_scale=7.0,
       last_n=23,
       seed=42,
       use_single_file=True,
       dtype=torch.float16,
       lora_folder="/mnt/newdrive/automatic1111/models/Lora",
-      lora_files=lora_files)
+      lora_files=lora_files,
+      debug_latents=False,
+      # unet_override="/mnt/newdrive/viddle-animatediff/output_dreamshaper_8/checkpoint-10000")
+  )

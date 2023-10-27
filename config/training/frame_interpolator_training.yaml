@@ -4,7 +4,7 @@ output_dir: "outputs"
 pretrained_model_path: "/mnt/newdrive/models/miniSD"
 
 unet_additional_kwargs:
-  in_channels: 4
+  in_channels: 8
   use_motion_module              : true
   motion_module_resolutions      : [ 1,2,4,8 ]
   unet_use_cross_frame_attention : false
@@ -39,7 +39,7 @@ noise_scheduler_kwargs:
 
 train_data:
   csv_path:        "data/output.csv"
-  video_folder:    "data/latent_cache"
+  video_folder:    "data/videos"
   sample_size:     256
   sample_stride:   4
   sample_n_frames: 16
@@ -55,7 +55,7 @@ trainable_modules:
 
 unet_checkpoint_path: ""
 
-learning_rate:    9e-7
+learning_rate:    1e-6
 train_batch_size: 4
 gradient_checkpointing: True
 gradient_accumulation_steps: 4
@@ -67,9 +67,9 @@ scale_lr: true
 max_train_epoch:     4
 max_train_steps:      -1
 checkpointing_epochs: -1
-checkpointing_steps:  250
+checkpointing_steps:  500
 
-validation_steps:       400
+validation_steps:       100
 validation_steps_tuple: []
 
 global_seed: 42
@@ -77,4 +77,4 @@ mixed_precision_training: true
 enable_xformers_memory_efficient_attention: False
 
 is_debug: False
-num_workers: 0
+num_workers: 32

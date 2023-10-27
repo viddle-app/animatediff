@@ -1,0 +1,1 @@
+MASTER_ADDR=127.0.0.1 MASTER_PORT=6666 RANK=0 WORLD_SIZE=1 python train_overlapping.py --wandb --config config/training/training.yaml

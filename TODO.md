@@ -12,6 +12,12 @@ refactor code to make it easier to switch out losses for validation
 use more videos for validation
 prepare the trailer dataset
 
+retrain with 1e-9 and a proper schedule
+try using an array of lrs for different timestep ranges to fine-tune just the high end
+try use noise perputations
+
+log out latents when rendering for debugging
+
 
 OLD:
 - Clean up the partition code
@@ -37,7 +43,7 @@ Modify to use same size windows without looping and use blending instead
 - This is going to have issues
 Look at how the inpainting model is trained
 
-Need to write a new captioning dataset script
+
 Should start downloading videos all the time
 Docker image for training
 

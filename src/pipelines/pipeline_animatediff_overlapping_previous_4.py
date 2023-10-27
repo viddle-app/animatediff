@@ -341,7 +341,6 @@ class AnimationPipeline(DiffusionPipeline, FromSingleFileMixin):
         # scale the initial noise by the standard deviation required by the scheduler
         # check if the init_noise_sigma is a tensor
         if do_init_noise:
-            print("prepare init noise", self.scheduler.init_noise_sigma)
             if isinstance(self.scheduler.init_noise_sigma, torch.Tensor):
                 latents = latents * self.scheduler.init_noise_sigma.to(device)
             else:
@@ -437,8 +436,8 @@ class AnimationPipeline(DiffusionPipeline, FromSingleFileMixin):
         callback_steps: Optional[int] = 1,
         window_count=24,
         wrap_around = True,
-        min_offset = 3,
-        max_offset = 5,
+        decimation_start = 0,
+        decimation_end = 1,
         offset_generator = None,
         alternate_direction = True,
         do_init_noise: bool = True,
@@ -912,7 +911,7 @@ class AnimationPipeline(DiffusionPipeline, FromSingleFileMixin):
                     if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
                         progress_bar.update()
                         if callback is not None and i % callback_steps == 0:
-                            callback(i, t, latent_partition, noise_pred)
+                            callback(i, t, latent_partition)
 
                     if hasattr(self.unet, 'swap_next_to_last'):
                         self.unet.swap_next_to_last()
