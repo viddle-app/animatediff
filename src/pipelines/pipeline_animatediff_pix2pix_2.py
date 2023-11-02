@@ -319,6 +319,10 @@ class StableDiffusionInstructPix2PixPipeline(DiffusionPipeline, TextualInversion
         height = height * self.vae_scale_factor
         width = width * self.vae_scale_factor
 
+        print("image_latents.shape", image_latents.shape)
+        print("height", height)
+        print("width", width)
+
         # 6. Prepare latent variables
         num_channels_latents = self.vae.config.latent_channels
         latents = self.prepare_latents(

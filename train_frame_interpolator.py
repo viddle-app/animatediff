@@ -9,6 +9,7 @@ import inspect
 import argparse
 import datetime
 import subprocess
+import glob
 
 from pathlib import Path
 from tqdm.auto import tqdm
@@ -40,9 +41,64 @@ from PIL import Image
 from src.models.unet import UNet3DConditionModel
 from src.pipelines.pipeline_animatediff_pix2pix_2 import StableDiffusionInstructPix2PixPipeline
 from src.utils.util import save_videos_grid, zero_rank_print
+# from src.data.dataset_cached_latents import WebVid10M
 from src.data.dataset import WebVid10M
 from torchvision.transforms import ToTensor
 from safetensors.torch import load_file
+from src.pipelines.pipeline_animatediff_frame_interpolator import StableDiffusionFrameInterpolatorPipeline
+from itertools import repeat
+
+def frame_diff(video_tensor):
+    """
+    Compute the frame difference for a video tensor.
+    video_tensor should have shape (batch_size, channels, frames, height, width)
+    """
+    return video_tensor[:, :, 1:] - video_tensor[:, :, :-1]
+
+def compute_snr(noise_scheduler, timesteps):
+    """
+    Computes SNR as per
+    https://github.com/TiankaiHang/Min-SNR-Diffusion-Training/blob/521b624bd70c67cee4bdf49225915f5945a872e3/guided_diffusion/gaussian_diffusion.py#L847-L849
+    """
+    alphas_cumprod = noise_scheduler.alphas_cumprod
+    sqrt_alphas_cumprod = alphas_cumprod**0.5
+    sqrt_one_minus_alphas_cumprod = (1.0 - alphas_cumprod) ** 0.5
+
+    # Expand the tensors.
+    # Adapted from https://github.com/TiankaiHang/Min-SNR-Diffusion-Training/blob/521b624bd70c67cee4bdf49225915f5945a872e3/guided_diffusion/gaussian_diffusion.py#L1026
+    sqrt_alphas_cumprod = sqrt_alphas_cumprod.to(device=timesteps.device)[timesteps].float()
+    while len(sqrt_alphas_cumprod.shape) < len(timesteps.shape):
+        sqrt_alphas_cumprod = sqrt_alphas_cumprod[..., None]
+    alpha = sqrt_alphas_cumprod.expand(timesteps.shape)
+
+    sqrt_one_minus_alphas_cumprod = sqrt_one_minus_alphas_cumprod.to(device=timesteps.device)[timesteps].float()
+    while len(sqrt_one_minus_alphas_cumprod.shape) < len(timesteps.shape):
+        sqrt_one_minus_alphas_cumprod = sqrt_one_minus_alphas_cumprod[..., None]
+    sigma = sqrt_one_minus_alphas_cumprod.expand(timesteps.shape)
+
+    # Compute SNR.
+    snr = (alpha / sigma) ** 2
+    return snr
+
+
+def video_diff_loss_6(original_video, generated_video, first_frame_weight=1.0):
+    # diff both from the first frame
+    original_diff = frame_diff(original_video)
+    # now compute the frame difference of the generated
+    generated_diff = frame_diff(generated_video)
+
+    # add the first frame of the original and the generated
+    # to the front of the original_diff and generated_diff
+    original_diff = torch.cat([original_video[:, :, 0:1], original_diff], dim=2)
+    generated_diff = torch.cat([generated_video[:, :, 0:1], generated_diff], dim=2)
+    # take the difference between the two
+    difference_difference = original_diff - generated_diff
+
+    # multiple the first frame difference by the weight
+    difference_difference[:, :, 0] = difference_difference[:, :, 0] * first_frame_weight
+
+    # take the mse loss
+    return (difference_difference**2)
 
 def extract_motion_module(unet):
     mm_state_dict = OrderedDict()
@@ -85,7 +141,25 @@ def init_dist(launcher="slurm", backend='nccl', port=29500, **kwargs):
     
     return local_rank
 
-
+def add_positional_encoding(x, dim):
+    """
+    Add positional encoding to the tensor.
+    For the purpose of this demonstration, we'll use a simple sinusoidal encoding.
+    You can replace this with any positional encoding of your choice.
+    """
+    print("x.shape", x.shape)
+    pos = torch.arange(0, x.size(2), dtype=torch.float32, device=x.device)
+    div_term = torch.exp(torch.arange(0, dim, 2).float() * (-torch.log(torch.tensor(10000.0)) / dim)).to(x.device)
+    pos = pos.unsqueeze(1)
+    div_term = div_term.unsqueeze(0)
+    encoded = pos * div_term
+    sin_enc = torch.sin(encoded)
+    cos_enc = torch.cos(encoded[:, 1::2])
+    encoding = torch.stack([sin_enc, cos_enc], dim=2).flatten(1)
+    
+    # Expanding dimensions to match the input shape and adding to the input tensor
+    encoding = encoding.unsqueeze(0).unsqueeze(3).unsqueeze(4)
+    return x + encoding
 
 def main(
     image_finetune: bool,
@@ -135,6 +209,7 @@ def main(
 
     global_seed: int = 42,
     is_debug: bool = False,
+    cached_latents: bool = False,
 ):
     check_min_version("0.10.0.dev0")
 
@@ -177,37 +252,38 @@ def main(
     dtype = torch.float32
     noise_scheduler = DDIMScheduler(**OmegaConf.to_container(noise_scheduler_kwargs))
 
-    pipeline = StableDiffusionPipeline.from_single_file(pretrained_model_path, torch_dtype=dtype)
+    pipeline = StableDiffusionPipeline.from_pretrained(pretrained_model_path, torch_dtype=dtype)
   
     tokenizer = pipeline.tokenizer  
     text_encoder = pipeline.text_encoder
     vae = pipeline.vae
-    fine_tuned_unet = load_file("/mnt/newdrive/viddle-animatediff/output_8_channel/checkpoint-800/unet/diffusion_pytorch_model.safetensors")
-    unet = UNet3DConditionModel.from_unet2d(fine_tuned_unet, unet_additional_kwargs=unet_additional_kwargs)
+    fine_tuned_unet = "/mnt/newdrive/viddle-animatediff/output_8_channel/checkpoint-800/unet/"
+    unet = UNet3DConditionModel.from_pretrained_2d(fine_tuned_unet, unet_additional_kwargs=unet_additional_kwargs)
     # unet = UNet3DConditionModel.from_unet2d(pipeline.unet, 
     #                                         unet_additional_kwargs=OmegaConf.to_container(unet_additional_kwargs))
 
     # else:
     #    unet = UNet2DConditionModel.from_pretrained(pretrained_model_path, subfolder="unet")
     global_step = 0
-    motion_module_path = "motion-models/mm_sd_v15_v2.ckpt"
-    # motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/training-2023-09-26T09-38-19/checkpoints/mm.ckpt"
-    # motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/training-2023-09-26T12-50-02/checkpoints/mm.ckpt"
-    # motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/training-2023-09-26T14-32-35/checkpoints/mm.ckpt"
-    # motion_module_path = "motion-models/temporal-attn-5e-7-2-15000-steps.ckpt"
-    # motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/training-2023-09-19T10-06-51/checkpoints/checkpoint.ckpt"
-    # motion_module_path = '../ComfyUI/custom_nodes/ComfyUI-AnimateDiff/models/animatediffMotion_v15.ckpt'
-    motion_module_state_dict = torch.load(motion_module_path, map_location="cpu")
-    # update_pe(motion_module_state_dict)
-    missing, unexpected = unet.load_state_dict(motion_module_state_dict, strict=False)
-    if "global_step" in motion_module_state_dict:
-      global_step = int(motion_module_state_dict["global_step"])
-    print("unexpected", unexpected)
-    # assert len(unexpected) == 0
-    print("missing", len(missing))
-    print("missing", missing)
+    if not unet_additional_kwargs.motion_module_kwargs.zero_initialize:
+        motion_module_path = "motion-models/mm_sd_v15_v2.ckpt"
+        # motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/training-2023-09-26T09-38-19/checkpoints/mm.ckpt"
+        # motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/training-2023-09-26T12-50-02/checkpoints/mm.ckpt"
+        # motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/training-2023-09-26T14-32-35/checkpoints/mm.ckpt"
+        # motion_module_path = "motion-models/temporal-attn-5e-7-2-15000-steps.ckpt"
+        # motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/training-2023-09-19T10-06-51/checkpoints/checkpoint.ckpt"
+        # motion_module_path = '../ComfyUI/custom_nodes/ComfyUI-AnimateDiff/models/animatediffMotion_v15.ckpt'
+        motion_module_state_dict = torch.load(motion_module_path, map_location="cpu")
+        # update_pe(motion_module_state_dict)
+        missing, unexpected = unet.load_state_dict(motion_module_state_dict, strict=False)
+        if "global_step" in motion_module_state_dict:
+            global_step = int(motion_module_state_dict["global_step"])
+        print("unexpected", unexpected)
+        # assert len(unexpected) == 0
+        print("missing", len(missing))
+        print("missing", missing)
 
-    print(f"state_dict keys: {list(unet.config.keys())[:10]}")
+        print(f"state_dict keys: {list(unet.config.keys())[:10]}")
 
 
     # Load pretrained unet weights
@@ -235,7 +311,10 @@ def main(
             if trainable_module_name in name:
                 param.requires_grad = True
                 break
-            
+
+    if scale_lr:
+        learning_rate = (learning_rate * gradient_accumulation_steps * train_batch_size * num_processes)
+
     trainable_params = list(filter(lambda p: p.requires_grad, unet.parameters()))
     optimizer = torch.optim.AdamW(
         trainable_params,
@@ -295,8 +374,7 @@ def main(
         assert checkpointing_epochs != -1
         checkpointing_steps = checkpointing_epochs * len(train_dataloader)
 
-    if scale_lr:
-        learning_rate = (learning_rate * gradient_accumulation_steps * train_batch_size * num_processes)
+
 
     # Scheduler
     lr_scheduler = get_scheduler(
@@ -308,8 +386,12 @@ def main(
 
     # Validation pipeline
     if not image_finetune:
-        validation_pipeline = StableDiffusionInstructPix2PixPipeline(
-            unet=unet, vae=vae, tokenizer=tokenizer, text_encoder=text_encoder, scheduler=noise_scheduler,
+        validation_pipeline = StableDiffusionFrameInterpolatorPipeline(
+            unet=unet, 
+            vae=vae, 
+            tokenizer=tokenizer, 
+            text_encoder=text_encoder, 
+            scheduler=noise_scheduler,
             safety_checker=None,
             feature_extractor=None,
             requires_safety_checker=False,
@@ -361,35 +443,50 @@ def main(
                 batch['text'] = [name if random.random() > cfg_random_null_text_ratio else "" for name in batch['text']]
                 
             # Data batch sanity check
-            # if epoch == first_epoch and step == 0:
-            #     pixel_values, texts = batch['pixel_values'].cpu(), batch['text']
-            #     if not image_finetune:
-            #         pixel_values = rearrange(pixel_values, "b f c h w -> b c f h w")
-            #         for idx, (pixel_value, text) in enumerate(zip(pixel_values, texts)):
-            #             pixel_value = pixel_value[None, ...]
-            #             save_videos_grid(pixel_value, f"{output_dir}/sanity_check/{'-'.join(text.replace('/', '').split()[:10]) if not text == '' else f'{global_rank}-{idx}'}.gif", rescale=True)
-            #     else:
-            #         for idx, (pixel_value, text) in enumerate(zip(pixel_values, texts)):
-            #             pixel_value = pixel_value / 2. + 0.5
-            #             torchvision.utils.save_image(pixel_value, f"{output_dir}/sanity_check/{'-'.join(text.replace('/', '').split()[:10]) if not text == '' else f'{global_rank}-{idx}'}.png")
+            if epoch == first_epoch and step == 0:
+                pixel_values, texts = batch['pixel_values'].cpu(), batch['text']
+                if not image_finetune:
+                    if cached_latents:
+                        frame_count = pixel_values.shape[1]
+                        pixel_values = rearrange(pixel_values, "b f c h w -> (b f) c h w").to(device=local_rank)
+                        # decode using the vae
+                        with torch.no_grad():
+                            pixel_values = pixel_values / 0.18125
+                            pixel_values = vae.decode(pixel_values, return_dict=False)[0]
+                            pixel_values = rearrange(pixel_values, "(b f) c h w -> b c f h w", f=frame_count).to(device="cpu", dtype=torch.float32)
+                    else: 
+                        pixel_values = rearrange(pixel_values, "b f c h w -> b c f h w")
+
+                    for idx, (pixel_value, text) in enumerate(zip(pixel_values, texts)):
+                        pixel_value = pixel_value[None, ...]
+                        save_videos_grid(pixel_value, 
+                                         f"{output_dir}/sanity_check/{'-'.join(text.replace('/', '').split()[:10]) if not text == '' else f'{global_rank}-{idx}'}.gif", 
+                                         rescale=True)
+                else:
+                    for idx, (pixel_value, text) in enumerate(zip(pixel_values, texts)):
+                        pixel_value = (pixel_value + 1) / 2.0
+                        torchvision.utils.save_image(pixel_value, f"{output_dir}/sanity_check/{'-'.join(text.replace('/', '').split()[:10]) if not text == '' else f'{global_rank}-{idx}'}.png")
                     
             ### >>>> Training >>>> ###
             
             # Convert videos to latent space            
-            pixel_values = batch["pixel_values"].to(local_rank)
-            video_length = pixel_values.shape[1]
-            with torch.no_grad():
-                if not image_finetune:
-                    pixel_values = rearrange(pixel_values, "b f c h w -> (b f) c h w")
-                    latents = vae.encode(pixel_values).latent_dist
-                    latents = latents.sample()
-                    latents = rearrange(latents, "(b f) c h w -> b c f h w", f=video_length)
+            if cached_latents:
+                latents = batch["pixel_values"].to(local_rank)
+                latents = rearrange(latents, "b f c h w -> b c f h w")
+            else:
+                pixel_values = batch["pixel_values"].to(local_rank)
+                video_length = pixel_values.shape[1]
+                with torch.no_grad():
+                    if not image_finetune:
+                        pixel_values = rearrange(pixel_values, "b f c h w -> (b f) c h w")
+                        latents = vae.encode(pixel_values).latent_dist
+                        latents = latents.sample()
+                        latents = rearrange(latents, "(b f) c h w -> b c f h w", f=video_length)
+                    else:
+                        latents = vae.encode(pixel_values).latent_dist
+                        latents = latents.sample()
 
-                else:
-                    latents = vae.encode(pixel_values).latent_dist
-                    latents = latents.sample()
-
-                latents = latents * 0.18215
+                    latents = latents * 0.18215
 
             # Sample noise that we'll add to the latents
             noise = torch.randn_like(latents)
@@ -403,10 +500,19 @@ def main(
             # (this is the forward diffusion process)
             noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
 
-            # add repeat the first frame of the latents and concatenate to the noisy latents
-            first_frame = latents[:, :, 0:1, :, :] / 0.18215
-            repeated_first_frame = first_frame.repeat(1, 1, latents.shape[2], 1, 1)
-            noisy_latents = torch.cat([noisy_latents, repeated_first_frame], dim=1)
+            # Extract every fourth frame from latents
+            if cached_latents: 
+                raise "not implemented"
+            else:
+                image_latents = vae.encode(pixel_values).latent_dist.mode()
+                image_latents = rearrange(image_latents, "(b f) c h w -> b c f h w", f=video_length)
+                frames = image_latents[:, :, ::4, :, :] 
+
+                # duplicate each frame 4 times
+                frames = frames.repeat_interleave(4, dim=2)
+
+            # Concatenate the encoded frames to the noisy_latents
+            noisy_latents = torch.cat([noisy_latents, frames], dim=1)
 
 
             # Get the text embedding for conditioning
@@ -428,13 +534,26 @@ def main(
             # Mixed-precision training
             with torch.cuda.amp.autocast(enabled=mixed_precision_training):
                 model_pred = unet(noisy_latents, timesteps, encoder_hidden_states).sample
-                loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
+                model_pred_float = model_pred.float()
+                target_float = target.float()
+                # snr = compute_snr(noise_scheduler, timesteps)
+                # snr_scale = 1 / torch.sqrt(snr)
+                # loss = (snr_scale.reshape(-1, 1, 1, 1, 1) * 
+                #         video_diff_loss_6(model_pred_float, 
+                #                             target_float, 
+                #                             first_frame_weight=1.0)).mean()
+                loss = video_diff_loss_6(model_pred_float, 
+                                            target_float, 
+                                            first_frame_weight=1.0).mean()
+                # loss = F.mse_loss(model_pred_float, target_float, reduction="mean")
 
-            optimizer.zero_grad()
+            if mixed_precision_training:
+                scaler.scale(loss).backward()
+            else:
+                loss.backward()
 
             # Backpropagate
             if mixed_precision_training:
-                scaler.scale(loss).backward()
                 """ >>> gradient clipping >>> """
                 scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(unet.parameters(), max_grad_norm)
@@ -442,12 +561,12 @@ def main(
                 scaler.step(optimizer)
                 scaler.update()
             else:
-                loss.backward()
                 """ >>> gradient clipping >>> """
                 torch.nn.utils.clip_grad_norm_(unet.parameters(), max_grad_norm)
                 """ <<< gradient clipping <<< """
                 optimizer.step()
 
+            optimizer.zero_grad()
             lr_scheduler.step()
             progress_bar.update(1)
             global_step += 1
@@ -487,11 +606,28 @@ def main(
 
                 for idx, prompt in enumerate(prompts):
                     if not image_finetune:
+                        images = []
+                        width = 256
+                        height = 256
+                        
+                        background_frames_path = Path("/mnt/newdrive/viddle-animatediff/output/1c0c0f1e-73b4-417a-91c0-aaa7356e0cf0")
+                        background_frames = glob.glob(os.path.join(background_frames_path, '*.png'))
+                        background_frames = sorted(background_frames)
+                        # get frame_count with a stride of 2
+                        background_frames = background_frames[::4]
+                        print("background_frames", len(background_frames))
+                        background_frames = [element for item in background_frames for element in repeat(item, 4)]
+                        for frame_path in background_frames:
+                            frame = Image.open(frame_path).resize((width, height))
+                            images.append(frame)
+
+                        print("images", len(images))
+
                         sample = validation_pipeline(
                             prompt,
                             generator    = generator,
                             video_length = train_data.sample_n_frames,
-                            image = Image.open("mona-lisa-1.jpg").resize((256, 256)),
+                            image = images,
                             num_inference_steps = validation_data.get("num_inference_steps", 25),
                         )[0]
 

@@ -30,9 +30,18 @@ RUN mkdir -p /home/huggingface/.cache/huggingface \
   && mkdir -p /home/huggingface/input \
   && mkdir -p /home/huggingface/output
 
+COPY motion-models/mm_sd_v15_v2.ckpt /home/huggingface/motion-models/mm_sd_v15_v2.ckpt
+COPY base_models/v1-5 /home/huggingface/base_models/v1-5
+COPY data/latent_cache /home/huggingface/data/latent_cache
+COPY data/output.csv /home/huggingface/data/output.csv
+COPY outputs/training-2023-10-25T12-47-50/checkpoints/checkpoint-epoch-10.ckpt /home/huggingface/outputs/training-2023-10-25T12-47-50/checkpoints/checkpoint-epoch-10.ckpt
+
 COPY src/ /home/huggingface/src/
 
 COPY run.sh /home/huggingface
+
+COPY train_overlapping.py /home/huggingface/train_overlapping.py
+COPY config/* /home/huggingface/config/
 
 ENV PATH="/home/huggingface/.local/bin:${PATH}"
 

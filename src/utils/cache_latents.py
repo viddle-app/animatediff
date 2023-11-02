@@ -90,7 +90,8 @@ def cache_latents(video_folder, latent_cache_folder):
   # go through each folder and extract the 16 frames with stride 4
   # encode them and save them in the latent_cache_path
 
-  pipeline = StableDiffusionPipeline.from_pretrained(Path("/mnt/newdrive/models/v1-5")).to("cuda")
+  pipeline = StableDiffusionPipeline.from_pretrained(Path("/mnt/newdrive/models/v1-5"), 
+                                                     torch_dtype=torch.float32).to("cuda")
 
   pipeline.enable_vae_slicing()
   

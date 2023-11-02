@@ -10,9 +10,10 @@ import torch.nn.functional as F
 # from src.pipelines.multicontrolnet import MultiControlNetModel
 from diffusers.pipelines.controlnet.multicontrolnet import MultiControlNetModel
 from einops import rearrange
+from itertools import repeat
 
 use_ufree = False
-use_type = 'regular'
+use_type = 'frame_interpolator'
 if use_type == 'overlapping':
   from src.pipelines.pipeline_animatediff_overlapping import AnimationPipeline
 elif use_type == 'pix2pix_overlapping':
@@ -43,12 +44,23 @@ elif use_type == "ufree":
   from src.pipelines.pipeline_animatediff_ufree import AnimationPipeline
 elif use_type == "pix2pix_2":
   from src.pipelines.pipeline_animatediff_pix2pix_2 import StableDiffusionInstructPix2PixPipeline
+elif use_type == "frame_interpolator":
+  from src.pipelines.pipeline_animatediff_frame_interpolator import StableDiffusionFrameInterpolatorPipeline
 elif use_type == "init_image_2":
   from src.pipelines.pipeline_animatediff_init_image_2 import AnimationPipeline
+elif use_type == 'static_pix2pix':
+  from diffusers import StableDiffusionInstructPix2PixPipeline
 else:
   from src.pipelines.pipeline_animatediff import AnimationPipeline
 from src.pipelines.pipeline_animatediff_controlnet import StableDiffusionControlNetPipeline
-from diffusers import AutoencoderKL, EulerAncestralDiscreteScheduler, DDIMScheduler, UniPCMultistepScheduler, StableDiffusionPipeline, HeunDiscreteScheduler
+from diffusers import (UNet2DConditionModel,
+  AutoencoderKL, 
+  EulerAncestralDiscreteScheduler, 
+  DDIMScheduler, 
+  UniPCMultistepScheduler, 
+  StableDiffusionPipeline, 
+  HeunDiscreteScheduler
+  )
 import torch
 from transformers import CLIPTextModel, CLIPTokenizer
 if use_type == "ufree" or use_ufree == True:
@@ -413,14 +425,15 @@ def run(model,
    "num_train_timesteps": 1000,
    "beta_start": 0.00085,
    "beta_end": 0.012,
-   "beta_schedule": "scaled_linear",
+   "beta_schedule": "linear",
    # "clip_sample": False,
+   "steps_offset":        1,                                                                  
   }
 
   device = "cuda" if torch.cuda.is_available() else "cpu"
 
   unet_additional_kwargs = {
-    "in_channels": 4,
+    "in_channels": 8,
     "unet_use_cross_frame_attention": False,
     "unet_use_temporal_attention": False,
     "use_motion_module": True,
@@ -428,6 +441,7 @@ def run(model,
     "motion_module_mid_block": True,
     "motion_module_decoder_only": False,
     "motion_module_type": "Vanilla",
+    "use_inflated_groupnorm": True,
     "motion_module_kwargs": {
         "num_attention_heads": 8,
         "num_transformer_block": 1,
@@ -470,11 +484,23 @@ def run(model,
   else:
     tokenizer    = CLIPTokenizer.from_pretrained(model, subfolder="tokenizer", torch_dtype=dtype)
     text_encoder = CLIPTextModel.from_pretrained(model, subfolder="text_encoder", torch_dtype=dtype)
-    vae          = AutoencoderKL.from_pretrained(model, subfolder="vae", torch_dtype=dtype)            
-    unet         = UNet3DConditionModel.from_pretrained_2d(model, 
+    vae          = AutoencoderKL.from_pretrained(model, subfolder="vae", torch_dtype=dtype)       
+    if unet_override is not None:
+      if use_type == 'static_pix2pix':
+        unet = UNet2DConditionModel.from_pretrained(unet_override, 
+                                                          subfolder="unet", 
+                                                          unet_additional_kwargs=unet_additional_kwargs)
+      else:
+        unet = UNet3DConditionModel.from_pretrained_2d(unet_override, 
                                                           subfolder="unet", 
                                                           unet_additional_kwargs=unet_additional_kwargs)
 
+    else:
+      unet         = UNet3DConditionModel.from_pretrained_2d(model, 
+                                                          subfolder="unet", 
+                                                          unet_additional_kwargs=unet_additional_kwargs)
+
+  unet.enable_xformers_memory_efficient_attention()
   unet = unet.to(dtype=dtype) 
 
   use_controlnet = False
@@ -516,8 +542,32 @@ def run(model,
       text_encoder=text_encoder, 
       tokenizer=tokenizer, 
       unet=unet,
+      # scheduler=EulerAncestralDiscreteScheduler(**scheduler_kwargs),
+      scheduler=DDIMScheduler(**scheduler_kwargs),
+      safety_checker=None,
+      feature_extractor=None,
+      requires_safety_checker=False,
+    ).to(device)
+  elif use_type == "frame_interpolator":
+    pipeline = StableDiffusionFrameInterpolatorPipeline(
+      vae=vae, 
+      text_encoder=text_encoder, 
+      tokenizer=tokenizer, 
+      unet=unet,
       scheduler=EulerAncestralDiscreteScheduler(**scheduler_kwargs),
       # scheduler=DDIMScheduler(**scheduler_kwargs),
+      safety_checker=None,
+      feature_extractor=None,
+      requires_safety_checker=False,
+    ).to(device)
+  elif use_type == "static_pix2pix":
+    pipeline = StableDiffusionInstructPix2PixPipeline(
+      vae=vae, 
+      text_encoder=text_encoder, 
+      tokenizer=tokenizer, 
+      unet=unet,
+      # scheduler=EulerAncestralDiscreteScheduler(**scheduler_kwargs),
+      scheduler=DDIMScheduler(**scheduler_kwargs),
       safety_checker=None,
       feature_extractor=None,
       requires_safety_checker=False,
@@ -537,8 +587,8 @@ def run(model,
         ).to(device)
 
        
-
-  pipeline.enable_vae_slicing()
+  if hasattr(pipeline, "enable_vae_slicing"):
+    pipeline.enable_vae_slicing()
   pipeline.unet.eval()
 
       # set_upcast_softmax_to_false(pipeline)
@@ -654,14 +704,26 @@ def run(model,
   # motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/training-2023-10-24T00-15-29/checkpoints/checkpoint.ckpt"
   # motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/training-2023-10-25T02-06-38/checkpoints/checkpoint.ckpt"
   # motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/training-2023-10-25T16-22-30/checkpoints/checkpoint.ckpt"
-  motion_module_state_dict = torch.load(motion_module_path, map_location="cpu")
-  missing, unexpected = pipeline.unet.load_state_dict(motion_module_state_dict, strict=False)
-  # if "global_step" in motion_module_state_dict:
-  #  raise Exception("global_step present. Not sure how to handle that.")
-  print("unexpected", unexpected)
-  # assert len(unexpected) == 0
-  print("missing", len(missing))
-  print("missing", missing)
+  # motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/training-2023-10-27T14-21-27/checkpoints/checkpoint-epoch-2.ckpt"
+  # motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/training-2023-10-28T01-33-45/checkpoints/checkpoint-epoch-4.ckpt"
+  # motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/training-2023-10-28T01-33-45/checkpoints/checkpoint-epoch-9.ckpt"
+  # motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/training-2023-10-29T23-28-04/checkpoints/checkpoint.ckpt"
+  # motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/training-2023-10-30T00-06-44/checkpoints/checkpoint.ckpt"
+  # motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/frame_interpolator_training-2023-10-30T09-29-54/checkpoints/checkpoint.ckpt"
+  # motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/frame_interpolator_training-2023-10-30T14-09-21/checkpoints/checkpoint-epoch-4.ckpt"
+  motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/frame_interpolator_training-2023-10-31T15-05-11/checkpoints/checkpoint.ckpt"
+
+  if True:
+    motion_module_state_dict = torch.load(motion_module_path, map_location="cpu")
+    motion_module_state_dict = motion_module_state_dict["state_dict"] if "state_dict" in motion_module_state_dict else motion_module_state_dict
+
+    missing, unexpected = pipeline.unet.load_state_dict(motion_module_state_dict, strict=False)
+    # if "global_step" in motion_module_state_dict:
+    #  raise Exception("global_step present. Not sure how to handle that.")
+    print("unexpected", unexpected)
+    # assert len(unexpected) == 0
+    print("missing", len(missing))
+    print("missing", missing)
 
   if seed is None:
     seed = random.randint(-sys.maxsize, sys.maxsize)
@@ -708,7 +770,16 @@ def run(model,
 
     latents = 1 / vae.config.scaling_factor * latents
     latents = rearrange(latents, 'b c f h w -> (b f) c h w')
-    latents = vae.decode(latents, return_dict=False)[0]
+    print("latents.shape", latents.shape)
+    # if the latents have 8 channels split into too chunks
+    latents_0 = None
+    if latents.shape[1] == 8:
+      latents_0 = latents[:, :4]
+      latents_1 = latents[:, 4:]
+      latents_0 = vae.decode(latents_0, return_dict=False)[0]
+      latents_1 = vae.decode(latents_1, return_dict=False)[0]
+    else:
+      latents = vae.decode(latents, return_dict=False)[0]
     # convert to PIL image
     latents = (latents / 2 + 0.5).clamp(0, 1)
     
@@ -719,7 +790,14 @@ def run(model,
     prediction = (prediction / 2 + 0.5).clamp(0, 1)
 
     # concat the tensors along the W dimension
-    combined = torch.cat([latents, 
+    if latents_0 is not None:
+      combined = torch.cat([latents, 
+                          latents_0, 
+                          latents_1,
+                          x_0, 
+                          ], dim=3) 
+    else:
+      combined = torch.cat([latents, 
                           prediction, 
                           x_0, 
                           ], dim=3)
@@ -925,20 +1003,13 @@ def run(model,
 
   elif use_type == 'pix2pix_overlapping':
     images = []
+  
+    frame = Image.open("mona-lisa-1.jpg").resize((width, height))
     
-    # background_frames_path = Path("/mnt/newdrive/stable-diffusion-docker/output/dwpose")
-    background_frames_path = Path("/mnt/newdrive/stable-diffusion-docker/output/background_frames")
-    background_frames = glob.glob(os.path.join(background_frames_path, '*.png'))
-    background_frames = sorted(background_frames)
-    # get frame_count with a stride of 2
-    # background_frames = background_frames[::2]
-    background_frames = background_frames[:frame_count]
-    for frame_path in background_frames:
-       frame = Image.open(frame_path).resize((width, height))
-       images.append(frame)
+    images.append(frame)
 
-
-
+    # repeat the frame 16 times
+    images = images * frame_count
 
     video = pipeline(prompt=prompt, 
       negative_prompt=negative_prompt, 
@@ -1096,35 +1167,32 @@ def run(model,
 
     images = []
     
-    background_frames_path = Path("/mnt/newdrive/stable-diffusion-docker/output/source_frames")
+    frame = Image.open("mona-lisa-1.jpg").resize((width, height))
+    
+    images.append(frame)
+
+    images = []
+    
+    background_frames_path = Path("/mnt/newdrive/viddle-animatediff/output/1c0c0f1e-73b4-417a-91c0-aaa7356e0cf0")
     background_frames = glob.glob(os.path.join(background_frames_path, '*.png'))
     background_frames = sorted(background_frames)
     # get frame_count with a stride of 2
-    background_frames = background_frames[::2]
-    background_frames = background_frames[:frame_count]
+    # background_frames = background_frames[::8]
+    background_frames = background_frames[:frame_count//4]
+    background_frames = [element for item in background_frames for element in repeat(item, 4)]
     for frame_path in background_frames:
        frame = Image.open(frame_path).resize((width, height))
        images.append(frame)
 
-    # make a 
-    def f(x):
-      return 2.0 - 4*torch.exp(-1 / (1 - (x - 1) ** 2))
-
-    def sample_function(frame_count):
-        x_values = torch.linspace(0, 2, frame_count)
-        y_values = f(x_values)
-        return y_values
-
-
-    y_values_list = sample_function(frame_count).to(device=device, dtype=dtype)
-    print("y_values_list", y_values_list)
+    # repeat the frame 16 times
+    # images = images * frame_count
     video = pipeline(prompt=prompt,
             # negative_prompt=negative_prompt,
             num_inference_steps=num_inference_steps,
             guidance_scale=guidance_scale,
             image=images,
             video_length=frame_count,
-            image_guidance_scale=0.9,
+            image_guidance_scale=0.0,
             generator=generators,
             # image_guidance_scale=y_values_list,
               # width=width,
@@ -1139,6 +1207,75 @@ def run(model,
     tensors = [transform(img) for img in video]
 
 # Stack these tensors together
+    video = torch.stack(tensors, dim=0)
+    print("video", video.shape)
+
+    video = video.permute(1, 0, 2, 3)
+  elif use_type == 'frame_interpolator':
+  
+    images = []
+    
+    background_frames_path = Path("/mnt/newdrive/viddle-animatediff/output/1c0c0f1e-73b4-417a-91c0-aaa7356e0cf0")
+    background_frames = glob.glob(os.path.join(background_frames_path, '*.png'))
+    background_frames = sorted(background_frames)
+    # get frame_count with a stride of 2
+    # background_frames = background_frames[::8]
+    background_frames = background_frames[::4]
+    background_frames = [element for item in background_frames for element in repeat(item, 4)]
+    for frame_path in background_frames:
+       frame = Image.open(frame_path).resize((width, height))
+       images.append(frame)
+
+    video = pipeline(prompt=prompt,
+            num_inference_steps=num_inference_steps,
+            # guidance_scale=guidance_scale,
+            image=images,
+            video_length=frame_count,
+            generator=generators,
+            callback=callback,
+            
+              )[0]
+    # convert the list of PIL.Image images to a tensor
+
+    # Convert each PIL.Image to a numpy array
+    transform = ToTensor()
+    tensors = [transform(img) for img in video]
+
+    video = torch.stack(tensors, dim=0)
+    print("video", video.shape)
+
+    video = video.permute(1, 0, 2, 3)
+
+# Stack these tensors together
+
+  elif use_type == "static_pix2pix":
+    images = []
+    
+    frame = Image.open("mona-lisa-1.jpg").resize((width, height))
+    
+    images.append(frame)
+
+    # repeat the frame 16 times
+    images = images * frame_count
+    video = pipeline(prompt=prompt,
+            # negative_prompt=negative_prompt,
+            num_inference_steps=num_inference_steps,
+            guidance_scale=guidance_scale,
+            image=images,
+            image_guidance_scale=0.0,
+            generator=generators,
+            # image_guidance_scale=y_values_list,
+              # width=width,
+              # height=height,
+              # window_size=window_count,
+            
+              )[0]
+    # convert the list of PIL.Image images to a tensor
+
+    # Convert each PIL.Image to a numpy array
+    transform = ToTensor()
+    tensors = [transform(img) for img in video]
+
     video = torch.stack(tensors, dim=0)
     print("video", video.shape)
 
@@ -1233,7 +1370,7 @@ if __name__ == "__main__":
   # prompt = "Make synthwave retrowave vaporware style, outside night time city skyline"
   # prompt = "turn her into princess leia, side buns hairstyle"
   # prompt = "make her open her mouth"
-  prompt = "close up of a Girl swaying, red blouse, illustration by Wu guanzhong,China village,twojjbe trees in front of my chinese house,light orange, pink,white,blue ,8k"
+  # prompt = "close up of a Girl swaying, red blouse, illustration by Wu guanzhong,China village,twojjbe trees in front of my chinese house,light orange, pink,white,blue ,8k"
   # prompt = "paint by frazetta, man dancing, mountain blue sky in background"
   # prompt = "1man dancing outside, clear blue sky sunny day, photography, award winning, highly detailed, bright, well lit"
   # prompt = "Cute Chunky anthropomorphic Siamese cat dressed in rags walking down a rural road, mindblowing illustration by Jean-Baptiste Monge + Emily Carr + Tsubasa Nakai"
@@ -1248,8 +1385,8 @@ if __name__ == "__main__":
   # prompt = "girl posing outside a bar on a rainy day, black clothes, street, neon sign, movie production still, high quality, neo-noir"
   # prompt = "cowboy shot, cyberpunk jacket, camera following woman walking and smoking down street on rainy night, led sign"
   # prompt = "A lego ninja bending down to pick a flower in the style of the lego movie. High quality render by arnold. Animal logic. 3D soft focus"
-  prompt = "Glowing jellyfish, calm, slow hypnotic undulations, 35mm Nature photography, award winning"
-  # prompt = "synthwave retrowave vaporware back of a delorean driving on highway, dmc rear grill, neon lights, palm trees and sunset in background, clear, high definition, sharp"
+  # prompt = "Glowing jellyfish, calm, slow hypnotic undulations, 35mm Nature photography, award winning"
+  prompt = "synthwave retrowave vaporware back of a delorean driving on highway, dmc rear grill, neon lights, palm trees and sunset in background, clear, high definition, sharp"
   # prompt = "dog walking in the flower, in the style of geometric graffiti"
   # prompt = "a doodle of a bear dancing, scribble, messy, stickfigure, badly drawn"
   # prompt = "make a painting by patrick nagel, gorgeous woman"
@@ -1260,6 +1397,7 @@ if __name__ == "__main__":
   # prompt = "tom cruise statue made of ice dancing empty black background"
   # prompt = "watermeloncarving, Terra Cotta Warriors,full body dancing"
   # prompt = "A doll walking in the forest jan svankmajer, brother quay style stop action animation"
+  # prompt = "The mona lisa"
   # model = Path("../models/dreamshaper-6")
   # model = Path("../models/deliberate_v2")
   # lora_file="Frazetta.safetensors"
@@ -1275,32 +1413,33 @@ if __name__ == "__main__":
   # lora_file=None
   # lora_file
   # model = "/mnt/newdrive/automatic1111/models/Stable-diffusion/dreamshaper_6BakedVae.safetensors"
-  model = "/mnt/newdrive/automatic1111/models/Stable-diffusion/dreamshaper_8.safetensors"
+  # model = "/mnt/newdrive/automatic1111/models/Stable-diffusion/dreamshaper_8.safetensors"
   # model = "/mnt/newdrive/automatic1111/models/Stable-diffusion/epicrealism_pureEvolutionV5.safetensors"
   # model = "/mnt/newdrive/automatic1111/models/Stable-diffusion/instruct-pix2pix-00-22000.ckpt"
   # model = "/mnt/newdrive/automatic1111/models/Stable-diffusion/deliberate_v2.safetensors"
   # model = "/mnt/newdrive/automatic1111/models/Stable-diffusion/absolutereality_v181.safetensors"
   # model = "/mnt/newdrive/automatic1111/models/Stable-diffusion/neonskiesai_V10.safetensors"
   # model = "/mnt/newdrive/automatic1111/models/Stable-diffusion/synthwavepunk_v2.ckpt"
-  # model = "/mnt/newdrive/models/miniSD"
+  model = "/mnt/newdrive/models/miniSD"
   # model = "/mnt/newdrive/models/v1-5"
   # model = "/mnt/newdrive/viddle-animatediff/output_dreamshaper_8"
   run(model, 
       prompt=prompt,
-      negative_prompt="compression artifacts, blurry, worst quality, low quality, normal quality, jpeg artifacts, signature, watermark, username, blurry, made by children, caricature, ugly, boring, sketch, lacklustre, repetitive, cropped, (long neck), body horror, out of frame, mutilated, tiled, frame, border",
-      # negative_prompt="",
+      # negative_prompt="compression artifacts, blurry, worst quality, low quality, normal quality, jpeg artifacts, signature, watermark, username, blurry, made by children, caricature, ugly, boring, sketch, lacklustre, repetitive, cropped, (long neck), body horror, out of frame, mutilated, tiled, frame, border",
+      negative_prompt="",
       height=512,
       width=512,
       frame_count=16, # 288,
       window_count=16,
-      num_inference_steps=20,
+      num_inference_steps=25,
       guidance_scale=7.0,
       last_n=23,
       seed=42,
-      use_single_file=True,
-      dtype=torch.float16,
+      use_single_file=False,
+      dtype=torch.float32,
       lora_folder="/mnt/newdrive/automatic1111/models/Lora",
       lora_files=lora_files,
       debug_latents=False,
       # unet_override="/mnt/newdrive/viddle-animatediff/output_dreamshaper_8/checkpoint-10000")
+      unet_override="/mnt/newdrive/viddle-animatediff/output_8_channel/checkpoint-800/"
   )

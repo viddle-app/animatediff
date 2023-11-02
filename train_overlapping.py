@@ -948,11 +948,11 @@ def main(
             
             # fine_tuned_unet = torch.load("/mnt/newdrive/viddle-animatediff/outputs/training-2023-10-23T09-54-03/checkpoints/checkpoint-epoch-1.ckpt", map_location="cpu")
             # fine_tuned_unet = torch.load("/mnt/newdrive/viddle-animatediff/outputs/training-2023-10-11T11-46-02/checkpoints/checkpoint-epoch-1.ckpt", map_location="cpu")
-            fine_tuned_unet = torch.load("/mnt/newdrive/viddle-animatediff/outputs/training-2023-10-25T12-47-50/checkpoints/checkpoint-epoch-10.ckpt")
-            unet = UNet3DConditionModel.from_unet2d(fine_tuned_unet, unet_additional_kwargs=unet_additional_kwargs)
-            # unet = UNet3DConditionModel.from_pretrained_2d(pretrained_model_path, 
-            #                                          subfolder="unet",
-            #                                          unet_additional_kwargs=unet_additional_kwargs,)
+            # fine_tuned_unet = torch.load("/mnt/newdrive/viddle-animatediff/outputs/training-2023-10-25T12-47-50/checkpoints/checkpoint-epoch-1.ckpt")
+            # unet = UNet3DConditionModel.from_unet2d(fine_tuned_unet, unet_additional_kwargs=unet_additional_kwargs)
+            unet = UNet3DConditionModel.from_pretrained_2d(pretrained_model_path, 
+                                                     subfolder="unet",
+                                                     unet_additional_kwargs=unet_additional_kwargs,)
         
     # unet.set_attn_processor(XFormersAttnProcessor_Scaled())
     print(f"state_dict keys: {list(unet.config.keys())[:10]}")
@@ -986,6 +986,8 @@ def main(
         # motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/training-2023-10-20T16-12-28/checkpoints/checkpoint.ckpt"
         # motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/training-2023-10-21T15-05-53/checkpoints/checkpoint.ckpt"
         # motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/training-2023-10-26T05-53-31/checkpoints/checkpoint.ckpt"
+        # motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/training-2023-10-27T14-21-27/checkpoints/checkpoint-epoch-2.ckpt"
+        # motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/training-2023-10-28T01-33-45/checkpoints/checkpoint-epoch-9.ckpt"
 
         motion_module_state_dict = torch.load(motion_module_path, map_location="cpu")
         missing, unexpected = unet.load_state_dict(motion_module_state_dict, strict=False)
@@ -1206,7 +1208,7 @@ def main(
             # Convert videos to latent space            
             latents = batch["pixel_values"].to(local_rank)
             latents = rearrange(latents, "b f c h w -> b c f h w")
-            video_length = latents.shape[1]
+            video_length = latents.shape[2]
             print("video_length: ", video_length)
 
             print("latents.shape: ", latents.shape)
@@ -1373,10 +1375,13 @@ def main(
                 # loss = normality_loss + the_frame_diff_loss
                 if not image_finetune:
                     # pred = (noisy_latents - model_pred * sqrt_one_minus_alpha_prod ) / sqrt_alpha_prod 
-                    loss = (snr_scale.reshape(-1, 1, 1, 1, 1) * 
-                            video_diff_loss_6(model_pred_float, 
-                                              target_float, 
-                                              first_frame_weight=first_frame_weight)).mean()
+                    # loss = (snr_scale.reshape(-1, 1, 1, 1, 1) * 
+                    #        video_diff_loss_6(model_pred_float, 
+                    #                         target_float, 
+                    #                         first_frame_weight=first_frame_weight)).mean()
+                    loss = video_diff_loss_6(model_pred_float, 
+                                             target_float, 
+                                             first_frame_weight=first_frame_weight).mean()
                     # loss = snr_scale * reconstruction_loss
 
                 else:

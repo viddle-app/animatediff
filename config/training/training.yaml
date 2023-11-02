@@ -1,7 +1,7 @@
 image_finetune: false
 
 output_dir: "outputs"
-pretrained_model_path: "/mnt/newdrive/models/miniSD"
+pretrained_model_path: "/mnt/newdrive/models/v1-5"
 
 unet_additional_kwargs:
   in_channels: 4
@@ -10,6 +10,7 @@ unet_additional_kwargs:
   unet_use_cross_frame_attention : false
   unet_use_temporal_attention    : false
   motion_module_mid_block: true
+  use_inflated_groupnorm: true
 
   motion_module_type: Vanilla
   motion_module_kwargs:
@@ -24,7 +25,7 @@ unet_additional_kwargs:
 
 noise_scheduler_kwargs:
   beta_end: 0.012
-  beta_schedule: "scaled_linear"
+  beta_schedule: "linear"
   beta_start: 0.00085
   clip_sample: false
   clip_sample_range: 1.0
@@ -56,25 +57,25 @@ trainable_modules:
 unet_checkpoint_path: ""
 
 learning_rate:    9e-7
-train_batch_size: 4
+train_batch_size: 6
 gradient_checkpointing: True
 gradient_accumulation_steps: 4
 adam_weight_decay: 1.e-2
-lr_scheduler: "constant"
-lr_warmup_steps: 0
+lr_scheduler: "constant_with_warmup"
+lr_warmup_steps: 50
 scale_lr: true
 
-max_train_epoch:     4
-max_train_steps:      -1
+max_train_epoch:     -1
+max_train_steps:      4000
 checkpointing_epochs: -1
-checkpointing_steps:  250
+checkpointing_steps:  4000
 
-validation_steps:       400
+validation_steps:       500
 validation_steps_tuple: []
 
 global_seed: 42
 mixed_precision_training: true
-enable_xformers_memory_efficient_attention: False
+enable_xformers_memory_efficient_attention: true
 
 is_debug: False
 num_workers: 0

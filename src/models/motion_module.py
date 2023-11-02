@@ -346,7 +346,7 @@ class VersatileAttention(Attention):
         # numerator = math.log(sequence_length) / math.log(sequence_length//4)
         if not self.training:
             numerator = math.log(sequence_length) / math.log(sequence_length//4)
-            # numerator = 1
+            numerator = 1
             self.scale = math.sqrt(numerator / (self.inner_dim // self.heads))
 
 

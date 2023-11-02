@@ -34,15 +34,6 @@ from einops import rearrange
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
-def get_position_encodings(length, dim, device):
-    """Return sinusoidal position encodings."""
-    position = torch.arange(length, dtype=torch.float).unsqueeze(1).to(device)
-    div_term = torch.exp(torch.arange(0, dim, 2).float() * -(math.log(10000.0) / dim)).to(device)
-    position_encodings = torch.empty(length, dim).to(device)
-    position_encodings[:, 0::2] = torch.sin(position * div_term)
-    position_encodings[:, 1::2] = torch.cos(position * div_term)
-    return position_encodings
-
 # Copied from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion_img2img.preprocess
 def preprocess(image):
     deprecation_message = "The preprocess method is deprecated and will be removed in diffusers 1.0.0. Please use VaeImageProcessor.preprocess(...) instead"
@@ -274,20 +265,8 @@ class StableDiffusionFrameInterpolatorPipeline(DiffusionPipeline, TextualInversi
             batch_size = prompt_embeds.shape[0]
 
         device = self._execution_device
-        # here `guidance_scale` is defined analog to the guidance weight `w` of equation (2)
-        # of the Imagen paper: https://arxiv.org/pdf/2205.11487.pdf . `guidance_scale = 1`
-        # corresponds to doing no classifier free guidance.
-        if isinstance(image_guidance_scale, torch.Tensor):
-            # if any of the image_guidance_scale values is greater than 1, we do classifier free guidance
-            has_high_image_guidance = (image_guidance_scale >= 1.0).any()
-        else:
-            has_high_image_guidance = image_guidance_scale >= 1.0
-        do_classifier_free_guidance = guidance_scale > 1.0 and has_high_image_guidance
 
-        if isinstance(image_guidance_scale, torch.Tensor) and do_classifier_free_guidance:
-            image_guidance_scale = image_guidance_scale.reshape(1, 1, -1, 1, 1)
-
-        do_classifier_free_guidance = True
+        do_classifier_free_guidance = False # guidance_scale > 1.0
 
         # check if scheduler is in sigmas space
         scheduler_is_in_sigma_space = hasattr(self.scheduler, "sigmas")
@@ -384,12 +363,19 @@ class StableDiffusionFrameInterpolatorPipeline(DiffusionPipeline, TextualInversi
 
  
                 if do_classifier_free_guidance:
-                      noise_pred_text, noise_pred_image, noise_pred_uncond = noise_pred.chunk(3)
-                      noise_pred = (
-                          noise_pred_uncond
-                          + guidance_scale * (noise_pred_text - noise_pred_image)
-                          # + image_guidance_scale * (noise_pred_image - noise_pred_uncond)
-                      )
+                    #  noise_pred_text, noise_pred_image, noise_pred_uncond = noise_pred.chunk(3)
+                    #  noise_pred = (
+                    #      noise_pred_uncond
+                    #      + guidance_scale * (noise_pred_text - noise_pred_image)
+                    #      # + image_guidance_scale * (noise_pred_image - noise_pred_uncond)
+                    #  )
+
+                    noise_pred_text, noise_pred_image, noise_pred_uncond = noise_pred.chunk(3)
+                    noise_pred = (
+                        noise_pred_uncond
+                        + guidance_scale * (noise_pred_text - noise_pred_image)
+                        + 0 * (noise_pred_image - noise_pred_uncond)
+                    )
 
                 # Hack:
                 # For karras style schedulers the model does classifer free guidance using the
@@ -407,7 +393,7 @@ class StableDiffusionFrameInterpolatorPipeline(DiffusionPipeline, TextualInversi
                 if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
                     progress_bar.update()
                     if callback is not None and i % callback_steps == 0:
-                        callback(i, t, latents)
+                        callback(i, t, latents, noise_pred)
 
         latents = rearrange(latents, "b c f h w -> (b f) c h w")
 
@@ -728,7 +714,7 @@ class StableDiffusionFrameInterpolatorPipeline(DiffusionPipeline, TextualInversi
                 " that this behavior is deprecated and will be removed in a version 1.0.0. Please make sure to update"
                 " your script to pass as many initial images as text prompts to suppress this warning."
             )
-            # deprecate("len(prompt) != len(image)", "1.0.0", deprecation_message, standard_warn=False)  # Assuming deprecate is a custom function.
+            deprecate("len(prompt) != len(image)", "1.0.0", deprecation_message, standard_warn=False)  # Assuming deprecate is a custom function.
             additional_image_per_prompt = effective_batch_size // image_latents.shape[0]
             image_latents = torch.cat([image_latents] * additional_image_per_prompt, dim=0)
         elif effective_batch_size > image_latents.shape[0] and effective_batch_size % image_latents.shape[0] != 0:
@@ -736,9 +722,7 @@ class StableDiffusionFrameInterpolatorPipeline(DiffusionPipeline, TextualInversi
                 f"Cannot duplicate `image` of batch size {image_latents.shape[0]} to {effective_batch_size} text prompts."
             )
 
-        # Add position encodings to image_latents
-        pos_encodings = get_position_encodings(video_length, image_latents.shape[1], device)
-        image_latents = image_latents + pos_encodings.unsqueeze(0)
+
 
         image_latents = image_latents.unsqueeze(0).permute(0, 2, 1, 3, 4)
         print("image latents shape", image_latents.shape)
