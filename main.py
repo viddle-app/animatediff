@@ -13,7 +13,7 @@ from einops import rearrange
 from itertools import repeat
 
 use_ufree = False
-use_type = 'frame_interpolator'
+use_type = 'regular'
 if use_type == 'overlapping':
   from src.pipelines.pipeline_animatediff_overlapping import AnimationPipeline
 elif use_type == 'pix2pix_overlapping':
@@ -420,20 +420,28 @@ def run(model,
         seed=None,
         last_n=21,
         unet_override=None,
-        debug_latents=False,):
+        debug_latents=False,
+        unet_override_ckpt=None):
   scheduler_kwargs = {
    "num_train_timesteps": 1000,
    "beta_start": 0.00085,
    "beta_end": 0.012,
-   "beta_schedule": "linear",
+   "beta_schedule": "scaled_linear",
    # "clip_sample": False,
-   "steps_offset":        1,                                                                  
+   "steps_offset":        1,      
+   # "dynamic_thresholding_ratio": 0.995,  
+  "prediction_type": "epsilon",
+  # "sample_max_value": 1.0,
+  # "set_alpha_to_one": False,
+  "steps_offset": 1,
+  # "thresholding": False,
+  "trained_betas": None ,                                                           
   }
 
   device = "cuda" if torch.cuda.is_available() else "cpu"
 
   unet_additional_kwargs = {
-    "in_channels": 8,
+    "in_channels": 4,
     "unet_use_cross_frame_attention": False,
     "unet_use_temporal_attention": False,
     "use_motion_module": True,
@@ -441,7 +449,7 @@ def run(model,
     "motion_module_mid_block": True,
     "motion_module_decoder_only": False,
     "motion_module_type": "Vanilla",
-    "use_inflated_groupnorm": True,
+    "use_inflated_groupnorm": False,
     "motion_module_kwargs": {
         "num_attention_heads": 8,
         "num_transformer_block": 1,
@@ -494,6 +502,12 @@ def run(model,
         unet = UNet3DConditionModel.from_pretrained_2d(unet_override, 
                                                           subfolder="unet", 
                                                           unet_additional_kwargs=unet_additional_kwargs)
+    elif unet_override_ckpt is not None:
+      fine_tuned_unet = torch.load(unet_override_ckpt, map_location="cpu")
+      if use_type == 'static_pix2pix':
+        raise "not supported"
+      else:
+        unet = UNet3DConditionModel.from_unet2d(fine_tuned_unet, unet_additional_kwargs=unet_additional_kwargs)
 
     else:
       unet         = UNet3DConditionModel.from_pretrained_2d(model, 
@@ -582,7 +596,7 @@ def run(model,
           tokenizer=tokenizer, 
           unet=unet,
           # scheduler=HeunDiscreteScheduler(**scheduler_kwargs),
-          scheduler=scheduler,
+          scheduler=EulerAncestralDiscreteScheduler(**scheduler_kwargs),
           # scheduler=UniPCMultistepScheduler(**scheduler_kwargs),
         ).to(device)
 
@@ -711,7 +725,22 @@ def run(model,
   # motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/training-2023-10-30T00-06-44/checkpoints/checkpoint.ckpt"
   # motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/frame_interpolator_training-2023-10-30T09-29-54/checkpoints/checkpoint.ckpt"
   # motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/frame_interpolator_training-2023-10-30T14-09-21/checkpoints/checkpoint-epoch-4.ckpt"
-  motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/frame_interpolator_training-2023-10-31T15-05-11/checkpoints/checkpoint.ckpt"
+  # motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/frame_interpolator_training-2023-10-31T15-05-11/checkpoints/checkpoint.ckpt"
+  # motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/training-2023-11-02T14-02-42/checkpoints/checkpoint.ckpt"
+  # motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/training-2023-11-02T14-34-25/checkpoints/checkpoint.ckpt"
+  # motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/training-2023-11-02T15-37-18/checkpoints/checkpoint.ckpt"
+  # motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/training-2023-11-02T23-14-35/checkpoints/checkpoint.ckpt"
+  # motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/training-2023-11-02T23-30-06/checkpoints/checkpoint.ckpt"
+  # motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/training-2023-11-03T00-14-56/checkpoints/checkpoint.ckpt"
+  # motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/training-2023-11-03T10-38-54/checkpoints/checkpoint.ckpt"
+  # motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/training-2023-11-03T11-19-12/checkpoints/checkpoint-epoch-1.ckpt"
+  # motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/training-2023-11-03T15-18-54/checkpoints/checkpoint.ckpt"
+  # motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/training-2023-11-04T09-14-53/checkpoints/checkpoint.ckpt"
+  # motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/training-2023-11-04T09-03-06/checkpoints/checkpoint.ckpt"
+  # motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/training-2023-11-04T09-29-41/checkpoints/checkpoint.ckpt"
+  # motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/training-2023-11-04T09-44-23/checkpoints/checkpoint.ckpt"
+  # motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/training-2023-11-04T10-42-29/checkpoints/checkpoint.ckpt"
+  motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/training-2023-11-04T10-56-36/checkpoints/checkpoint.ckpt"
 
   if True:
     motion_module_state_dict = torch.load(motion_module_path, map_location="cpu")
@@ -1373,10 +1402,10 @@ if __name__ == "__main__":
   # prompt = "close up of a Girl swaying, red blouse, illustration by Wu guanzhong,China village,twojjbe trees in front of my chinese house,light orange, pink,white,blue ,8k"
   # prompt = "paint by frazetta, man dancing, mountain blue sky in background"
   # prompt = "1man dancing outside, clear blue sky sunny day, photography, award winning, highly detailed, bright, well lit"
-  # prompt = "Cute Chunky anthropomorphic Siamese cat dressed in rags walking down a rural road, mindblowing illustration by Jean-Baptiste Monge + Emily Carr + Tsubasa Nakai"
+  prompt = "Cute Chunky anthropomorphic Siamese cat dressed in rags walking down a rural road, mindblowing illustration by Jean-Baptiste Monge + Emily Carr + Tsubasa Nakai"
   # prompt = "close up of A man walking, movie production, cinematic, photography, designed by daniel arsham, glowing white, futuristic, white liquid, highly detailed, 35mm"
   # prompt = "closeup of A woman dancing in front of a secret garden, upper body headshot, early renaissance paintings, Rogier van der Weyden paintings style"
-  # prompt = "Close Up portrait of a woman turning in front of a lake artwork by Kawase Hasui"
+  # prompt = "Close Up portrait of a woman, turning in front of a lake artwork by Kawase Hasui"
   # prompt = "guy working at his computer"
   # prompt = "little boy plays with marbles"
   # prompt = "close up head shot of girl standing in a field of flowers, windy, long blonde hair in a blue dress smiling"
@@ -1386,7 +1415,7 @@ if __name__ == "__main__":
   # prompt = "cowboy shot, cyberpunk jacket, camera following woman walking and smoking down street on rainy night, led sign"
   # prompt = "A lego ninja bending down to pick a flower in the style of the lego movie. High quality render by arnold. Animal logic. 3D soft focus"
   # prompt = "Glowing jellyfish, calm, slow hypnotic undulations, 35mm Nature photography, award winning"
-  prompt = "synthwave retrowave vaporware back of a delorean driving on highway, dmc rear grill, neon lights, palm trees and sunset in background, clear, high definition, sharp"
+  # prompt = "synthwave retrowave vaporware back of a delorean driving on highway, dmc rear grill, neon lights, palm trees and sunset in background, clear, high definition, sharp"
   # prompt = "dog walking in the flower, in the style of geometric graffiti"
   # prompt = "a doodle of a bear dancing, scribble, messy, stickfigure, badly drawn"
   # prompt = "make a painting by patrick nagel, gorgeous woman"
@@ -1413,14 +1442,14 @@ if __name__ == "__main__":
   # lora_file=None
   # lora_file
   # model = "/mnt/newdrive/automatic1111/models/Stable-diffusion/dreamshaper_6BakedVae.safetensors"
-  # model = "/mnt/newdrive/automatic1111/models/Stable-diffusion/dreamshaper_8.safetensors"
+  model = "/mnt/newdrive/automatic1111/models/Stable-diffusion/dreamshaper_8.safetensors"
   # model = "/mnt/newdrive/automatic1111/models/Stable-diffusion/epicrealism_pureEvolutionV5.safetensors"
   # model = "/mnt/newdrive/automatic1111/models/Stable-diffusion/instruct-pix2pix-00-22000.ckpt"
   # model = "/mnt/newdrive/automatic1111/models/Stable-diffusion/deliberate_v2.safetensors"
   # model = "/mnt/newdrive/automatic1111/models/Stable-diffusion/absolutereality_v181.safetensors"
   # model = "/mnt/newdrive/automatic1111/models/Stable-diffusion/neonskiesai_V10.safetensors"
   # model = "/mnt/newdrive/automatic1111/models/Stable-diffusion/synthwavepunk_v2.ckpt"
-  model = "/mnt/newdrive/models/miniSD"
+  # model = "/mnt/newdrive/models/miniSD"
   # model = "/mnt/newdrive/models/v1-5"
   # model = "/mnt/newdrive/viddle-animatediff/output_dreamshaper_8"
   run(model, 
@@ -1431,15 +1460,19 @@ if __name__ == "__main__":
       width=512,
       frame_count=16, # 288,
       window_count=16,
-      num_inference_steps=25,
+      num_inference_steps=20,
       guidance_scale=7.0,
       last_n=23,
       seed=42,
-      use_single_file=False,
-      dtype=torch.float32,
+      use_single_file=True,
+      dtype=torch.float16,
       lora_folder="/mnt/newdrive/automatic1111/models/Lora",
       lora_files=lora_files,
       debug_latents=False,
+      # unet_override_ckpt="/mnt/newdrive/viddle-animatediff/outputs/training-2023-11-02T12-52-22/checkpoints/checkpoint-epoch-1.ckpt",
+      # unet_override_ckpt="/mnt/newdrive/viddle-animatediff/outputs/training-2023-11-02T11-46-27/checkpoints/checkpoint-epoch-1.ckpt"
+      # unet_override_ckpt="/mnt/newdrive/viddle-animatediff/outputs/training-2023-11-02T11-28-24/checkpoints/checkpoint-epoch-1.ckpt"
       # unet_override="/mnt/newdrive/viddle-animatediff/output_dreamshaper_8/checkpoint-10000")
-      unet_override="/mnt/newdrive/viddle-animatediff/output_8_channel/checkpoint-800/"
+      # unet_override="/mnt/newdrive/viddle-animatediff/output_8_channel/checkpoint-800/"
+      # unet_override="/mnt/newdrive/viddle-animatediff/output_minisd_2/checkpoint-200/",
   )

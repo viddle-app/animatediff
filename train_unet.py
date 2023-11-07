@@ -205,9 +205,10 @@ def log_validation(noise_scheduler,
     #                         # predict the noise
     #     model_pred = unet(noisy_latents, the_timestep, encoder_hidden_states).sample
 
-    def callback(step, timestep, latents, prediction):
+    def callback(step, timestep, latents, prediction, x_0):
         # save the latents and compute the x_o and save that too
-        x_0 = compute_x_0(noise_scheduler, timestep, latents, prediction)
+        if x_0 is None:
+            x_0 = compute_x_0(noise_scheduler, timestep, latents, prediction)
 
         x_0 = 1 / vae.config.scaling_factor * x_0
         x_0 = vae.decode(x_0, return_dict=False)[0]
@@ -1069,9 +1070,7 @@ def main():
                 # Predict the noise residual and compute loss
                 model_pred = unet(noisy_latents, timesteps, encoder_hidden_states).sample
 
-                if args.snr_gamma is None:
-                    loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
-                else:
+                if args.snr_gamma is not None:
                     # Compute loss-weights as per Section 3.4 of https://arxiv.org/abs/2303.09556.
                     # Since we predict the noise instead of x_0, the original formulation is slightly changed.
                     # This is discussed in Section 4.2 of the same paper.
@@ -1086,6 +1085,14 @@ def main():
                     loss = F.mse_loss(model_pred.float(), target.float(), reduction="none")
                     loss = loss.mean(dim=list(range(1, len(loss.shape)))) * mse_loss_weights
                     loss = loss.mean()
+
+                elif args.snr_scaling:
+                    snr = compute_snr(noise_scheduler, timesteps)
+                    snr_scale = 1/torch.sqrt(snr)
+                    loss = (snr_scale.reshape(-1, 1, 1, 1, 1) * (model_pred.float() - target.float())**2).mean()
+
+                else:
+                    loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
 
                 # Gather the losses across all processes for logging (if we use distributed training).
                 avg_loss = accelerator.gather(loss.repeat(args.train_batch_size)).mean()

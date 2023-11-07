@@ -1,12 +1,14 @@
 # Adapted from https://github.com/huggingface/diffusers/blob/main/src/diffusers/models/unet_2d_blocks.py
 
+import sys
 from typing import Any, Dict, Optional
 import torch
 from torch import nn
 
 from .attention import Transformer3DModel
 from .resnet import Downsample3D, ResnetBlock3D, Upsample3D
-from .motion_module import get_motion_module
+# from .motion_module import get_motion_module
+from .motion_module_sigma_reparam import get_motion_module
 # from .motion_module_offset import get_motion_module
 # from .motion_module_previous_window import get_motion_module
 from torch.fft import fft
@@ -141,9 +143,7 @@ def get_up_block(
             resnet_act_fn=resnet_act_fn,
             resnet_groups=resnet_groups,
             resnet_time_scale_shift=resnet_time_scale_shift,
-
             use_inflated_groupnorm=use_inflated_groupnorm,
-
             use_motion_module=use_motion_module,
             motion_module_type=motion_module_type,
             motion_module_kwargs=motion_module_kwargs,
@@ -279,6 +279,44 @@ class UNetMidBlock3DCrossAttn(nn.Module):
         self.attentions = nn.ModuleList(attentions)
         self.resnets = nn.ModuleList(resnets)
         self.motion_modules = nn.ModuleList(motion_modules)
+
+    def set_save_attention_entropy(self, save_attention_entropy):
+        print("set_save_attention_entropy in midblock")
+        for m in self.motion_modules:
+            if m is not None:
+                if hasattr(m, 'set_save_attention_entropy'):
+                    print("set_save_attention_entropy in midblock motion module")
+                    m.set_save_attention_entropy(save_attention_entropy)
+    
+    def clear_attention_entropy(self):
+        for m in self.motion_modules:
+            if m is not None:
+                if hasattr(m, 'clear_attention_entropy'):
+                    m.clear_attention_entropy()
+
+    def get_attention_entropy(self):
+        entropies = []
+        min_attention_entropy = sys.float_info.max
+        max_attention_entropy = sys.float_info.min
+        for m in self.motion_modules:
+            if m is not None:
+                if hasattr(m, 'get_attention_entropy'):
+                    the_avg, the_min, the_max = m.get_attention_entropy()
+                    entropies.append(the_avg)
+                    min_attention_entropy = min(min_attention_entropy, the_min)
+                    max_attention_entropy = max(max_attention_entropy, the_max)
+        
+        return entropies, min_attention_entropy, max_attention_entropy
+    
+    def get_entropies(self):
+        all_entropies = []
+
+        for m in self.motion_modules:
+            if m is not None:
+                if hasattr(m, 'get_attention_entropy'):
+                    all_entropies += m.get_entropies()
+        
+        return all_entropies
 
     def clear_last_encoder_hidden_states(self):
         for m in self.motion_modules:
@@ -427,6 +465,42 @@ class CrossAttnDownBlock3D(nn.Module):
 
         self.gradient_checkpointing = False
     
+    def set_save_attention_entropy(self, save_attention_entropy):
+        for m in self.motion_modules:
+            if m is not None:
+                if hasattr(m, 'set_save_attention_entropy'):
+                    m.set_save_attention_entropy(save_attention_entropy)
+
+    def clear_attention_entropy(self):
+        for m in self.motion_modules:
+            if m is not None:
+                if hasattr(m, 'clear_attention_entropy'):
+                    m.clear_attention_entropy()
+
+    def get_attention_entropy(self):
+        entropies = []
+        min_attention_entropy = sys.float_info.max
+        max_attention_entropy = sys.float_info.min
+        for m in self.motion_modules:
+            if m is not None:
+                if hasattr(m, 'get_attention_entropy'):
+                    the_avg, the_min, the_max = m.get_attention_entropy()
+                    entropies.append(the_avg)
+                    min_attention_entropy = min(the_min, min_attention_entropy)
+                    max_attention_entropy = max(the_max, max_attention_entropy)
+        
+        return entropies, min_attention_entropy, max_attention_entropy
+
+    def get_entropies(self):
+        all_entropies = []
+
+        for m in self.motion_modules:
+            if m is not None:
+                if hasattr(m, 'get_attention_entropy'):
+                    all_entropies += m.get_entropies()
+
+        return all_entropies
+
     def clear_last_encoder_hidden_states(self):
         for m in self.motion_modules:
             if m is not None:
@@ -578,6 +652,42 @@ class DownBlock3D(nn.Module):
             self.downsamplers = None
 
         self.gradient_checkpointing = False
+    
+    def set_save_attention_entropy(self, save_attention_entropy):
+        for m in self.motion_modules:
+            if m is not None:
+                if hasattr(m, 'set_save_attention_entropy'):
+                    m.set_save_attention_entropy(save_attention_entropy)
+    
+    def clear_attention_entropy(self):
+        for m in self.motion_modules:
+            if m is not None:
+                if hasattr(m, 'clear_attention_entropy'):
+                    m.clear_attention_entropy()
+
+    def get_attention_entropy(self):
+        entropies = []
+        min_attention_entropy = sys.float_info.max
+        max_attention_entropy = sys.float_info.min
+        for m in self.motion_modules:
+            if m is not None:
+                if hasattr(m, 'get_attention_entropy'):
+                    the_avg, the_min, the_max = m.get_attention_entropy()
+                    entropies.append(the_avg)
+                    min_attention_entropy = min(the_min, min_attention_entropy)
+                    max_attention_entropy = max(the_max, max_attention_entropy)
+        
+        return entropies, min_attention_entropy, max_attention_entropy
+
+    def get_entropies(self):
+        all_entropies = []
+
+        for m in self.motion_modules:
+            if m is not None:
+                if hasattr(m, 'get_attention_entropy'):
+                    all_entropies += m.get_entropies()
+
+        return all_entropies
 
     def clear_last_encoder_hidden_states(self):
         for m in self.motion_modules:
@@ -731,6 +841,43 @@ class CrossAttnUpBlock3D(nn.Module):
 
         self.gradient_checkpointing = False
 
+    def set_save_attention_entropy(self, save_attention_entropy):
+        for m in self.motion_modules:
+            if m is not None:
+                if hasattr(m, 'set_save_attention_entropy'):
+                    m.set_save_attention_entropy(save_attention_entropy)
+
+    def clear_attention_entropy(self):
+        for m in self.motion_modules:
+            if m is not None:
+                if hasattr(m, 'clear_attention_entropy'):
+                    m.clear_attention_entropy()
+
+    def get_entropies(self):
+        all_entropies = []
+
+        for m in self.motion_modules:
+            if m is not None:
+                if hasattr(m, 'get_attention_entropy'):
+                    all_entropies += m.get_entropies()
+
+        return all_entropies
+
+    def get_attention_entropy(self):
+        entropies = []
+        min_attention_entropy = sys.float_info.max
+        max_attention_entropy = sys.float_info.min
+        for m in self.motion_modules:
+            if m is not None:
+                if hasattr(m, 'get_attention_entropy'):
+                    the_avg, the_min, the_max = m.get_attention_entropy()
+                    entropies.append(the_avg)
+                    min_attention_entropy = min(the_min, min_attention_entropy)
+                    max_attention_entropy = max(the_max, max_attention_entropy)
+
+        
+        return entropies, min_attention_entropy, max_attention_entropy
+
     def clear_last_encoder_hidden_states(self):
         for m in self.motion_modules:
             if m is not None:
@@ -866,6 +1013,42 @@ class UpBlock3D(nn.Module):
             self.upsamplers = None
 
         self.gradient_checkpointing = False
+
+    def set_save_attention_entropy(self, save_attention_entropy):
+        for m in self.motion_modules:
+            if m is not None:
+                if hasattr(m, 'set_save_attention_entropy'):
+                    m.set_save_attention_entropy(save_attention_entropy)
+    
+    def clear_attention_entropy(self):
+        for m in self.motion_modules:
+            if m is not None:
+                if hasattr(m, 'clear_attention_entropy'):
+                    m.clear_attention_entropy()
+
+    def get_entropies(self):
+        all_entropies = []
+
+        for m in self.motion_modules:
+            if m is not None:
+                if hasattr(m, 'get_attention_entropy'):
+                    all_entropies += m.get_entropies()
+
+        return all_entropies
+
+    def get_attention_entropy(self):
+        entropies = []
+        min_attention_entropy = sys.float_info.max
+        max_attention_entropy = sys.float_info.min
+        for m in self.motion_modules:
+            if m is not None:
+                if hasattr(m, 'get_attention_entropy'):
+                    the_avg, the_min, the_max = m.get_attention_entropy()
+                    entropies.append(the_avg)
+                    min_attention_entropy = min(the_min, min_attention_entropy)
+                    max_attention_entropy = max(the_max, max_attention_entropy)
+        
+        return entropies, min_attention_entropy, max_attention_entropy
 
     def clear_last_encoder_hidden_states(self):
         for m in self.motion_modules:

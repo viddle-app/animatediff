@@ -87,6 +87,15 @@ class VanillaTemporalModule(nn.Module):
         output = hidden_states
         return output
 
+    def set_save_attention_entropy(self, save_attention_entropy):
+        self.temporal_transformer.set_save_attention_entropy(save_attention_entropy)
+
+    def clear_attention_entropy(self):
+        self.temporal_transformer.clear_attention_entropy()
+
+    def get_attention_entropy(self):
+        return self.temporal_transformer.get_attention_entropy()
+
 
 class TemporalTransformer3DModel(nn.Module):
     def __init__(
@@ -136,7 +145,21 @@ class TemporalTransformer3DModel(nn.Module):
             ]
         )
         self.proj_out = nn.Linear(inner_dim, in_channels)    
-    
+
+    def set_save_attention_entropy(self, save_attention_entropy):
+        for block in self.transformer_blocks:
+            block.set_save_attention_entropy(save_attention_entropy)
+
+    def clear_attention_entropy(self):
+        for block in self.transformer_blocks:
+            block.clear_attention_entropy()
+
+    def get_attention_entropy(self):
+        attention_entropy = []
+        for block in self.transformer_blocks:
+            attention_entropy += block.get_attention_entropy()
+        return attention_entropy
+
     def forward(self, hidden_states, encoder_hidden_states=None, attention_mask=None):
         assert hidden_states.dim() == 5, f"Expected hidden_states to have ndim=5, but got ndim={hidden_states.dim()}."
         video_length = hidden_states.shape[2]
@@ -212,6 +235,19 @@ class TemporalTransformerBlock(nn.Module):
         self.ff = FeedForward(dim, dropout=dropout, activation_fn=activation_fn)
         self.ff_norm = nn.LayerNorm(dim)
 
+    def set_save_attention_entropy(self, save_attention_entropy):
+        for block in self.attention_blocks:
+            block.set_save_attention_entropy(save_attention_entropy)
+
+    def clear_attention_entropy(self):
+        for block in self.attention_blocks:
+            block.clear_attention_entropy()
+
+    def get_attention_entropy(self):
+        attention_entropy = []
+        for block in self.attention_blocks:
+            attention_entropy.append(block.get_attention_entropy())
+        return attention_entropy
 
     def forward(self, hidden_states, encoder_hidden_states=None, attention_mask=None, video_length=None):
         for attention_block, norm in zip(self.attention_blocks, self.norms):
@@ -255,11 +291,15 @@ class VersatileAttention(Attention):
             attention_mode                     = None,
             cross_frame_attention_mode         = None,
             temporal_position_encoding         = False,
-            temporal_position_encoding_max_len = 24,            
+            temporal_position_encoding_max_len = 24,
+            save_attention_entropy = False,            
             *args, **kwargs
         ):
         super().__init__(*args, **kwargs)
         assert attention_mode == "Temporal"
+
+        self.save_attention_entropy = save_attention_entropy
+        self.attention_entropy = None
 
         self.attention_mode = attention_mode
         self.is_cross_attention = kwargs["cross_attention_dim"] is not None
@@ -270,6 +310,14 @@ class VersatileAttention(Attention):
             max_len=temporal_position_encoding_max_len
         ) if (temporal_position_encoding and attention_mode == "Temporal") else None
 
+    def set_save_attention_entropy(self, save_attention_entropy):
+        self.save_attention_entropy = save_attention_entropy
+
+    def clear_attention_entropy(self):
+        self.attention_entropy = None
+    
+    def get_attention_entropy(self):
+        return self.attention_entropy
 
     def reshape_heads_to_batch_dim(self, tensor):
         batch_size, seq_len, dim = tensor.shape
@@ -281,6 +329,32 @@ class VersatileAttention(Attention):
 
     def extra_repr(self):
         return f"(Module Info) Attention_Mode: {self.attention_mode}, Is_Cross_Attention: {self.is_cross_attention}"
+
+    def compute_attention_entropy(self, attention_matrix, eps=6.10e-05):
+        if eps is None:
+            A_clamped = attention_matrix
+        else:
+            A_clamped = torch.clamp(attention_matrix, eps, 1.0)
+
+        # Compute the entropy for each row in each attention matrix
+        # The result will have shape (B, T)
+        entropies = -torch.sum(A_clamped * torch.log(A_clamped), dim=2)
+
+        # Compute the average entropy for each matrix in the batch
+        # The result will have shape (B,)
+        avg_entropies_per_matrix = torch.mean(entropies, dim=1)
+
+        # todo take the max and the min of the entropies
+
+        # Compute the average of all the average entropies across the batch
+        avg_entropy_across_batch = torch.mean(avg_entropies_per_matrix).item()
+
+    
+        return avg_entropy_across_batch
+
+        
+        
+        
 
     def forward(self, 
                 hidden_states, 
@@ -331,22 +405,12 @@ class VersatileAttention(Attention):
                 attention_mask = F.pad(attention_mask, (0, target_length), value=0.0)
                 attention_mask = attention_mask.repeat_interleave(self.heads, dim=0)
 
-        # attention, what we cannot get enough of
-        # if self._use_memory_efficient_attention_xformers:
-        #    hidden_states = self._memory_efficient_attention_xformers(query, key, value, attention_mask)
-        #    # Some versions of xformers return output in fp32, cast it back to the dtype of the input
-        #    hidden_states = hidden_states.to(query.dtype)
-        # else:
-        #    if self._slice_size is None or query.shape[0] // self._slice_size == 1:
-        #        hidden_states = self._attention(query, key, value, attention_mask)
-        #    else:
-        #        hidden_states = self._sliced_attention(query, key, value, sequence_length, dim, attention_mask)
 
         # update the scale to using
         # numerator = math.log(sequence_length) / math.log(sequence_length//4)
         if not self.training:
             numerator = math.log(sequence_length) / math.log(sequence_length//4)
-            numerator = 1
+            # numerator = 1
             self.scale = math.sqrt(numerator / (self.inner_dim // self.heads))
 
 
@@ -354,9 +418,18 @@ class VersatileAttention(Attention):
             hidden_states = xformers.ops.memory_efficient_attention(
                 query, key, value, attn_bias=attention_mask, op=None, scale=self.scale
             )
+
+            if self.save_attention_entropy:
+                attention_probs = self.get_attention_scores(query, key, attention_mask)
+                self.attention_entropy = self.compute_attention_entropy(attention_probs)
+
             hidden_states = hidden_states.to(query.dtype)
         else:
             attention_probs = self.get_attention_scores(query, key, attention_mask)
+
+            if self.save_attention_entropy:
+                self.attention_entropy = self.compute_attention_entropy(attention_probs)
+
             hidden_states = torch.bmm(attention_probs, value)
         
         hidden_states = self.batch_to_head_dim(hidden_states)

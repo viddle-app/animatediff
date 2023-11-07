@@ -13,6 +13,8 @@ from diffusers.models.modeling_utils import ModelMixin
 from diffusers.utils import BaseOutput
 from diffusers.utils.import_utils import is_xformers_available
 from diffusers.models.attention import FeedForward
+import xformers
+import xformers.ops
 from diffusers.models.attention_processor import (
     AttnProcessor2_0,
     AttnProcessor,
@@ -38,6 +40,7 @@ from diffusers.utils import (USE_PEFT_BACKEND,)
 
 from einops import rearrange, repeat
 import math
+import sys
 
 
 def zero_module(module):
@@ -72,8 +75,9 @@ def get_motion_module(
 class SigmaReparamLinear(nn.Module):
     """
     SigmaReparamLinear applies the sigmaReparam reparameterization to a standard linear layer.
+    Includes NaN checks to ensure numerical stability.
     """
-    def __init__(self, in_features, out_features):
+    def __init__(self, in_features, out_features, bias=True):
         super(SigmaReparamLinear, self).__init__()
         # Initialize the weight matrix and the learned spectral norm gamma
         self.W = nn.Parameter(torch.randn(out_features, in_features))
@@ -83,34 +87,77 @@ class SigmaReparamLinear(nn.Module):
         self.register_buffer('u', F.normalize(torch.randn(out_features), dim=0))
         self.register_buffer('v', F.normalize(torch.randn(in_features), dim=0))
 
+        # Epsilon for numerical stability
+        self.eps = 1e-12
+
+        if bias:
+            self.bias = nn.Parameter(torch.Tensor(out_features))
+        else:
+            self.register_parameter('bias', None)
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        nn.init.kaiming_uniform_(self.W, a=math.sqrt(5))
+        if self.bias is not None:
+            fan_in, _ = nn.init._calculate_fan_in_and_fan_out(self.W)
+            bound = 1 / math.sqrt(fan_in)
+            nn.init.uniform_(self.bias, -bound, bound)
+
+
     def power_iteration(self, num_iterations=1):
         """
         Perform power iteration to approximate the spectral norm of the weight matrix.
         Typically, one iteration is sufficient as the approximation improves over training.
+        Includes NaN checks for numerical stability.
         """
         with torch.no_grad():
             for _ in range(num_iterations):
                 # Update u and v
-                self.u = F.normalize(self.W.mv(self.v), dim=0)
-                self.v = F.normalize(self.W.t().mv(self.u), dim=0)
+                self.u = F.normalize(self.W.mv(self.v), dim=0, eps=self.eps)
+                self.v = F.normalize(self.W.t().mv(self.u), dim=0, eps=self.eps)
+
+                # Check for NaNs
+                # if torch.isnan(self.u).any() or torch.isnan(self.v).any():
+                #    raise ValueError('NaN detected in power iteration vectors u or v')
 
     def compute_weight_hat(self):
         """
         Compute the reparameterized weight matrix W_hat using the current u, v, and gamma.
+        Includes NaN checks for numerical stability.
         """
         sigma = torch.dot(self.u, self.W.mv(self.v))  # Spectral norm approximation
+
+        # Avoid division by zero or very small numbers
+        sigma = max(sigma, self.eps)
         W_hat = self.gamma / sigma * self.W  # Reparameterize the weight matrix
+
+        # Check for NaNs
+        # if torch.isnan(W_hat).any():
+        #    raise ValueError('NaN detected in reparameterized weight matrix W_hat')
+
         return W_hat
 
     def forward(self, x):
         """
         Define the forward pass through the reparameterized linear layer.
+        Includes NaN checks for numerical stability.
         """
         if self.training:
             self.power_iteration()  # Update u and v during training only
         W_hat = self.compute_weight_hat()  # Compute the reparameterized weight matrix
-        return F.linear(x, W_hat)  # Apply the reparameterized linear transformation
 
+        # Check for NaNs in input
+        # if torch.isnan(x).any():
+        #    raise ValueError('NaN detected in input to SigmaReparamLinear')
+
+        # Apply the reparameterized linear transformation
+        out = F.linear(x, W_hat, self.bias)
+
+        # Check for NaNs in output
+        # if torch.isnan(out).any():
+        #    raise ValueError('NaN detected in output of SigmaReparamLinear')
+
+        return out
 
 class VanillaTemporalModule(nn.Module):
     def __init__(
@@ -124,7 +171,7 @@ class VanillaTemporalModule(nn.Module):
         temporal_position_encoding_max_len = 24,
         temporal_attention_dim_div         = 1,
         zero_initialize                    = True,
-        upcast_attention                     = False,
+        upcast_attention                   = False,
     ):
         super().__init__()
         
@@ -149,6 +196,18 @@ class VanillaTemporalModule(nn.Module):
 
         output = hidden_states
         return output
+
+    def set_save_attention_entropy(self, save_attention_entropy):
+        self.temporal_transformer.set_save_attention_entropy(save_attention_entropy)
+
+    def clear_attention_entropy(self):
+        self.temporal_transformer.clear_attention_entropy()
+
+    def get_attention_entropy(self):
+        return self.temporal_transformer.get_attention_entropy()
+
+    def get_entropies(self):
+        return self.temporal_transformer.get_entropies()
 
 
 class TemporalTransformer3DModel(nn.Module):
@@ -176,7 +235,8 @@ class TemporalTransformer3DModel(nn.Module):
         inner_dim = num_attention_heads * attention_head_dim
 
         self.norm = torch.nn.GroupNorm(num_groups=norm_num_groups, num_channels=in_channels, eps=1e-6, affine=True)
-        self.proj_in = SigmaReparamLinear(in_channels, inner_dim)
+        # self.proj_in = SigmaReparamLinear(in_channels, inner_dim)
+        self.proj_in = nn.Linear(in_channels, inner_dim)
 
         self.transformer_blocks = nn.ModuleList(
             [
@@ -198,8 +258,37 @@ class TemporalTransformer3DModel(nn.Module):
                 for d in range(num_layers)
             ]
         )
+        # self.proj_out = SigmaReparamLinear(inner_dim, in_channels)    
         self.proj_out = nn.Linear(inner_dim, in_channels)    
-    
+
+    def set_save_attention_entropy(self, save_attention_entropy):
+        for block in self.transformer_blocks:
+            block.set_save_attention_entropy(save_attention_entropy)
+
+    def clear_attention_entropy(self):
+        for block in self.transformer_blocks:
+            block.clear_attention_entropy()
+
+    def get_attention_entropy(self):
+        attention_entropy = []
+        min_attention_entropy = sys.float_info.max
+        max_attention_entropy = sys.float_info.min
+
+        for block in self.transformer_blocks:
+            averages, min_attention, max_attention = block.get_attention_entropy()
+            attention_entropy += averages
+            min_attention_entropy = min(min_attention_entropy, min_attention)
+            max_attention_entropy = max(max_attention_entropy, max_attention)
+        return attention_entropy, min_attention_entropy, max_attention_entropy
+
+    def get_entropies(self):
+        all_entropies = []
+
+        for block in self.transformer_blocks:
+            all_entropies += block.get_entropies()
+
+        return all_entropies
+
     def forward(self, hidden_states, encoder_hidden_states=None, attention_mask=None):
         assert hidden_states.dim() == 5, f"Expected hidden_states to have ndim=5, but got ndim={hidden_states.dim()}."
         video_length = hidden_states.shape[2]
@@ -275,6 +364,30 @@ class TemporalTransformerBlock(nn.Module):
         self.ff = FeedForward(dim, dropout=dropout, activation_fn=activation_fn)
         self.ff_norm = nn.LayerNorm(dim)
 
+    def set_save_attention_entropy(self, save_attention_entropy):
+        for block in self.attention_blocks:
+            block.set_save_attention_entropy(save_attention_entropy)
+
+    def clear_attention_entropy(self):
+        for block in self.attention_blocks:
+            block.clear_attention_entropy()
+
+    def get_attention_entropy(self):
+        attention_entropy = []
+        attention_entropy_min = sys.float_info.max
+        attention_entropy_max = sys.float_info.min
+        for block in self.attention_blocks:
+            average, min_attention, max_attention = block.get_attention_entropy()
+            attention_entropy.append(average)
+            attention_entropy_min = min(attention_entropy_min, min_attention)
+            attention_entropy_max = max(attention_entropy_max, max_attention)
+        return attention_entropy, attention_entropy_min, attention_entropy_max
+
+    def get_entropies(self):
+        all_entropies = []
+        for block in self.attention_blocks:
+            all_entropies.append(block.get_entropies())
+        return all_entropies
 
     def forward(self, hidden_states, encoder_hidden_states=None, attention_mask=None, video_length=None):
         for attention_block, norm in zip(self.attention_blocks, self.norms):
@@ -308,8 +421,9 @@ class PositionalEncoding(nn.Module):
         self.register_buffer('pe', pe)
 
     def forward(self, x):
-        x = x + self.pe[:, 16:x.size(1) + 16]
+        x = x + self.pe[:, :x.size(1)]
         return self.dropout(x)
+
 
 class Attention(nn.Module):
     r"""
@@ -416,7 +530,8 @@ class Attention(nn.Module):
         if USE_PEFT_BACKEND:
             linear_cls = SigmaReparamLinear
         else:
-            linear_cls = LoRACompatibleLinear
+            # linear_cls = LoRACompatibleLinear
+            linear_cls = SigmaReparamLinear
 
         self.to_q = linear_cls(query_dim, self.inner_dim, bias=bias)
 
@@ -809,18 +924,29 @@ class Attention(nn.Module):
 
         return encoder_hidden_states
 
-
 class VersatileAttention(Attention):
     def __init__(
             self,
             attention_mode                     = None,
             cross_frame_attention_mode         = None,
             temporal_position_encoding         = False,
-            temporal_position_encoding_max_len = 24,            
+            temporal_position_encoding_max_len = 24,
+            save_attention_entropy = False,            
             *args, **kwargs
         ):
         super().__init__(*args, **kwargs)
         assert attention_mode == "Temporal"
+
+        self.save_attention_entropy = save_attention_entropy
+        self.attention_entropy = None
+        self.min_attention_entropy = None
+        self.max_attention_entropy = None
+
+        # TODO need to store entropy losses
+        # this is a tensor of per row average entropy - the max entropy
+        # squared
+        # then I collect all of these and take the mean assuming it is possible
+        self.entropies = None
 
         self.attention_mode = attention_mode
         self.is_cross_attention = kwargs["cross_attention_dim"] is not None
@@ -831,6 +957,19 @@ class VersatileAttention(Attention):
             max_len=temporal_position_encoding_max_len
         ) if (temporal_position_encoding and attention_mode == "Temporal") else None
 
+    def set_save_attention_entropy(self, save_attention_entropy):
+        self.save_attention_entropy = save_attention_entropy
+
+    def clear_attention_entropy(self):
+        self.attention_entropy = None
+        self.min_attention_entropy = None
+        self.max_attention_entropy = None
+    
+    def get_entropies(self):
+        return self.entropies
+
+    def get_attention_entropy(self):
+        return self.attention_entropy.item(), self.min_attention_entropy, self.max_attention_entropy
 
     def reshape_heads_to_batch_dim(self, tensor):
         batch_size, seq_len, dim = tensor.shape
@@ -842,6 +981,40 @@ class VersatileAttention(Attention):
 
     def extra_repr(self):
         return f"(Module Info) Attention_Mode: {self.attention_mode}, Is_Cross_Attention: {self.is_cross_attention}"
+
+    def compute_attention_entropy(self, attention_matrix, eps=6.10e-05, batch_size=None, 
+                                  ):
+        if eps is None:
+            A_clamped = attention_matrix
+        else:
+            A_clamped = torch.clamp(attention_matrix, eps, 1.0)
+
+        # Compute the entropy for each row in each attention matrix
+        # The result will have shape (B, T)
+        self.entropies = -torch.sum(A_clamped * torch.log(A_clamped), dim=2)
+
+        # Compute the average entropy for each matrix in the batch
+        # The result will have shape (B,)
+        avg_entropies_per_matrix = torch.mean(self.entropies, dim=1)
+
+        self.entropies = rearrange(self.entropies, 
+                                   "(b d) f -> b d f", 
+                                   b=batch_size)
+    
+
+        # todo take the max and the min of the entropies
+
+        # Compute the average of all the average entropies across the batch
+        avg_entropy_across_batch = torch.mean(avg_entropies_per_matrix)
+        min_entropy_across_batch = torch.min(avg_entropies_per_matrix).item()
+        max_entropy_across_batch = torch.max(avg_entropies_per_matrix).item()
+
+    
+        return avg_entropy_across_batch, min_entropy_across_batch, max_entropy_across_batch
+
+        
+        
+        
 
     def forward(self, 
                 hidden_states, 
@@ -892,9 +1065,37 @@ class VersatileAttention(Attention):
                 attention_mask = F.pad(attention_mask, (0, target_length), value=0.0)
                 attention_mask = attention_mask.repeat_interleave(self.heads, dim=0)
 
+
+        # update the scale to using
+        # numerator = math.log(sequence_length) / math.log(sequence_length//4)
+        if not self.training:
+            numerator = math.log(sequence_length) / math.log(sequence_length//4)
+            # numerator = 1
+            self.scale = math.sqrt(numerator / (self.inner_dim // self.heads))
+
+
+        if query.dtype == torch.float16:
+            hidden_states = xformers.ops.memory_efficient_attention(
+                query, key, value, attn_bias=attention_mask, op=None, scale=self.scale
+            )
+
+            if self.save_attention_entropy:
+                attention_probs = self.get_attention_scores(query, key, attention_mask)
+                self.attention_entropy = self.compute_attention_entropy(attention_probs)
+
+            hidden_states = hidden_states.to(query.dtype)
+        else:
+            attention_probs = self.get_attention_scores(query, key, attention_mask)
+
+            if self.save_attention_entropy:
+                avg, the_min, the_max = self.compute_attention_entropy(attention_probs,
+                                                   batch_size=batch_size // video_length)
+                self.attention_entropy = avg
+                self.min_attention_entropy = the_min
+                self.max_attention_entropy = the_max 
+
+            hidden_states = torch.bmm(attention_probs, value)
         
-        attention_probs = self.get_attention_scores(query, key, attention_mask)
-        hidden_states = torch.bmm(attention_probs, value)
         hidden_states = self.batch_to_head_dim(hidden_states)
         
         # linear proj

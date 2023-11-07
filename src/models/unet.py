@@ -1,6 +1,7 @@
 # Adapted from https://github.com/huggingface/diffusers/blob/main/src/diffusers/models/unet_2d_condition.py
 
 from dataclasses import dataclass
+import sys
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import os
@@ -27,6 +28,7 @@ from .unet_blocks import (
 )
 from .resnet import InflatedConv3d, InflatedGroupNorm
 from safetensors.torch import load_file
+import sys
 
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
@@ -252,6 +254,79 @@ class UNet3DConditionModel(ModelMixin, ConfigMixin):
             self.conv_norm_out = nn.GroupNorm(num_channels=block_out_channels[0], num_groups=norm_num_groups, eps=norm_eps)
         self.conv_act = nn.SiLU()
         self.conv_out = InflatedConv3d(block_out_channels[0], out_channels, kernel_size=3, padding=1)
+
+    def set_save_attention_entropy(self, save_attention_entropy):
+        for m in self.down_blocks:
+            if m is not None:
+                m.set_save_attention_entropy(save_attention_entropy)
+
+        if self.mid_block is not None:
+            self.mid_block.set_save_attention_entropy(save_attention_entropy)
+
+        for m in self.up_blocks:
+            if m is not None:
+                m.set_save_attention_entropy(save_attention_entropy)
+
+    def clear_attention_entropy(self):
+        for m in self.down_blocks:
+            if m is not None:
+                m.clear_attention_entropy()
+
+        if self.mid_block is not None:
+            self.mid_block.clear_attention_entropy()
+
+        for m in self.up_blocks:
+            if m is not None:
+                m.clear_attention_entropy()
+
+    def get_down_attention_entropy(self):
+        entropies = []
+        min_attention_entropy = []
+        max_attention_entropy = []
+        for m in self.down_blocks:
+            if m is not None:
+                the_avg, the_min, the_max = m.get_attention_entropy()
+                entropies.append(the_avg)
+                min_attention_entropy.append(the_min)
+                max_attention_entropy.append(the_max)
+
+        return entropies, min_attention_entropy, max_attention_entropy
+    
+    def get_mid_attention_entropy(self):
+        if self.mid_block is not None:
+            return self.mid_block.get_attention_entropy()
+        else:
+            return [], sys.float_info.max, sys.float_info.min
+        
+    def get_up_attention_entropy(self):
+        entropies = []
+        min_attention_entropy = []
+        max_attention_entropy = []
+        for m in self.up_blocks:
+            if m is not None:
+                the_avg, the_min, the_max = m.get_attention_entropy()
+                entropies.append(the_avg)
+                min_attention_entropy.append(the_min)
+                max_attention_entropy.append(the_max)
+
+        return entropies, min_attention_entropy, max_attention_entropy
+
+    def get_entropies(self):
+        all_entropies = []
+
+
+        for m in self.down_blocks:
+            if m is not None:
+                all_entropies += m.get_entropies()
+
+        if self.mid_block is not None:
+            all_entropies += self.mid_block.get_entropies()
+
+        for m in self.up_blocks:
+            if m is not None:
+                all_entropies += m.get_entropies()
+
+        return all_entropies
 
     def clear_last_encoder_hidden_states(self):
         # set clear_last_encoder_hidden_states

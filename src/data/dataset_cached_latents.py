@@ -16,6 +16,7 @@ class WebVid10M(Dataset):
             csv_path, video_folder,
             sample_size=256, sample_stride=4, sample_n_frames=16,
             is_image=False,
+            seed = 42,
         ):
         zero_rank_print(f"loading annotations from {csv_path} ...")
         with open(csv_path, 'r') as csvfile:
@@ -27,6 +28,8 @@ class WebVid10M(Dataset):
         self.sample_stride   = sample_stride
         self.sample_n_frames = sample_n_frames
         self.is_image        = is_image
+        self.seed = seed
+        self.generator = torch.Generator().manual_seed(self.seed)
         
         sample_size = tuple(sample_size) if not isinstance(sample_size, int) else (sample_size, sample_size)
     
@@ -39,7 +42,10 @@ class WebVid10M(Dataset):
             pixel_values = torch.load(latents_path, map_location='cpu').detach()        
         
         if self.is_image:
-            pixel_values = pixel_values[0]
+            frame_count = pixel_values.shape[0]
+            # select a random frame using the generator
+            frame_idx = torch.randint(frame_count, (1,), generator=self.generator).item()
+            pixel_values = pixel_values[frame_idx]
         else:
             if pixel_values.shape[0] != self.sample_n_frames:
                 raise "Wrong number of frames"

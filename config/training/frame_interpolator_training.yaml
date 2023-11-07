@@ -74,3 +74,4 @@ is_debug: False
 num_workers: 32
 
 cached_latents: false
+first_frame_weight: 1.0

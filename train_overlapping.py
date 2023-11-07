@@ -1,4 +1,5 @@
 # originally copied from: 
+from cgitb import enable
 import json
 import os
 import math
@@ -33,7 +34,7 @@ from torch.utils.data.distributed import DistributedSampler
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 import diffusers
-from diffusers import AutoencoderKL, DDIMScheduler, PNDMScheduler
+from diffusers import AutoencoderKL, DDIMScheduler, PNDMScheduler, DDPMScheduler
 from diffusers.models import UNet2DConditionModel
 from diffusers.pipelines import StableDiffusionPipeline
 from diffusers.optimization import get_scheduler
@@ -51,6 +52,7 @@ from transformers import Adafactor
 import torch.nn as nn
 from diffusers.models.attention_processor import Attention
 from typing import Callable, Optional, Union
+from safetensors.torch import load_file
 
 
 
@@ -245,13 +247,17 @@ def validate_prediction(data,
     # target_diff = diff_from_first_frame(target)[:, :, 1:]
     # model_pred_diff = diff_from_first_frame(model_pred)[:, :, 1:]
 
-    target_diff = diff_from_first_frame(target)
-    model_pred_diff = diff_from_first_frame(model_pred)
+    target_diff = frame_diff(target)
+    model_pred_diff = frame_diff(model_pred)
+
+    target_diff = torch.cat([target_diff[:, :, 0:1], target_diff], dim=2)
+    model_pred_diff = torch.cat([model_pred_diff[:, :, 0:1], model_pred_diff], dim=2)
     
     diff_error = (target_diff - model_pred_diff)
-    # multiple the first frame difference by the weight
     diff_error[:, :, 0] = diff_error[:, :, 0] * first_frame_weight
     diff_error = diff_error**2
+
+
 
 
 
@@ -260,7 +266,8 @@ def validate_prediction(data,
     # loss = 0.5 * reconstruction_loss + 0.5*(diff_loss + noisy_diff_loss)
     snr = compute_snr(noise_scheduler, torch.tensor([the_timestep]).to(noisy_latents.device))
     snr_scale = 1/torch.sqrt(snr)
-    loss = snr_scale * diff_loss
+    loss = diff_error.mean(dim=list(range(1, len(diff_error.shape)))) * snr_scale
+    loss = loss.mean()
     # TODO log the losses
     
     data[f"validation_reconstruction_loss_{the_timestep}"] = reconstruction_loss.item()
@@ -582,8 +589,11 @@ def video_diff_loss_5(original_video, generated_video, first_frame_weight=1.0):
     original_diff = diff_from_first_frame(original_video)[:, :, 1:]
     generated_diff = diff_from_first_frame(generated_video)[:, :, 1:]
 
+
+
     # take the difference between the two
     difference_difference = original_diff - generated_diff
+
 
     # take the mse loss
     return (difference_difference**2).mean()
@@ -606,6 +616,8 @@ def video_diff_loss_6(original_video, generated_video, first_frame_weight=1.0):
 
     # take the mse loss
     return (difference_difference**2)
+
+    # return F.mse_loss(original_diff, generated_diff, reduction="none")
 
 def compute_fft_and_update_state(input_tensor, state=None):
     # Step 1: Compute 1D FFT along the frequency dimension (F)
@@ -824,6 +836,13 @@ def compute_frequency_energies(input):
 
 slow_validation_steps = 100
 
+class StateDictWrapper:
+    def __init__(self, model):
+        self.model = model
+
+    def state_dict(self):
+        return self.model
+
 def main(
     image_finetune: bool,
     
@@ -875,6 +894,14 @@ def main(
     is_debug: bool = False,
     first_frame_weight = 1.0,
     progressive_noise = None,
+    use_sqrt_snr = False,
+    motion_module_path = None,
+    validation_timestep_image_step = 100,
+    cached_latents = True,
+    alternate_losses = False,
+    recon_losses = False,
+    use_adafactor = False,
+    log_attention_entropy = False,
 ):
     check_min_version("0.10.0.dev0")
 
@@ -924,7 +951,8 @@ def main(
 
     # Load scheduler, tokenizer and models.
     dtype = torch.float32
-    noise_scheduler = DDIMScheduler(**OmegaConf.to_container(noise_scheduler_kwargs))
+    # noise_scheduler = DDIMScheduler(**OmegaConf.to_container(noise_scheduler_kwargs))
+    noise_scheduler = DDPMScheduler.from_pretrained(pretrained_model_path, subfolder="scheduler")
     # noise_scheduler = PNDMScheduler(**OmegaConf.to_container(noise_scheduler_kwargs))
     noise_scheduler.set_timesteps(noise_scheduler.num_train_timesteps)
 
@@ -945,49 +973,42 @@ def main(
             print("loading 2d unet")
             unet = UNet2DConditionModel.from_pretrained(pretrained_model_path, subfolder="unet", torch_dtype=dtype)
         else:      
+            if unet_checkpoint_path is not None and unet_checkpoint_path != "":
+                # check if the extension is .safetensors
+                if unet_checkpoint_path.endswith(".safetensors"):
+                    fine_tuned_unet = load_file(unet_checkpoint_path)
+                    # wrap in an object so fine_tuned_unet is the state_dict property
+
+                    unet = UNet3DConditionModel.from_pretrained_2d(pretrained_model_path, 
+                                                   subfolder="unet",
+                                                   unet_additional_kwargs=unet_additional_kwargs,)
+                    
+                    missing, unexpected = unet.load_state_dict(fine_tuned_unet, strict=False)
+                    # print("unexpected", unexpected)
+                    assert len(unexpected) == 0
+                    print("missing", len(missing))
+                    
+                else:
+                    fine_tuned_unet = torch.load(unet_checkpoint_path, map_location="cpu")
             
-            # fine_tuned_unet = torch.load("/mnt/newdrive/viddle-animatediff/outputs/training-2023-10-23T09-54-03/checkpoints/checkpoint-epoch-1.ckpt", map_location="cpu")
-            # fine_tuned_unet = torch.load("/mnt/newdrive/viddle-animatediff/outputs/training-2023-10-11T11-46-02/checkpoints/checkpoint-epoch-1.ckpt", map_location="cpu")
-            # fine_tuned_unet = torch.load("/mnt/newdrive/viddle-animatediff/outputs/training-2023-10-25T12-47-50/checkpoints/checkpoint-epoch-1.ckpt")
-            # unet = UNet3DConditionModel.from_unet2d(fine_tuned_unet, unet_additional_kwargs=unet_additional_kwargs)
-            unet = UNet3DConditionModel.from_pretrained_2d(pretrained_model_path, 
-                                                     subfolder="unet",
-                                                     unet_additional_kwargs=unet_additional_kwargs,)
+                    unet = UNet3DConditionModel.from_unet2d(fine_tuned_unet, unet_additional_kwargs=unet_additional_kwargs)
+            else:
+                unet = UNet3DConditionModel.from_pretrained_2d(pretrained_model_path, 
+                                                   subfolder="unet",
+                                                   unet_additional_kwargs=unet_additional_kwargs,)
         
-    # unet.set_attn_processor(XFormersAttnProcessor_Scaled())
+
     print(f"state_dict keys: {list(unet.config.keys())[:10]}")
 
     # global_step = 0
     global_step = 0
 
-    if image_finetune == False:
+    if image_finetune == False and unet_additional_kwargs.motion_module_kwargs.zero_initialize == False:
         # motion_module_path = "motion-models/mm-Stabilized_high.pth"
         # motion_module_path = "models/mm-1000.pth"
         # motion_module_path = "models/motionModel_v03anime.ckpt"
         # motion_module_path = "models/mm_sd_v14.ckpt"
-        motion_module_path = "motion-models/mm_sd_v15_v2.ckpt"
-        # motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/training-2023-10-07T15-59-37/checkpoints/checkpoint.ckpt"
-        # motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/training-2023-09-28T19-12-07/checkpoints/checkpoint.ckpt"
-        # motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/training-2023-09-28T14-37-24/checkpoints/checkpoint.ckpt"
-        # motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/training-2023-09-28T15-46-14/checkpoints/checkpoint.ckpt"
-        # motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/training-2023-09-28T10-57-52/checkpoints/checkpoint.ckpt"
-        # motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/training-2023-09-28T11-39-21/checkpoints/checkpoint.ckpt"
-        # motion_module_path = "motion-models/temporal-attn-pe-5e-7-4-50000-steps.ckpt"
-        # motion_module_path = '../ComfyUI/custom_nodes/ComfyUI-AnimateDiff/models/animatediffMotion_v15.ckpt'
-        # motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/training-2023-10-05T18-29-30/checkpoints/checkpoint.ckpt"
-        # motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/training-2023-10-12T19-32-53/checkpoints/checkpoint.ckpt"
-        # motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/training-2023-10-13T03-04-19/checkpoints/checkpoint.ckpt"
-        # motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/training-2023-10-16T14-07-53/checkpoints/checkpoint.ckpt"
-        # motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/training-2023-10-17T11-22-06/checkpoints/checkpoint.ckpt"
-        # motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/training-2023-10-17T02-08-28/checkpoints/checkpoint.ckpt"
-        # otion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/training-2023-10-19T14-17-48/checkpoints/checkpoint.ckpt"
-        # motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/training-2023-10-18T06-58-55/checkpoints/checkpoint.ckpt"
-        # motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/training-2023-10-19T19-53-19/checkpoints/checkpoint.ckpt"
-        # motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/training-2023-10-20T16-12-28/checkpoints/checkpoint.ckpt"
-        # motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/training-2023-10-21T15-05-53/checkpoints/checkpoint.ckpt"
-        # motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/training-2023-10-26T05-53-31/checkpoints/checkpoint.ckpt"
-        # motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/training-2023-10-27T14-21-27/checkpoints/checkpoint-epoch-2.ckpt"
-        # motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/training-2023-10-28T01-33-45/checkpoints/checkpoint-epoch-9.ckpt"
+        # motion_module_path = "motion-models/mm_sd_v15_v2.ckpt"
 
         motion_module_state_dict = torch.load(motion_module_path, map_location="cpu")
         missing, unexpected = unet.load_state_dict(motion_module_state_dict, strict=False)
@@ -997,23 +1018,21 @@ def main(
         assert len(unexpected) == 0
         print("missing", len(missing))
 
-    # Load pretrained unet weights
-    if unet_checkpoint_path != "":
-        zero_rank_print(f"from checkpoint: {unet_checkpoint_path}")
-        unet_checkpoint_path = torch.load(unet_checkpoint_path, map_location="cpu")
-        if "global_step" in unet_checkpoint_path: zero_rank_print(f"global_step: {unet_checkpoint_path['global_step']}")
-        state_dict = unet_checkpoint_path["state_dict"] if "state_dict" in unet_checkpoint_path else unet_checkpoint_path
-        print(f"state_dict keys: {list(state_dict.keys())[:10]}")
-        state_dict = {key.replace('module.', '', 1): value for key, value in state_dict.items()}
-        m, u = unet.load_state_dict(state_dict, strict=False)
-        print(f"missing keys: {m[:10]}")
-        # zero_rank_print(f"missing keys: {len(m)}, unexpected keys: {len(u)}")
-        print(f"missing keys: {len(m)}, unexpected keys: {len(u)}")
-        assert len(u) == 0
+
+
         
     # Freeze vae and text_encoder
     vae.requires_grad_(False)
     text_encoder.requires_grad_(False)
+
+    down_params_default = []
+    down_params_gamma = []
+    up_params_default = []
+    up_params_gamma = []
+    mid_params_default = []
+    mid_params_gamma = []
+
+
 
     # Set unet trainable parameters
     if image_finetune:
@@ -1030,34 +1049,72 @@ def main(
                     print(name)
                     param.requires_grad = True
 
+                    if name.startswith('down_blocks'):
+                        if name.endswith('gamma'):
+                            down_params_gamma.append(param)
+                        else:
+                            down_params_default.append(param)
+                    elif name.startswith('up_blocks'):
+                        if name.endswith('gamma'):
+                            up_params_gamma.append(param)
+                        else:
+                            up_params_default.append(param)
+                    elif name.startswith('mid_block'):
+                        if name.endswith('gamma'):
+                            mid_params_gamma.append(param)
+                        else:
+                            mid_params_default.append(param)
+                    else: 
+                        raise Exception("unknown param group", name)
+    if scale_lr:
+        learning_rate = (learning_rate * gradient_accumulation_steps * train_batch_size * num_processes)
+
+        # Define learning rates for each main group
+    down_lr = learning_rate
+    up_lr = learning_rate * 1.0  # Example adjustment
+    mid_lr = learning_rate * 1.0  # Example adjustment
+
     trainable_params = list(filter(lambda p: p.requires_grad, unet.parameters()))
-    if True:
+    if not use_adafactor:
+        # optimizer = torch.optim.AdamW(
+        #     trainable_params,
+        #     lr=learning_rate,
+        #     betas=(adam_beta1, adam_beta2),
+        #     weight_decay=adam_weight_decay,
+        #     eps=adam_epsilon,
+        # )
+
         optimizer = torch.optim.AdamW(
-            trainable_params,
-            lr=learning_rate,
+            [
+                {'params': down_params_default, 'lr': down_lr},
+                {'params': down_params_gamma, 'lr': down_lr * 2},
+                {'params': up_params_default, 'lr': up_lr},
+                {'params': up_params_gamma, 'lr': up_lr * 2},
+                {'params': mid_params_default, 'lr': mid_lr},
+                {'params': mid_params_gamma, 'lr': mid_lr * 2},
+            ],
             betas=(adam_beta1, adam_beta2),
             weight_decay=adam_weight_decay,
             eps=adam_epsilon,
         )
-    elif False:
+    else:
         optimizer = Adafactor(
             trainable_params,
-            lr=learning_rate,  # Note: AdaFactor adjusts learning rates dynamically and doesn't require a fixed learning rate
             eps=(1e-30, 1e-3),  # Tuple of two eps values: regularizer term eps and factorization term eps
             clip_threshold=1.0,  # Gradient clipping threshold
             decay_rate=-0.8,  # Decay rate for the second moment. < 0 implies using the default AdaFactor schedule
             beta1=None,  # beta1 parameter: < 0 implies N/A
             weight_decay=0.0,  # Weight decay rate
             scale_parameter=True,  # Whether to scale the learning rate
-            relative_step=False,  # Whether to compute the learning rate relative to the step
-            warmup_init=False  # Whether to initialize the learning rate as 0 during warm-up
+            relative_step=True,  # Whether to compute the learning rate relative to the step
+            warmup_init=True  # Whether to initialize the learning rate as 0 during warm-up
         )
-    else: 
-        optimizer = torch.optim.SGD(
-            trainable_params,
-            lr=learning_rate,
-            weight_decay=adam_weight_decay,  # Optional: if you want to use weight decay
-        )
+    # else: 
+    #    optimizer = torch.optim.SGD(
+    #        trainable_params,
+    #        lr=learning_rate,
+    #        weight_decay=adam_weight_decay,  # Optional: if you want to use weight decay
+    #    )
 
     if is_main_process:
         zero_rank_print(f"trainable params number: {len(trainable_params)}")
@@ -1109,17 +1166,17 @@ def main(
         assert checkpointing_epochs != -1
         checkpointing_steps = checkpointing_epochs * len(train_dataloader)
 
-    if scale_lr:
-        learning_rate = (learning_rate * gradient_accumulation_steps * train_batch_size * num_processes)
+
 
     # Scheduler
-    lr_scheduler = get_scheduler(
-        lr_scheduler,
-        optimizer=optimizer,
-        num_warmup_steps=lr_warmup_steps * gradient_accumulation_steps,
-        num_training_steps=max_train_steps * gradient_accumulation_steps,
-        step_rules="0.01:5,0.02:5,0.04:5,0.08:5,0.1:50,0.2:50,0.4:50,0.8:50,1.0:40000,0.8:2000,0.6:2000,0.4:2000,0.3"
-    )
+    if not use_adafactor:
+        lr_scheduler = get_scheduler(
+            lr_scheduler,
+            optimizer=optimizer,
+            num_warmup_steps=lr_warmup_steps * gradient_accumulation_steps,
+            num_training_steps=max_train_steps * gradient_accumulation_steps,
+            step_rules="0.01:5,0.02:5,0.04:5,0.08:5,0.1:50,0.2:50,0.4:50,0.8:50,1.0:40000,0.8:2000,0.6:2000,0.4:2000,0.3"
+        )
 
     # Validation pipeline
     if not image_finetune:
@@ -1132,6 +1189,8 @@ def main(
             unet=unet, vae=vae, tokenizer=tokenizer, text_encoder=text_encoder, scheduler=noise_scheduler, safety_checker=None,
         )
     validation_pipeline.enable_vae_slicing()
+    # unet.set_attn_processor(XFormersAttnProcessor_Scaled())
+    # validation_pipeline.unet.set_attn_processor(XFormersAttnProcessor_Scaled())
 
     # DDP warpper
     unet.to(local_rank)
@@ -1177,6 +1236,9 @@ def main(
 
     stdDevAccum = RunningAverages()
 
+    if log_attention_entropy:
+        unet.set_save_attention_entropy(True)
+
     for epoch in range(first_epoch, num_train_epochs):
         train_dataloader.sampler.set_epoch(epoch)
         unet.train()
@@ -1189,6 +1251,9 @@ def main(
             # unet.clear_last_encoder_hidden_states()
             print(f"step: {step}")
 
+            if log_attention_entropy:
+                unet.clear_attention_entropy()
+
             if cfg_random_null_text:
                 batch['text'] = [name if random.random() > cfg_random_null_text_ratio else "" for name in batch['text']]
                 
@@ -1196,7 +1261,16 @@ def main(
             if epoch == first_epoch and step == 0:
                 pixel_values, texts = batch['pixel_values'].cpu(), batch['text']
                 if not image_finetune:
-                    pixel_values = rearrange(pixel_values, "b f c h w -> b c f h w")
+                    if cached_latents:
+                        frame_count = pixel_values.shape[1]
+                        pixel_values = rearrange(pixel_values, "b f c h w -> (b f) c h w").to(device=local_rank)
+                        # decode using the vae
+                        with torch.no_grad():
+                            pixel_values = pixel_values / 0.18125
+                            pixel_values = vae.decode(pixel_values, return_dict=False)[0]
+                            pixel_values = rearrange(pixel_values, "(b f) c h w -> b c f h w", f=frame_count).to(device="cpu", dtype=torch.float32)
+                    else: 
+                        pixel_values = rearrange(pixel_values, "b f c h w -> b c f h w")
                     for idx, (pixel_value, text) in enumerate(zip(pixel_values, texts)):
                         pixel_value = pixel_value[None, ...]
                         save_videos_grid(pixel_value, f"{output_dir}/sanity_check/{'-'.join(text.replace('/', '').split()[:10]) if not text == '' else f'{global_rank}-{idx}'}.gif", rescale=True)
@@ -1207,9 +1281,10 @@ def main(
 
             # Convert videos to latent space            
             latents = batch["pixel_values"].to(local_rank)
-            latents = rearrange(latents, "b f c h w -> b c f h w")
-            video_length = latents.shape[2]
-            print("video_length: ", video_length)
+            if not image_finetune:
+                latents = rearrange(latents, "b f c h w -> b c f h w")
+                video_length = latents.shape[2]
+                print("video_length: ", video_length)
 
             print("latents.shape: ", latents.shape)
 
@@ -1228,11 +1303,6 @@ def main(
             bsz = latents.shape[0]
 
             print("latents.shape", latents.shape)
-
-            # keeping things simple for now
-            # assert(bsz == 1)
-            
-            # set the number of inference steps
 
             # Sample a random timestep for each video
             # 
@@ -1279,81 +1349,7 @@ def main(
             # (this is the forward diffusion process)
             noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
 
-            # I think some amount of time I need to add more noise
-            # take a random int and mod it by 10
-            # if it's 0, then add more noise
-
-            # if step % 10 == 0:
-            #    noisy_latents = noisy_latents + 0.1 * torch.randn_like(noisy_latents)
-
-            def ddim_step(model_output: torch.FloatTensor,
-                         timestep: int,
-                         sample: torch.FloatTensor,
-                         prev_timestep: int):
-                eta = 0
-                alpha_prod_t = noise_scheduler.alphas_cumprod[timestep]
-                alpha_prod_t_prev = noise_scheduler.alphas_cumprod[prev_timestep] if prev_timestep >= 0 else self.final_alpha_cumprod
-
-                beta_prod_t = 1 - alpha_prod_t
-
-                # 3. compute predicted original sample from predicted noise also called
-                # "predicted x_0" of formula (12) from https://arxiv.org/pdf/2010.02502.pdf
-                
-                pred_original_sample = (sample - beta_prod_t ** (0.5) * model_output) / alpha_prod_t ** (0.5)
-                pred_epsilon = model_output
-          
-
-                # 4. Clip or threshold "predicted x_0"
-                if noise_scheduler.config.thresholding:
-                    pred_original_sample = noise_scheduler._threshold_sample(pred_original_sample)
-                elif noise_scheduler.config.clip_sample:
-                    pred_original_sample = pred_original_sample.clamp(
-                        -noise_scheduler.config.clip_sample_range, noise_scheduler.config.clip_sample_range
-                    )
-
-                # 5. compute variance: "sigma_t(η)" -> see formula (16)
-                # σ_t = sqrt((1 − α_t−1)/(1 − α_t)) * sqrt(1 − α_t/α_t−1)
-                variance = noise_scheduler._get_variance(timestep, prev_timestep)
-                std_dev_t = eta * variance ** (0.5)
-
-
-                # 6. compute "direction pointing to x_t" of formula (12) from https://arxiv.org/pdf/2010.02502.pdf
-                pred_sample_direction = (1 - alpha_prod_t_prev - std_dev_t**2) ** (0.5) * pred_epsilon
-
-                # 7. compute x_t without "random noise" of formula (12) from https://arxiv.org/pdf/2010.02502.pdf
-                return alpha_prod_t_prev ** (0.5) * pred_original_sample + pred_sample_direction
-            
-            
-
-            # update the lr of the optimizer. I'm assuming no gradient accumulation here
-            # lr = get_lr_6(the_timestep)
-
-            # print("lr: ", lr)
-
-            # for param_group in optimizer.param_groups:
-            #  param_group['lr'] = lr
-
-            # if the_timestep != 0 and video_length == 16:
-            #    continue
-            #elif the_timestep == 0 and video_length == 16 and step % 10 != 0:
-            #    continue
-
-        
-                # slice the latents and target to 16 frames
-            if not image_finetune:
-                noisy_latents = noisy_latents[:, :, :16]
-                target = target[:, :, :16]
-            
-            # print("target after mean: ", target.mean())
-            # print("target after std: ", target.std())
-
-                # clone the noisy_latents to have gradients
-
-            # Predict the noise residual and compute loss
-            # Mixed-precision training
-            # unet.clear_last_encoder_hidden_states()
-
-            # take diff power spectrum
+     
 
             with torch.cuda.amp.autocast(enabled=mixed_precision_training):
                 model_pred = unet(noisy_latents, timesteps, encoder_hidden_states).sample
@@ -1371,22 +1367,81 @@ def main(
                 snr = compute_snr(noise_scheduler, timesteps)
                 snr_scale = 1 / torch.sqrt(snr)
                 # the loss is the two losses dot producted
+                use_custom_weight = False
          
                 # loss = normality_loss + the_frame_diff_loss
                 if not image_finetune:
                     # pred = (noisy_latents - model_pred * sqrt_one_minus_alpha_prod ) / sqrt_alpha_prod 
-                    # loss = (snr_scale.reshape(-1, 1, 1, 1, 1) * 
-                    #        video_diff_loss_6(model_pred_float, 
-                    #                         target_float, 
-                    #                         first_frame_weight=first_frame_weight)).mean()
-                    loss = video_diff_loss_6(model_pred_float, 
+                    if use_sqrt_snr:
+                        print("snr_scale: ", snr_scale)
+                        mse_loss_weights = snr_scale
+                        
+                        if alternate_losses == True: 
+                            if global_step % 2 == 0:
+                                loss = video_diff_loss_6(model_pred_float, 
+                                                target_float, 
+                                                first_frame_weight=first_frame_weight)
+
+                            else: 
+                                print("recon loss")
+                                loss = F.mse_loss(model_pred_float, target_float, reduction="none")
+
+                        elif recon_losses: 
+                            loss = F.mse_loss(model_pred_float, target_float, reduction="none")
+                        else:     
+                            # TODO add a attention entropy regularization
+                            # compute the attention entropy
+
+                            entropy_regularization_strength = 1
+                            all_entropies = unet.get_entropies()
+                            # I need to concat the entropies
+                            total_entropy = torch.cat(all_entropies, dim=1)
+
+                            # I need to take the difference between the total_entropies and log(16)
+                            unscaled_entropy_loss = F.mse_loss(total_entropy, 
+                                                          torch.log(torch.tensor(video_length)).to(total_entropy.device), 
+                                                          reduction="none")
+
+                            entropy_loss = entropy_regularization_strength * unscaled_entropy_loss
+
+                            loss = video_diff_loss_6(model_pred_float, 
+                                                target_float, 
+                                                first_frame_weight=first_frame_weight) 
+                            
+                        
+                        timesteps_loss = loss.mean(dim=list(range(1, len(loss.shape)))) * mse_loss_weights
+                        timesteps_entropy_loss = entropy_loss.mean(dim=list(range(1, len(entropy_loss.shape)))) * mse_loss_weights
+                        entropy_loss = timesteps_entropy_loss.mean()
+                        loss = timesteps_loss.mean() + entropy_loss
+
+                    elif use_custom_weight:
+                        # make a tensor of weights from the timesteps
+                        normalized_timesteps = timesteps.float() / noise_scheduler.num_train_timesteps
+
+                        # where == 0 make it 0.0000000000001  and where == 1 make it 0.9999999999999
+                        normalized_timesteps = torch.where(normalized_timesteps == 0, 1e-27, normalized_timesteps)
+                        normalized_timesteps = torch.where(normalized_timesteps == 1, 1 - 1e-27, normalized_timesteps)
+
+                        weights = torch.e * torch.exp(-1 / (1 - normalized_timesteps**2))
+                        weights = (1 - weights) + 0.2
+                        print("weights: ", weights)
+                        loss = (weights.reshape(-1, 1, 1, 1, 1) * 
+                            video_diff_loss_6(model_pred_float, 
+                                             target_float, 
+                                             first_frame_weight=first_frame_weight)).mean()
+
+
+                    else:
+                        loss = video_diff_loss_6(model_pred_float, 
                                              target_float, 
                                              first_frame_weight=first_frame_weight).mean()
                     # loss = snr_scale * reconstruction_loss
 
                 else:
-                    the_loss = (model_pred - target) ** 2
-                    the_loss = snr_scale.reshape(-1, 1, 1, 1) * the_loss
+                    the_loss = (model_pred.float() - target.float()) ** 2
+                    if use_sqrt_snr:
+                        the_loss = snr_scale.reshape(-1, 1, 1, 1) * the_loss
+
                     loss = the_loss.mean()
                 
 
@@ -1415,7 +1470,7 @@ def main(
             else:
                 loss.backward()
 
-            if actual_step % gradient_accumulation_steps == gradient_accumulation_steps - 1:
+            if actual_step % gradient_accumulation_steps == 0:
                 # Backpropagate
                 if mixed_precision_training:
                     """ >>> gradient clipping >>> """
@@ -1451,7 +1506,7 @@ def main(
 
 
                 optimizer.zero_grad()
-                if learning_rate_reading_steps is None:
+                if learning_rate_reading_steps is None and not use_adafactor:
                     lr_scheduler.step()
                 progress_bar.update(1)
                 global_step += 1
@@ -1466,7 +1521,7 @@ def main(
                 wandb.log
 
                 data = {}
-                for the_timestep in timesteps:
+                for the_timestep, the_loss, the_entropy_loss in zip(timesteps, timesteps_loss, timesteps_entropy_loss):
 
                     if the_timestep < 100:
                         prefix = "0_99_"
@@ -1489,7 +1544,8 @@ def main(
                     elif the_timestep < 1000:
                         prefix = "900_999_"
 
-                    data[f"{prefix}train_loss"] = loss.item()
+                    data[f"{prefix}train_loss"] = the_loss
+                    data[f"{prefix}entropy_loss"] = the_entropy_loss
                     data[f"{prefix}reconstruction_loss"] = reconstruction_loss
                     data[f"{prefix}the_frame_diff_loss_noise"] = the_frame_diff_loss_noise
                     data[f"{prefix}mean_gradient"] = mean_grad
@@ -1498,6 +1554,7 @@ def main(
                 
                 data["loss"] = loss.item()
                 data["reconstruction_loss"] = reconstruction_loss
+                data["entropy_loss"] = entropy_loss
                 data["the_frame_diff_loss_noise"] = the_frame_diff_loss_noise
                 data["mean_gradient"] = mean_grad
                 data["variance_gradient"] = var_grad
@@ -1512,12 +1569,72 @@ def main(
 
                 # for each predicted_frequency_energy and target_frequency_energy
                 # add an entry to data
+                if log_attention_entropy:
+
+
+                    down_attention_entropy, down_the_min, down_the_max = unet.get_down_attention_entropy()
+                    i = 0
+                    for a, mn, mx in zip(down_attention_entropy, down_the_min, down_the_max):
+                        data[f"down_attention_entropy_{i}"] = wandb.Histogram(a)
+                        data[f"down_attention_entropy_min_{i}"] = mn
+                        data[f"down_attention_entropy_max_{i}"] = mx
+                        i += 1
+
+                    down_the_min = min(down_the_min)
+                    down_the_max = max(down_the_max)
+
+                    up_attention_entropy, up_the_min, up_the_max = unet.get_up_attention_entropy()
+                    i = 0
+                    for a, mn, mx in zip(up_attention_entropy, up_the_min, up_the_max):
+                        data[f"up_attention_entropy_{i}"] = wandb.Histogram(a)
+                        data[f"up_attention_entropy_min_{i}"] = mn
+                        data[f"up_attention_entropy_max_{i}"] = mx
+                        i += 1
+
+                    up_the_min = min(up_the_min)
+                    up_the_max = max(up_the_max)
+
+                    mid_attention_entropy, mid_the_min, mid_the_max = unet.get_mid_attention_entropy()
+
+                    down_attention_entropy_flat = [item for sublist in down_attention_entropy for item in sublist]
+                    down_attention_entropy_flat = [item for sublist in down_attention_entropy_flat for item in sublist]
+                    up_attention_entropy_flat = [item for sublist in up_attention_entropy for item in sublist]
+                    up_attention_entropy_flat = [item for sublist in up_attention_entropy_flat for item in sublist]
+                    mid_attention_entropy_flat = [item for sublist in mid_attention_entropy for item in sublist]
+
+                    attention_entropy = down_attention_entropy_flat + up_attention_entropy_flat + mid_attention_entropy_flat
+                    the_min = min(down_the_min, up_the_min, mid_the_min)
+                    the_max = max(down_the_max, up_the_max, mid_the_max)
+
+
+                    # create a histogram of the attention entropy
+                    try: 
+                        data["attention_entropy_histogram"] = wandb.Histogram(attention_entropy)
+                        data["down_attention_entropy_histogram"] = wandb.Histogram(down_attention_entropy_flat)
+                        data["up_attention_entropy_histogram"] = wandb.Histogram(up_attention_entropy_flat)
+                        data["mid_attention_entropy_histogram"] = wandb.Histogram(mid_attention_entropy_flat)
+                    except Exception as e:
+                        print(e)
+
+                    # take the average of the attention entropy
+                    data["attention_entropy"] = sum(attention_entropy) / len(attention_entropy)
+                    data["down_attention_entropy"] = sum(down_attention_entropy_flat) / len(down_attention_entropy_flat)
+                    data["up_attention_entropy"] = sum(up_attention_entropy_flat) / len(up_attention_entropy_flat)
+                    data["mid_attention_entropy"] = sum(mid_attention_entropy_flat) / len(mid_attention_entropy_flat)
+                    data["attention_entropy_min"] = the_min
+                    data["attention_entropy_max"] = the_max
+                    data["down_attention_entropy_min"] = down_the_min
+                    data["down_attention_entropy_max"] = down_the_max
+                    data["up_attention_entropy_min"] = up_the_min
+                    data["up_attention_entropy_max"] = up_the_max
+                    data["mid_attention_entropy_min"] = mid_the_min
+                    data["mid_attention_entropy_max"] = mid_the_max
 
     
                 csv_path = f"{output_dir}/stats.csv"
                 append_loss_to_csv(actual_step, loss.item(), csv_path)
 
-                if not image_finetune:
+                if not image_finetune and global_step % 10 == 0:
                     # load mp4 from data/validation_videos/000352b9-5884-4f82-8153-7ef794979ee5.mp4
                     video_length = 16
                     pixel_values = load_video_as_tensor("data/validation_videos/000352b9-5884-4f82-8153-7ef794979ee5.mp4",
@@ -1596,7 +1713,7 @@ def main(
                                 target=target,
                                 key=key,
                                 actual_step=actual_step,
-                                save_images=actual_step % 400 == 1,
+                                save_images=actual_step % validation_timestep_image_step == 0,
                                 log_images_to_wandb=True)
                 
                 wandb.log(data, step=actual_step)
