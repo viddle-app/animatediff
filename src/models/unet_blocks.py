@@ -7,8 +7,9 @@ from torch import nn
 
 from .attention import Transformer3DModel
 from .resnet import Downsample3D, ResnetBlock3D, Upsample3D
-# from .motion_module import get_motion_module
-from .motion_module_sigma_reparam import get_motion_module
+from .motion_module import get_motion_module
+# from .motion_module_qk_norm import get_motion_module
+# from .motion_module_sigma_reparam import get_motion_module
 # from .motion_module_offset import get_motion_module
 # from .motion_module_previous_window import get_motion_module
 from torch.fft import fft
@@ -313,7 +314,7 @@ class UNetMidBlock3DCrossAttn(nn.Module):
 
         for m in self.motion_modules:
             if m is not None:
-                if hasattr(m, 'get_attention_entropy'):
+                if hasattr(m, 'get_entropies'):
                     all_entropies += m.get_entropies()
         
         return all_entropies
@@ -349,6 +350,7 @@ class UNetMidBlock3DCrossAttn(nn.Module):
                 attention_mask: Optional[torch.FloatTensor] = None,
                 cross_attention_kwargs: Optional[Dict[str, Any]] = None,
                 encoder_attention_mask: Optional[torch.FloatTensor] = None,):
+        # TODO add gradient checkpointing
         hidden_states = self.resnets[0](hidden_states, temb)
         for attn, resnet, motion_module in zip(self.attentions, self.resnets[1:], self.motion_modules):
             hidden_states = attn(hidden_states, 
@@ -496,7 +498,7 @@ class CrossAttnDownBlock3D(nn.Module):
 
         for m in self.motion_modules:
             if m is not None:
-                if hasattr(m, 'get_attention_entropy'):
+                if hasattr(m, 'get_entropies'):
                     all_entropies += m.get_entropies()
 
         return all_entropies
@@ -537,7 +539,6 @@ class CrossAttnDownBlock3D(nn.Module):
 
         for resnet, attn, motion_module in zip(self.resnets, self.attentions, self.motion_modules):
             if self.training and self.gradient_checkpointing:
-
                 def create_custom_forward(module, return_dict=None):
                     def custom_forward(*inputs):
                         if return_dict is not None:
@@ -554,8 +555,9 @@ class CrossAttnDownBlock3D(nn.Module):
                     encoder_hidden_states,
                 )[0]
                 if motion_module is not None:
+                    hidden_states = hidden_states.requires_grad_()
                     hidden_states = torch.utils.checkpoint.checkpoint(create_custom_forward(motion_module), 
-                                                                      hidden_states.requires_grad_(), 
+                                                                      hidden_states, 
                                                                       temb, 
                                                                       encoder_hidden_states)
                 
@@ -684,7 +686,7 @@ class DownBlock3D(nn.Module):
 
         for m in self.motion_modules:
             if m is not None:
-                if hasattr(m, 'get_attention_entropy'):
+                if hasattr(m, 'get_entropies'):
                     all_entropies += m.get_entropies()
 
         return all_entropies
@@ -858,7 +860,7 @@ class CrossAttnUpBlock3D(nn.Module):
 
         for m in self.motion_modules:
             if m is not None:
-                if hasattr(m, 'get_attention_entropy'):
+                if hasattr(m, 'get_entropies'):
                     all_entropies += m.get_entropies()
 
         return all_entropies
@@ -1031,7 +1033,7 @@ class UpBlock3D(nn.Module):
 
         for m in self.motion_modules:
             if m is not None:
-                if hasattr(m, 'get_attention_entropy'):
+                if hasattr(m, 'get_entropies'):
                     all_entropies += m.get_entropies()
 
         return all_entropies

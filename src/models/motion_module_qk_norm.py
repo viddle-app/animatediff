@@ -316,6 +316,36 @@ class PositionalEncoding(nn.Module):
         return self.dropout(x)
 
 
+def get_attention_scores(query, key, scale, upcast_attention, upcast_softmax, attention_mask=None):
+    dtype = query.dtype
+
+    # Handling upcasting for attention
+    if upcast_attention:
+        query = query.float()
+        key = key.float()
+
+    # Perform batch matrix-matrix product and scale
+    attention_scores = torch.matmul(query, key.transpose(-1, -2)) * scale
+
+    # Apply attention mask (if provided)
+    if attention_mask is not None:
+        # Ensure that attention_mask is broadcastable to the shape of attention_scores
+        attention_scores += attention_mask
+
+    # Handling upcasting for softmax
+    if upcast_softmax:
+        attention_scores = attention_scores.float()
+
+    # Apply softmax to compute the attention probabilities
+    attention_probs = attention_scores.softmax(dim=-1)
+
+    # Convert back to the original dtype if necessary
+    if upcast_softmax or upcast_attention:
+        attention_probs = attention_probs.to(dtype)
+
+    return attention_probs
+
+
 class VersatileAttention(Attention):
     def __init__(
             self,
@@ -333,6 +363,9 @@ class VersatileAttention(Attention):
         self.attention_entropy = None
         self.min_attention_entropy = None
         self.max_attention_entropy = None
+
+        init_amount = torch.log2(torch.tensor(16**2 - 16))
+        self.learnable_scale = nn.Parameter(init_amount)
 
         # TODO need to store entropy losses
         # this is a tensor of per row average entropy - the max entropy
@@ -450,9 +483,13 @@ class VersatileAttention(Attention):
         key = self.to_k(encoder_hidden_states)
         value = self.to_v(encoder_hidden_states)
 
+
         key = self.reshape_heads_to_batch_dim(key)
         value = self.reshape_heads_to_batch_dim(value)
 
+        query = F.normalize(query, p=2, dim=-1)
+        key = F.normalize(key, p=2, dim=-1)
+        # reshape back
         if attention_mask is not None:
             if attention_mask.shape[-1] != query.shape[1]:
                 target_length = query.shape[1]
@@ -462,10 +499,12 @@ class VersatileAttention(Attention):
 
         # update the scale to using
         # numerator = math.log(sequence_length) / math.log(sequence_length//4)
-        if not self.training:
-            numerator = math.log(sequence_length) / math.log(sequence_length//4)
-            numerator = 1
-            self.scale = math.sqrt(numerator / (self.inner_dim // self.heads))
+        # if not self.training:
+        #    numerator = math.log(sequence_length) / math.log(sequence_length//4)
+        #    numerator = 1
+        #    self.scale = math.sqrt(numerator / (self.inner_dim // self.heads))
+
+        # self.scale = self.learnable_scale
 
 
         if query.dtype == torch.float16:
@@ -474,7 +513,10 @@ class VersatileAttention(Attention):
             )
 
             if self.save_attention_entropy:
-                attention_probs = self.get_attention_scores(query, key, attention_mask)
+                attention_probs = get_attention_scores(query, key, self.learnable_scale,
+                                                       self.upcast_attention, 
+                                                       self.upcast_softmax,
+                                                       attention_mask=attention_mask)
                 avg, the_min, the_max = self.compute_attention_entropy(attention_probs,
                                                    batch_size=batch_size // video_length)
                 self.attention_entropy = avg
@@ -483,7 +525,10 @@ class VersatileAttention(Attention):
 
             hidden_states = hidden_states.to(query.dtype)
         else:
-            attention_probs = self.get_attention_scores(query, key, attention_mask)
+            attention_probs =  get_attention_scores(query, key, self.learnable_scale,
+                                                       self.upcast_attention, 
+                                                       self.upcast_softmax,
+                                                       attention_mask=attention_mask)
 
             if self.save_attention_entropy:
                 avg, the_min, the_max = self.compute_attention_entropy(attention_probs,

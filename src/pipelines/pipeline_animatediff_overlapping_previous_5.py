@@ -709,17 +709,17 @@ class AnimationPipeline(DiffusionPipeline, FromSingleFileMixin):
                 # I should decrease my offset linearly
                 initial_offset = window_length // 2
                 # Calculate the decrement amount per step so that the offset reaches 0 by the last step
-                decrement_per_step = initial_offset / total_steps
+                decrement_per_step = initial_offset / num_inference_steps
 
                 # Calculate the current offset based on the step we're on
-                current_offset = max(initial_offset - decrement_per_step * current_step, 0)
+                current_offset = max(initial_offset - decrement_per_step * i, 0)
 
                 # Use the calculated offset to ensure it does not exceed the video length constraints
                 if video_length == window_length and not wrap_around:
                     offset = 0
                 else:
                     offset = int(current_offset) 
-                    
+
                 if wrap_around == True:
                     indices = partition_wrap_around_2(video_length, window_length, i, offset)
                 else:

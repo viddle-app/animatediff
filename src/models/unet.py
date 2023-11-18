@@ -316,14 +316,14 @@ class UNet3DConditionModel(ModelMixin, ConfigMixin):
 
 
         for m in self.down_blocks:
-            if m is not None:
-                all_entropies += m.get_entropies()
+            # if m is not None:
+               all_entropies += m.get_entropies()
 
         if self.mid_block is not None:
-            all_entropies += self.mid_block.get_entropies()
+          all_entropies += self.mid_block.get_entropies()
 
         for m in self.up_blocks:
-            if m is not None:
+            # if m is not None:
                 all_entropies += m.get_entropies()
 
         return all_entropies

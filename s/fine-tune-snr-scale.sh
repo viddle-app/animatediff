@@ -1,5 +1,5 @@
 python train_unet.py \
-  --learning_rate "1e-7" \
+  --learning_rate "1e-9" \
   --scale_lr \
   --dataset_name "laion_6plus" \
   --output_dir "output_dreamshaper_8_snr" \
@@ -8,7 +8,7 @@ python train_unet.py \
   --resolution 512 \
   --train_batch_size 24 \
   --max_train_steps 800 \
-  --gradient_accumulation_steps 40 \
+  --gradient_accumulation_steps 1 \
   --gradient_checkpointing \
   --use_8bit_adam \
   --checkpointing_steps 100 \
@@ -18,7 +18,10 @@ python train_unet.py \
   --image_column "URL" \
   --caption_column "TEXT" \
   --report_to "wandb" \
-  --validation_steps 50 \
+  --validation_steps 25 \
   --noise_offset 0.0 \
-  --snr_scaling
+  --lr_scheduler "constant_with_warmup" \
+  --lr_warmup_steps 10 \
+  --snr_gamma 5.0 
   
+  # --snr_scaling \

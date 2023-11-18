@@ -11,6 +11,8 @@ import torch.nn.functional as F
 from diffusers.pipelines.controlnet.multicontrolnet import MultiControlNetModel
 from einops import rearrange
 from itertools import repeat
+from src.utils.compute_data_statistics import make_noise
+from src.utils.image_utils import load_video_as_tensor
 
 use_ufree = False
 use_type = 'regular'
@@ -36,6 +38,8 @@ elif use_type == 'overlapping_3':
   from src.pipelines.pipeline_animatediff_overlapping_3 import AnimationPipeline
 elif use_type == 'overlapping_4':
   from src.pipelines.pipeline_animatediff_overlapping_4 import AnimationPipeline
+elif use_type == 'overlapping_5':
+  from src.pipelines.pipeline_animatediff_overlapping_previous_5 import AnimationPipeline
 elif use_type == 'reference':
   from src.pipelines.pipeline_animatediff_reference import AnimationPipeline
 elif use_type == "init_image":
@@ -46,6 +50,10 @@ elif use_type == "pix2pix_2":
   from src.pipelines.pipeline_animatediff_pix2pix_2 import StableDiffusionInstructPix2PixPipeline
 elif use_type == "frame_interpolator":
   from src.pipelines.pipeline_animatediff_frame_interpolator import StableDiffusionFrameInterpolatorPipeline
+elif use_type == "init_image_3":
+  from src.pipelines.pipeline_animatediff_init_image_3 import StableDiffusionInitImagePipeline
+elif use_type == "init_image_4":
+  from src.pipelines.pipeline_animatediff_init_image_3 import StableDiffusionInitImagePipeline
 elif use_type == "init_image_2":
   from src.pipelines.pipeline_animatediff_init_image_2 import AnimationPipeline
 elif use_type == 'static_pix2pix':
@@ -82,6 +90,7 @@ if image_render:
    from src.pipelines.pipeline_stable_diffusion import StableDiffusionPipeline
 
 print("use_type", use_type) 
+
 
 class AttentionProcessorController:
     def __init__(self) -> None:
@@ -426,7 +435,7 @@ def run(model,
    "num_train_timesteps": 1000,
    "beta_start": 0.00085,
    "beta_end": 0.012,
-   "beta_schedule": "scaled_linear",
+   "beta_schedule": "linear",
    # "clip_sample": False,
    "steps_offset":        1,      
    # "dynamic_thresholding_ratio": 0.995,  
@@ -449,7 +458,7 @@ def run(model,
     "motion_module_mid_block": True,
     "motion_module_decoder_only": False,
     "motion_module_type": "Vanilla",
-    "use_inflated_groupnorm": False,
+    "use_inflated_groupnorm": True,
     "motion_module_kwargs": {
         "num_attention_heads": 8,
         "num_transformer_block": 1,
@@ -518,7 +527,7 @@ def run(model,
   unet = unet.to(dtype=dtype) 
 
   use_controlnet = False
-  # noise_scheduler=DDIMScheduler(**scheduler_kwargs)
+  noise_scheduler=DDIMScheduler(**scheduler_kwargs)
 
   if (use_type == "overlapping_previous" or use_type == 'conv' or use_type == 'overlapping_previous_1' or use_type == 'overlapping_previous_2') and use_controlnet:
     # controlnet_path = Path("../models/ControlNet-v1-1/control_v11p_sd15_openpose.yaml")
@@ -574,6 +583,18 @@ def run(model,
       feature_extractor=None,
       requires_safety_checker=False,
     ).to(device)
+  elif use_type == "init_image_3" or use_type == "init_image_4":
+    pipeline = StableDiffusionInitImagePipeline(
+      vae=vae, 
+      text_encoder=text_encoder, 
+      tokenizer=tokenizer, 
+      unet=unet,
+      scheduler=EulerAncestralDiscreteScheduler(**scheduler_kwargs),
+      # scheduler=DDIMScheduler(**scheduler_kwargs),
+      safety_checker=None,
+      feature_extractor=None,
+      requires_safety_checker=False,
+    ).to(device)
   elif use_type == "static_pix2pix":
     pipeline = StableDiffusionInstructPix2PixPipeline(
       vae=vae, 
@@ -596,7 +617,8 @@ def run(model,
           tokenizer=tokenizer, 
           unet=unet,
           # scheduler=HeunDiscreteScheduler(**scheduler_kwargs),
-          scheduler=EulerAncestralDiscreteScheduler(**scheduler_kwargs),
+          # scheduler=EulerAncestralDiscreteScheduler(**scheduler_kwargs),
+          scheduler=DDIMScheduler(**scheduler_kwargs),
           # scheduler=UniPCMultistepScheduler(**scheduler_kwargs),
         ).to(device)
 
@@ -721,6 +743,7 @@ def run(model,
   # motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/training-2023-10-27T14-21-27/checkpoints/checkpoint-epoch-2.ckpt"
   # motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/training-2023-10-28T01-33-45/checkpoints/checkpoint-epoch-4.ckpt"
   # motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/training-2023-10-28T01-33-45/checkpoints/checkpoint-epoch-9.ckpt"
+
   # motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/training-2023-10-29T23-28-04/checkpoints/checkpoint.ckpt"
   # motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/training-2023-10-30T00-06-44/checkpoints/checkpoint.ckpt"
   # motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/frame_interpolator_training-2023-10-30T09-29-54/checkpoints/checkpoint.ckpt"
@@ -740,7 +763,37 @@ def run(model,
   # motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/training-2023-11-04T09-29-41/checkpoints/checkpoint.ckpt"
   # motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/training-2023-11-04T09-44-23/checkpoints/checkpoint.ckpt"
   # motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/training-2023-11-04T10-42-29/checkpoints/checkpoint.ckpt"
-  motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/training-2023-11-04T10-56-36/checkpoints/checkpoint.ckpt"
+  # motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/training-2023-11-04T10-56-36/checkpoints/checkpoint.ckpt"
+  # motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/training-2023-11-07T23-59-47/checkpoints/checkpoint.ckpt"
+  # motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/training-2023-11-08T00-56-13/checkpoints/checkpoint.ckpt"
+  # motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/training-2023-11-08T01-05-55/checkpoints/checkpoint.ckpt"
+  # motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/training-2023-11-08T01-05-55/checkpoints/checkpoint-epoch-1.ckpt"
+  # motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/training-2023-11-08T09-56-53/checkpoints/checkpoint.ckpt"
+  # motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/training-2023-11-08T11-13-18/checkpoints/checkpoint.ckpt"
+  # motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/training-2023-11-08T13-37-13/checkpoints/checkpoint.ckpt"
+  # motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/training-2023-11-08T14-10-29/checkpoints/checkpoint.ckpt"
+  # motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/training-2023-11-08T14-57-17/checkpoints/checkpoint.ckpt"
+  # motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/training-2023-11-09T00-03-06/checkpoints/checkpoint.ckpt"
+  # motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/training-2023-11-09T00-29-56/checkpoints/checkpoint-epoch-1.ckpt"
+  # motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/training-2023-11-09T10-25-14/checkpoints/checkpoint.ckpt"
+  # motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/training-2023-11-09T10-57-40/checkpoints/checkpoint.ckpt"
+  # motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/training-2023-11-09T11-51-46/checkpoints/checkpoint-epoch-1.ckpt"
+  # motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/training-2023-11-10T11-54-23/checkpoints/checkpoint.ckpt"
+  # motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/training-2023-11-10T09-55-36/checkpoints/checkpoint.ckpt"
+  # motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/training-2023-11-10T13-25-41/checkpoints/checkpoint.ckpt"
+  # motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/training-2023-11-10T18-25-55/checkpoints/checkpoint-epoch-4.ckpt"
+  # motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/training-2023-11-11T07-57-09/checkpoints/checkpoint.ckpt"
+  # motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/init_frame_training-2023-11-11T20-52-51/checkpoints/checkpoint.ckpt"
+  # motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/training-2023-11-12T22-18-50/checkpoints/checkpoint.ckpt"
+  # motion_module_path = "/mnt/newdrive/viddle-animatediff/outputs/training-2023-11-12T22-59-51/checkpoints/checkpoint.ckpt"
+  # motion_module_path = "outputs/training_recon-2023-11-13T05-46-32/checkpoints/checkpoint-epoch-2.ckpt"
+  # motion_module_path = "outputs/training-2023-11-13T00-44-03/checkpoints/checkpoint-epoch-2.ckpt"
+  # motion_module_path = "outputs/training-2023-11-15T08-43-44/checkpoints/checkpoint.ckpt"
+  # motion_module_path = "outputs/training-2023-11-17T15-52-26/checkpoints/checkpoint.ckpt"
+  # motion_module_path = "outputs/training-2023-11-17T11-55-48/checkpoints/checkpoint-epoch-1.ckpt"
+  # motion_module_path = "outputs/training-2023-11-17T17-42-17/checkpoints/checkpoint.ckpt"
+  # motion_module_path = "outputs/training-2023-11-17T21-34-07/checkpoints/checkpoint.ckpt"
+  motion_module_path = "outputs/training-2023-11-17T23-50-42/checkpoints/checkpoint.ckpt"
 
   if True:
     motion_module_state_dict = torch.load(motion_module_path, map_location="cpu")
@@ -837,7 +890,49 @@ def run(model,
      callback = None
 
 
-  if use_type == 'overlapping' or use_type == 'overlapping_noise_pred' or use_type == 'overlapping_2' or use_type == 'overlapping_3' or use_type == 'overlapping_4' :
+  def make_frame_latents(device=torch.device("cuda")):
+    with torch.no_grad():
+        cuda_device = torch.device("cuda")
+
+        # filename = "000352b9-5884-4f82-8153-7ef794979ee5.mp4"
+        # filename = "0006a128-09d8-4845-97ee-7f80982980aa.mp4"
+        # filename = "00083ea1-cbaa-44dd-99b1-b27c85428723.mp4"
+        # filename = "001abce3-7446-4861-9f4b-27aed5a72353.mp4"
+        filename = "001c83c2-3be7-4e51-8f64-b67c89d16e55.mp4"
+        # filename = "01264eef-1252-4323-b56b-26bc24d728f0.mp4"
+        # filename = "011e29ed-5a52-499b-a9fd-077f669cf73f.mp4"
+        # filename = "011cba1b-708f-4c09-8cce-b27304640565.mp4"
+
+        pixel_values = load_video_as_tensor(f"data/videos/{filename}",
+                                                            max_frames=frame_count*4,)
+        print("pixel_values", pixel_values.shape)
+        pixel_values = rearrange(pixel_values, "b c f h w -> (f b) c h w")
+        # pixel_values = pixel_values[::4]
+        # resize to 512x512
+        pixel_values = F.interpolate(pixel_values, (height, width), mode="bicubic")
+        print("pixel_values", pixel_values.shape)
+        # take every fourth frame
+
+        # encode as latents
+        # encode each frame one at a time
+        encoded_frames = []
+        for frame in pixel_values:
+          print("frame", frame.shape)
+          frame = frame.unsqueeze(0)
+          encoded_frames.append(pipeline.vae.encode(frame.to(device=cuda_device, dtype=dtype)).latent_dist.sample(generator=generators).to(device))
+
+
+        latents = torch.cat(encoded_frames)
+        latents = latents * vae.config.scaling_factor
+        latents = rearrange(latents, "(f b) c h w -> b c f h w", f=frame_count)
+
+
+        target = torch.randn(latents.shape, generator=generators, device=latents.device, dtype=dtype)
+        timesteps = torch.tensor([999]).to(device=cuda_device, dtype=torch.long)
+        return noise_scheduler.add_noise(latents, target, timesteps).to(dtype=dtype)
+
+  if use_type == 'overlapping' or use_type == 'overlapping_noise_pred' or use_type == 'overlapping_2' or use_type == 'overlapping_3' or use_type == 'overlapping_5' or use_type == 'overlapping_4' :
+    latents = make_frame_latents(device=cpu_device)
     video = pipeline(prompt=prompt, 
                   negative_prompt=negative_prompt, 
                   num_inference_steps=num_inference_steps,
@@ -847,7 +942,9 @@ def run(model,
                     window_count=window_count,
                     video_length=frame_count,
                     generator=generators,
-                    shift_count = 12
+                    shift_count = 12, 
+                    latents=latents,
+                    do_init_noise=False
                     # wrap_around=True,
                     # alternate_direction=True,
                     ).videos[0]
@@ -981,7 +1078,7 @@ def run(model,
               window_count=window_count,
               video_length=frame_count,
               generator=generators,
-              wrap_around=False,
+              wrap_around=True,
               alternate_direction=False,
               guess_mode=guess_mode,
               image=images,
@@ -995,7 +1092,7 @@ def run(model,
               ).videos[0]
 
       else:
-        
+        latents = make_frame_latents(device=cpu_device)
         video = pipeline(prompt=prompt, 
               negative_prompt=negative_prompt, 
               num_inference_steps=num_inference_steps,
@@ -1005,11 +1102,13 @@ def run(model,
                 window_count=window_count,
                 video_length=frame_count,
                 generator=generators,
-                wrap_around=False,
+                wrap_around=True,
                 alternate_direction=False,
-                min_offset = 3,
-                max_offset = 5,
+                min_offset = 8,
+                max_offset = 8,
                 callback=callback,
+                latents=latents,
+                do_init_noise=False,
                 # cpu_device=torch.device("cuda"),
                 ).videos[0]
       
@@ -1274,6 +1373,38 @@ def run(model,
     print("video", video.shape)
 
     video = video.permute(1, 0, 2, 3)
+  elif use_type == 'init_image_3' or use_type == 'init_image_4':
+  
+    images = []
+    
+    background_frames_path = Path("/mnt/newdrive/viddle-animatediff/output/1c0c0f1e-73b4-417a-91c0-aaa7356e0cf0")
+    background_frames = glob.glob(os.path.join(background_frames_path, '*.png'))
+    background_frames = sorted(background_frames)
+    # get frame_count with a stride of 2
+    # background_frames = background_frames[::8]
+    background_frames = background_frames[0]
+    
+    frame = Image.open(background_frames).resize((width, height))
+
+    video = pipeline(prompt=prompt,
+            num_inference_steps=num_inference_steps,
+            # guidance_scale=guidance_scale,
+            image=frame,
+            video_length=frame_count,
+            generator=generators,
+            callback=callback,
+            
+              )[0]
+    # convert the list of PIL.Image images to a tensor
+
+    # Convert each PIL.Image to a numpy array
+    transform = ToTensor()
+    tensors = [transform(img) for img in video]
+
+    video = torch.stack(tensors, dim=0)
+    print("video", video.shape)
+
+    video = video.permute(1, 0, 2, 3)
 
 # Stack these tensors together
 
@@ -1337,13 +1468,28 @@ def run(model,
                     image_weights=image_weights,
                     noise_scheduler=noise_scheduler).videos[0]
   else:
-    video = pipeline(prompt=prompt, 
+    
+
+    # latents = make_noise().to(device=device, dtype=dtype)
+    # latents = None
+
+    # load an example video
+    # noise to 999
+    # pass it in
+    noisy_latents = make_frame_latents()
+
+    # noisy_latents = None
+
+
+
+    video = pipeline(prompt=prompt,
                   negative_prompt=negative_prompt, 
                   num_inference_steps=num_inference_steps,
                   guidance_scale=guidance_scale,
                     width=width,
                     height=height,
                     generator= generators,
+                    latents=noisy_latents,
                     video_length=frame_count,
                     callback=callback).videos[0]
       
@@ -1402,17 +1548,19 @@ if __name__ == "__main__":
   # prompt = "close up of a Girl swaying, red blouse, illustration by Wu guanzhong,China village,twojjbe trees in front of my chinese house,light orange, pink,white,blue ,8k"
   # prompt = "paint by frazetta, man dancing, mountain blue sky in background"
   # prompt = "1man dancing outside, clear blue sky sunny day, photography, award winning, highly detailed, bright, well lit"
-  prompt = "Cute Chunky anthropomorphic Siamese cat dressed in rags walking down a rural road, mindblowing illustration by Jean-Baptiste Monge + Emily Carr + Tsubasa Nakai"
+  # prompt = "Cute Chunky anthropomorphic Siamese cat dressed in rags walking down a rural road, mindblowing illustration by Jean-Baptiste Monge + Emily Carr + Tsubasa Nakai"
   # prompt = "close up of A man walking, movie production, cinematic, photography, designed by daniel arsham, glowing white, futuristic, white liquid, highly detailed, 35mm"
   # prompt = "closeup of A woman dancing in front of a secret garden, upper body headshot, early renaissance paintings, Rogier van der Weyden paintings style"
   # prompt = "Close Up portrait of a woman, turning in front of a lake artwork by Kawase Hasui"
+  # prompt = "A panda standing on a surfboard in the ocean in sunset, 4k, high resolution.Realistic, Cinematic, high resolution"
   # prompt = "guy working at his computer"
   # prompt = "little boy plays with marbles"
   # prompt = "close up head shot of girl standing in a field of flowers, windy, long blonde hair in a blue dress smiling"
-  # prompt = "RAW Photo, DSLR BREAK a young woman with bangs, (light smile:0.8), (smile:0.5), wearing relaxed shirt and trousers, causal clothes, (looking at viewer), focused, (modern and cozy office space), design agency office, spacious and open office, Scandinavian design space BREAK detailed, natural light"
+  # prompt = "RAW Photo, DSLR BREAK a young man, (light smile:0.8), (smile:0.5), wearing relaxed shirt and trousers, causal clothes, (looking at viewer), focused, (modern and cozy office space), design agency office, spacious and open office, Scandinavian design space BREAK detailed, natural light"
   # prompt = "taken with iphone camera BREAK medium shot selfie of a pretty young woman BREAK (ombre:1.3) blonde pink BREAK film grain, medium quality"
   # prompt = "girl posing outside a bar on a rainy day, black clothes, street, neon sign, movie production still, high quality, neo-noir"
-  # prompt = "cowboy shot, cyberpunk jacket, camera following woman walking and smoking down street on rainy night, led sign"
+  
+  prompt = "cowboy shot, cyberpunk jacket, camera following woman walking and smoking down street on rainy night, led sign"
   # prompt = "A lego ninja bending down to pick a flower in the style of the lego movie. High quality render by arnold. Animal logic. 3D soft focus"
   # prompt = "Glowing jellyfish, calm, slow hypnotic undulations, 35mm Nature photography, award winning"
   # prompt = "synthwave retrowave vaporware back of a delorean driving on highway, dmc rear grill, neon lights, palm trees and sunset in background, clear, high definition, sharp"
@@ -1454,8 +1602,8 @@ if __name__ == "__main__":
   # model = "/mnt/newdrive/viddle-animatediff/output_dreamshaper_8"
   run(model, 
       prompt=prompt,
-      # negative_prompt="compression artifacts, blurry, worst quality, low quality, normal quality, jpeg artifacts, signature, watermark, username, blurry, made by children, caricature, ugly, boring, sketch, lacklustre, repetitive, cropped, (long neck), body horror, out of frame, mutilated, tiled, frame, border",
-      negative_prompt="",
+      negative_prompt="compression artifacts, blurry, worst quality, low quality, normal quality, jpeg artifacts, signature, watermark, username, blurry, made by children, caricature, ugly, boring, sketch, lacklustre, repetitive, cropped, (long neck), body horror, out of frame, mutilated, tiled, frame, border",
+      # negative_prompt="",
       height=512,
       width=512,
       frame_count=16, # 288,

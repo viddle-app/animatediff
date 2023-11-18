@@ -26,6 +26,7 @@ from diffusers.schedulers import (
     PNDMScheduler,
 )
 from diffusers.utils import deprecate, logging, BaseOutput
+from consistencydecoder import ConsistencyDecoder, save_image, load_image
 
 from einops import rearrange
 
@@ -116,6 +117,7 @@ class AnimationPipeline(DiffusionPipeline, FromSingleFileMixin):
             scheduler=scheduler,
         )
         self.vae_scale_factor = 2 ** (len(self.vae.config.block_out_channels) - 1)
+        # self.consistency_decoder = ConsistencyDecoder(device="cuda:0") # Model size: 2.49 GB
 
     def enable_vae_slicing(self):
         self.vae.enable_slicing()
@@ -246,6 +248,7 @@ class AnimationPipeline(DiffusionPipeline, FromSingleFileMixin):
         video = []
         for frame_idx in tqdm(range(latents.shape[0])):
             video.append(self.vae.decode(latents[frame_idx:frame_idx+1]).sample)
+            # video.append(self.consistency_decoder(latents[frame_idx:frame_idx+1]))
         video = torch.cat(video)
         video = rearrange(video, "(b f) c h w -> b c f h w", f=video_length)
         video = (video / 2 + 0.5).clamp(0, 1)
@@ -311,7 +314,7 @@ class AnimationPipeline(DiffusionPipeline, FromSingleFileMixin):
             latents = latents.to(device)
 
         # scale the initial noise by the standard deviation required by the scheduler
-        latents = latents * self.scheduler.init_noise_sigma
+        # latents = latents * self.scheduler.init_noise_sigma
         return latents
 
     @torch.no_grad()

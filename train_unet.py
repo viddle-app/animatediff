@@ -1087,9 +1087,15 @@ def main():
                     loss = loss.mean()
 
                 elif args.snr_scaling:
-                    snr = compute_snr(noise_scheduler, timesteps)
-                    snr_scale = 1/torch.sqrt(snr)
-                    loss = (snr_scale.reshape(-1, 1, 1, 1, 1) * (model_pred.float() - target.float())**2).mean()
+                    # snr = compute_snr(noise_scheduler, timesteps)
+                    alphas = noise_scheduler.alphas[timesteps.to("cpu")]
+                    snr = alphas / (1 - alphas)
+
+                    snr_scale = 1/torch.sqrt(snr).to(target.device)
+                    mse_loss_weights = snr_scale
+                    loss = F.mse_loss(model_pred.float(), target.float(), reduction="none")
+                    loss = loss.mean(dim=list(range(1, len(loss.shape)))) * mse_loss_weights
+                    loss = loss.mean()
 
                 else:
                     loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
@@ -1142,6 +1148,31 @@ def main():
                         save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
                         accelerator.save_state(save_path)
                         logger.info(f"Saved state to {save_path}")
+                
+                if accelerator.is_main_process:
+                    # if args.validation_prompts is not None and epoch % args.validation_epochs == 0:
+                    if args.validation_prompts is not None and global_step % args.validation_steps == 0:
+                        if args.use_ema:
+                            # Store the UNet parameters temporarily and load the EMA parameters to perform inference.
+                            ema_unet.store(unet.parameters())
+                            ema_unet.copy_to(unet.parameters())
+                        log_validation(
+                            noise_scheduler,
+                            global_step,
+                            args.output_dir,
+                            vae,
+                            text_encoder,
+                            tokenizer,
+                            unet,
+                            args,
+                            accelerator,
+                            weight_dtype,
+                            global_step,
+                        )
+                        if args.use_ema:
+                            # Switch back to the original UNet parameters.
+                            ema_unet.restore(unet.parameters())
+
 
             logs = {"step_loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
             progress_bar.set_postfix(**logs)
@@ -1149,30 +1180,7 @@ def main():
             if global_step >= args.max_train_steps:
                 break
 
-            if accelerator.is_main_process:
-                # if args.validation_prompts is not None and epoch % args.validation_epochs == 0:
-                if args.validation_prompts is not None and global_step % args.validation_steps == 0:
-                    if args.use_ema:
-                        # Store the UNet parameters temporarily and load the EMA parameters to perform inference.
-                        ema_unet.store(unet.parameters())
-                        ema_unet.copy_to(unet.parameters())
-                    log_validation(
-                        noise_scheduler,
-                        global_step,
-                        args.output_dir,
-                        vae,
-                        text_encoder,
-                        tokenizer,
-                        unet,
-                        args,
-                        accelerator,
-                        weight_dtype,
-                        global_step,
-                    )
-                    if args.use_ema:
-                        # Switch back to the original UNet parameters.
-                        ema_unet.restore(unet.parameters())
-
+            
     # Create the pipeline using the trained modules and save it.
     accelerator.wait_for_everyone()
     if accelerator.is_main_process:

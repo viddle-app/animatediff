@@ -34,7 +34,7 @@ from torch.utils.data.distributed import DistributedSampler
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 import diffusers
-from diffusers import AutoencoderKL, DDIMScheduler, PNDMScheduler, DDPMScheduler
+from diffusers import AutoencoderKL, DDIMScheduler, PNDMScheduler, DDPMScheduler, EulerAncestralDiscreteScheduler
 from diffusers.models import UNet2DConditionModel
 from diffusers.pipelines import StableDiffusionPipeline
 from diffusers.optimization import get_scheduler
@@ -53,6 +53,7 @@ import torch.nn as nn
 from diffusers.models.attention_processor import Attention
 from typing import Callable, Optional, Union
 from safetensors.torch import load_file
+import bitsandbytes as bnb
 
 
 
@@ -160,21 +161,42 @@ class XFormersAttnProcessor_Scaled:
         return hidden_states
 
 
-
-def diff_from_first_frame(video_tensor):
+def diff_from_anchor_frame(video_tensor, anchor_frame=0):
     """
-    Compute the difference between each frame and the first frame.
+    Compute the difference between each frame but the anchor frame and the anchor frame itself,
+    then concatenate the unchanged anchor frame back to its original position.
     video_tensor should have shape (batch_size, channels, frames, height, width)
     """
-    # Get the first frame
-    first_frame = video_tensor[:, :, 0:1]
+    # Ensure the anchor frame is within bounds
+    total_frames = video_tensor.shape[2]
+    if anchor_frame < 0 or anchor_frame >= total_frames:
+        raise ValueError("anchor_frame is out of bounds")
 
-    # Compute the difference between each frame and the first frame
-    diff_from_first_frame = video_tensor[:, :, 1:] - first_frame
-    # add the first frame to then front of the tensor
-    diff_from_first_frame = torch.cat([first_frame, diff_from_first_frame], dim=2)
-    return diff_from_first_frame
+    # Get the anchor frame (expanded to match the video tensor's frame dimension for broadcasting)
+    the_anchor_frame = video_tensor[:, :, anchor_frame:anchor_frame+1, :, :]
 
+    # Compute the difference for frames before the anchor frame
+    if anchor_frame > 0:
+        before_anchor = video_tensor[:, :, :anchor_frame] - the_anchor_frame
+    else:
+        before_anchor = torch.empty(0)  # No frames before the anchor
+
+    # Compute the difference for frames after the anchor frame
+    if anchor_frame < total_frames - 1:
+        after_anchor = video_tensor[:, :, anchor_frame+1:] - the_anchor_frame
+    else:
+        after_anchor = torch.empty(0)  # No frames after the anchor
+
+    # Concatenate the before_anchor, the_anchor_frame, and after_anchor tensors along the frame dimension
+    # We use torch.cat and ensure we have tensors to concatenate by checking their shape
+    tensors_to_concat = [t for t in (before_anchor, the_anchor_frame, after_anchor) if t.nelement() > 0]
+    diff_from_anchor_frame = torch.cat(tensors_to_concat, dim=2) if tensors_to_concat else the_anchor_frame
+
+    return diff_from_anchor_frame
+
+
+def diff_from_first_frame(video_tensor):
+    return diff_from_anchor_frame(video_tensor, anchor_frame=0)
 
 def compute_snr(noise_scheduler, timesteps):
     """
@@ -619,6 +641,95 @@ def video_diff_loss_6(original_video, generated_video, first_frame_weight=1.0):
 
     # return F.mse_loss(original_diff, generated_diff, reduction="none")
 
+def video_diff_loss_7(original_video, generated_video, anchor_frame=0, first_frame_weight=1.0):
+    # diff both from the first frame
+    original_diff = diff_from_anchor_frame(original_video, anchor_frame=anchor_frame)
+    # compute the 
+    generated_diff = diff_from_anchor_frame(generated_video, anchor_frame=anchor_frame)
+
+    # take the difference between the two
+    difference_difference = original_diff - generated_diff
+
+    # multiple the first frame difference by the weight
+    # difference_difference[:, :, 0] = difference_difference[:, :, 0] * first_frame_weight
+
+    # take the mse loss
+    return (difference_difference**2)
+
+def frame_diff_with_anchor(video_tensor, anchor_frame_index):
+    """
+    Compute the frame difference for a video tensor using an anchor frame.
+    video_tensor should have shape (batch_size, channels, frames, height, width)
+    anchor_frame_index is the index of the anchor frame around which diffs are computed
+    """
+    # Ensure that the anchor frame is within the correct range
+    num_frames = video_tensor.shape[2]
+    if not (0 <= anchor_frame_index < num_frames):
+        raise ValueError("anchor_frame_index is out of range.")
+
+    # Compute diffs before the anchor frame (if any)
+    if anchor_frame_index > 0:
+        # split at the anchor
+        before_anchor_diff = video_tensor[:, :, :anchor_frame_index] - video_tensor[:, :, 1:anchor_frame_index+1]
+    else:
+        before_anchor_diff = torch.tensor([]).to(video_tensor.device)
+
+    # Compute diffs after the anchor frame (if any)
+    if anchor_frame_index < num_frames - 1:
+        # split at the anchor
+        after_anchor_diff = video_tensor[:, :, anchor_frame_index+1:] - video_tensor[:, :, anchor_frame_index:-1]
+    else:
+        after_anchor_diff = torch.tensor([]).to(video_tensor.device)
+
+    anchor = video_tensor[:, :, anchor_frame_index:anchor_frame_index+1]
+
+    diffs = torch.concat([before_anchor_diff, anchor, after_anchor_diff], dim=2)
+
+    return diffs
+
+
+def video_diff_loss_8(original_video, generated_video, anchor_frame_index):
+    """
+    Compute the squared frame difference loss for two video tensors using an anchor frame.
+    """
+    # Compute the frame difference from the anchor frame for both videos
+    original_diff = frame_diff_with_anchor(original_video, anchor_frame_index)
+    generated_diff = frame_diff_with_anchor(generated_video, anchor_frame_index)
+
+    # Compute the squared difference
+    squared_diff = (original_diff - generated_diff)**2
+
+    # Return the mean squared loss over all elements
+    return squared_diff.mean()
+
+def video_diff_loss_9(original_video, generated_video, anchor_frame_index):
+    """
+    Compute the squared frame difference loss for two video tensors using an anchor frame.
+    """
+    # Compute the frame difference from the anchor frame for both videos
+    original_diff = frame_diff_with_anchor(original_video, anchor_frame_index)
+    generated_diff = frame_diff_with_anchor(generated_video, anchor_frame_index)
+
+    # Compute the squared difference
+    squared_diff = (original_diff - generated_diff)**2
+
+    # Return the mean squared loss over all elements
+    return squared_diff
+
+def video_diff_loss_10(original_video, generated_video, anchor_frame_index):
+    """
+    Compute the squared frame difference loss for two video tensors using an anchor frame.
+    """
+    # Compute the frame difference from the anchor frame for both videos
+    original_diff = frame_diff_with_anchor(original_video, anchor_frame_index)
+    generated_diff = frame_diff_with_anchor(generated_video, anchor_frame_index)
+
+    # Compute the squared difference
+    squared_diff = torch.abs(original_diff - generated_diff)
+
+    # Return the mean squared loss over all elements
+    return squared_diff.mean()
+
 def compute_fft_and_update_state(input_tensor, state=None):
     # Step 1: Compute 1D FFT along the frequency dimension (F)
     rearranged = rearrange(input_tensor, "b c f h w -> c (b h w) f")
@@ -902,6 +1013,10 @@ def main(
     recon_losses = False,
     use_adafactor = False,
     log_attention_entropy = False,
+    entropy_loss_scale = 1.0,
+    both_loss = False,
+    pred_diff_loss = False,
+    use_8bit_adam = False,
 ):
     check_min_version("0.10.0.dev0")
 
@@ -951,19 +1066,44 @@ def main(
 
     # Load scheduler, tokenizer and models.
     dtype = torch.float32
-    # noise_scheduler = DDIMScheduler(**OmegaConf.to_container(noise_scheduler_kwargs))
-    noise_scheduler = DDPMScheduler.from_pretrained(pretrained_model_path, subfolder="scheduler")
+    noise_scheduler = DDIMScheduler(**OmegaConf.to_container(noise_scheduler_kwargs))
+    # noise_scheduler = DDPMScheduler.from_pretrained(pretrained_model_path, subfolder="scheduler")
     # noise_scheduler = PNDMScheduler(**OmegaConf.to_container(noise_scheduler_kwargs))
     noise_scheduler.set_timesteps(noise_scheduler.num_train_timesteps)
 
-    if False:
+    # check if the pretrained_model_path is a directory or a file
+    if os.path.isfile(pretrained_model_path):
         pipeline = StableDiffusionPipeline.from_single_file(pretrained_model_path, torch_dtype=dtype)
       
         tokenizer = pipeline.tokenizer  
         text_encoder = pipeline.text_encoder
         vae = pipeline.vae
-        unet = UNet3DConditionModel.from_unet2d(pipeline.unet, 
+
+        if not image_finetune:     
+            if unet_checkpoint_path is not None and unet_checkpoint_path != "":
+                # check if the extension is .safetensors
+                if unet_checkpoint_path.endswith(".safetensors"):
+                    fine_tuned_unet = load_file(unet_checkpoint_path)
+                    # wrap in an object so fine_tuned_unet is the state_dict property
+
+                    unet = UNet3DConditionModel.from_pretrained_2d(pretrained_model_path, 
+                                                   subfolder="unet",
+                                                   unet_additional_kwargs=unet_additional_kwargs,)
+                    
+                    missing, unexpected = unet.load_state_dict(fine_tuned_unet, strict=False)
+                    # print("unexpected", unexpected)
+                    assert len(unexpected) == 0
+                    print("missing", len(missing))
+                    
+                else:
+                    fine_tuned_unet = torch.load(unet_checkpoint_path, map_location="cpu")
+            
+                    unet = UNet3DConditionModel.from_unet2d(fine_tuned_unet, unet_additional_kwargs=unet_additional_kwargs)
+            else:
+                unet = UNet3DConditionModel.from_unet2d(pipeline.unet, 
                                                 unet_additional_kwargs=unet_additional_kwargs)
+        else:
+            unet = pipeline.unet
     else: 
         tokenizer    = CLIPTokenizer.from_pretrained(pretrained_model_path, subfolder="tokenizer", torch_dtype=dtype)
         text_encoder = CLIPTextModel.from_pretrained(pretrained_model_path, subfolder="text_encoder", torch_dtype=dtype)
@@ -1000,15 +1140,11 @@ def main(
 
     print(f"state_dict keys: {list(unet.config.keys())[:10]}")
 
-    # global_step = 0
     global_step = 0
+    # global_step = 7600
 
     if image_finetune == False and unet_additional_kwargs.motion_module_kwargs.zero_initialize == False:
-        # motion_module_path = "motion-models/mm-Stabilized_high.pth"
-        # motion_module_path = "models/mm-1000.pth"
-        # motion_module_path = "models/motionModel_v03anime.ckpt"
-        # motion_module_path = "models/mm_sd_v14.ckpt"
-        # motion_module_path = "motion-models/mm_sd_v15_v2.ckpt"
+
 
         motion_module_state_dict = torch.load(motion_module_path, map_location="cpu")
         missing, unexpected = unet.load_state_dict(motion_module_state_dict, strict=False)
@@ -1074,29 +1210,36 @@ def main(
     up_lr = learning_rate * 1.0  # Example adjustment
     mid_lr = learning_rate * 1.0  # Example adjustment
 
+    if use_8bit_adam:
+        optimizer_cls = bnb.optim.AdamW8bit
+    else: 
+        optimizer_cls = torch.optim.AdamW
+
     trainable_params = list(filter(lambda p: p.requires_grad, unet.parameters()))
     if not use_adafactor:
-        # optimizer = torch.optim.AdamW(
-        #     trainable_params,
-        #     lr=learning_rate,
-        #     betas=(adam_beta1, adam_beta2),
-        #     weight_decay=adam_weight_decay,
-        #     eps=adam_epsilon,
-        # )
+        if image_finetune:
+            optimizer = optimizer_cls(
+                trainable_params,
+                lr=learning_rate,
+                betas=(adam_beta1, adam_beta2),
+                weight_decay=adam_weight_decay,
+                eps=adam_epsilon,
+            )
+        else:
 
-        optimizer = torch.optim.AdamW(
-            [
-                {'params': down_params_default, 'lr': down_lr},
-                {'params': down_params_gamma, 'lr': down_lr * 2},
-                {'params': up_params_default, 'lr': up_lr},
-                {'params': up_params_gamma, 'lr': up_lr * 2},
-                {'params': mid_params_default, 'lr': mid_lr},
-                {'params': mid_params_gamma, 'lr': mid_lr * 2},
-            ],
-            betas=(adam_beta1, adam_beta2),
-            weight_decay=adam_weight_decay,
-            eps=adam_epsilon,
-        )
+            optimizer = optimizer_cls(
+                [
+                    {'params': down_params_default, 'lr': down_lr},
+                    {'params': down_params_gamma, 'lr': down_lr * 2},
+                    {'params': up_params_default, 'lr': up_lr},
+                    {'params': up_params_gamma, 'lr': up_lr * 2},
+                    {'params': mid_params_default, 'lr': mid_lr},
+                    {'params': mid_params_gamma, 'lr': mid_lr * 2},
+                ],
+                betas=(adam_beta1, adam_beta2),
+                weight_decay=adam_weight_decay,
+                eps=adam_epsilon,
+            )
     else:
         optimizer = Adafactor(
             trainable_params,
@@ -1178,16 +1321,37 @@ def main(
             step_rules="0.01:5,0.02:5,0.04:5,0.08:5,0.1:50,0.2:50,0.4:50,0.8:50,1.0:40000,0.8:2000,0.6:2000,0.4:2000,0.3"
         )
 
+    # Define a list or set of keywords to exclude
+    exclude_keys = {'clip_sample', 'clip_sample_range', 'dynamic_thresholding_ratio', 'sample_max_value', 'set_alpha_to_one', 'thresholding'}
+
+    # Filter out the excluded keywords
+    filtered_kwargs = {key: value for key, value in OmegaConf.to_container(noise_scheduler_kwargs).items() if key not in exclude_keys}
+
     # Validation pipeline
     if not image_finetune:
         validation_pipeline = AnimationPipeline(
-            unet=unet, vae=vae, tokenizer=tokenizer, text_encoder=text_encoder, scheduler=noise_scheduler,
+            unet=unet, vae=vae, tokenizer=tokenizer, text_encoder=text_encoder, 
+            scheduler=EulerAncestralDiscreteScheduler(**filtered_kwargs),
         ).to("cuda")
     else:
-        validation_pipeline = StableDiffusionPipeline.from_pretrained(
-            pretrained_model_path,
-            unet=unet, vae=vae, tokenizer=tokenizer, text_encoder=text_encoder, scheduler=noise_scheduler, safety_checker=None,
-        )
+        if os.path.isfile(pretrained_model_path):
+            validation_pipeline = StableDiffusionPipeline.from_single_file(pretrained_model_path, torch_dtype=dtype)
+            validation_pipeline.vae = vae
+            validation_pipeline.tokenizer = tokenizer
+            validation_pipeline.text_encoder = text_encoder
+            validation_pipeline.scheduler = EulerAncestralDiscreteScheduler(**filtered_kwargs)
+            validation_pipeline.to("cuda")
+
+        else:
+            validation_pipeline = StableDiffusionPipeline.from_pretrained(
+                pretrained_model_path,
+                unet=unet, 
+                vae=vae, 
+                tokenizer=tokenizer, 
+                text_encoder=text_encoder, 
+                scheduler=EulerAncestralDiscreteScheduler(**filtered_kwargs), 
+                safety_checker=None,
+            )
     validation_pipeline.enable_vae_slicing()
     # unet.set_attn_processor(XFormersAttnProcessor_Scaled())
     # validation_pipeline.unet.set_attn_processor(XFormersAttnProcessor_Scaled())
@@ -1236,7 +1400,7 @@ def main(
 
     stdDevAccum = RunningAverages()
 
-    if log_attention_entropy:
+    if log_attention_entropy or entropy_loss_scale != 0.0:
         unet.set_save_attention_entropy(True)
 
     for epoch in range(first_epoch, num_train_epochs):
@@ -1250,9 +1414,8 @@ def main(
         for step, batch in enumerate(train_dataloader):
             # unet.clear_last_encoder_hidden_states()
             print(f"step: {step}")
-
-            if log_attention_entropy:
-                unet.clear_attention_entropy()
+            if step < global_step and epoch == first_epoch:
+                continue
 
             if cfg_random_null_text:
                 batch['text'] = [name if random.random() > cfg_random_null_text_ratio else "" for name in batch['text']]
@@ -1289,7 +1452,18 @@ def main(
             print("latents.shape: ", latents.shape)
 
             # Sample noise that we'll add to the latents
+            noise_offset = 0.0375
             noise = torch.randn_like(latents)
+            if noise_offset:
+                # https://www.crosslabs.org//blog/diffusion-with-offset-noise
+                if image_finetune:
+                    noise += noise_offset * torch.randn(
+                        (latents.shape[0], latents.shape[1], 1, 1), device=latents.device
+                    )
+                else:
+                    noise += noise_offset * torch.randn(
+                        (latents.shape[0], latents.shape[1], latents.shape[2], 1, 1), device=latents.device
+                    )
 
             if progressive_noise is not None:
                 shape = noise.shape
@@ -1372,48 +1546,24 @@ def main(
                 # loss = normality_loss + the_frame_diff_loss
                 if not image_finetune:
                     # pred = (noisy_latents - model_pred * sqrt_one_minus_alpha_prod ) / sqrt_alpha_prod 
+                    if entropy_loss_scale != 0:
+                        all_entropies = unet.get_entropies()
+                        # ensure all_entropies has gradients
+                        # I need to concat the entropies
+                        total_entropy = torch.cat(all_entropies, dim=1)
+
+                        # I need to take the difference between the total_entropies and log(16)
+                        unscaled_entropy_loss = F.mse_loss(total_entropy, 
+                                                        torch.log(torch.tensor(video_length)).to(total_entropy.device), 
+                                                        reduction="none")
+
+                        entropy_loss = entropy_loss_scale * unscaled_entropy_loss
+                    else:
+                        entropy_loss = 0
+
                     if use_sqrt_snr:
                         print("snr_scale: ", snr_scale)
                         mse_loss_weights = snr_scale
-                        
-                        if alternate_losses == True: 
-                            if global_step % 2 == 0:
-                                loss = video_diff_loss_6(model_pred_float, 
-                                                target_float, 
-                                                first_frame_weight=first_frame_weight)
-
-                            else: 
-                                print("recon loss")
-                                loss = F.mse_loss(model_pred_float, target_float, reduction="none")
-
-                        elif recon_losses: 
-                            loss = F.mse_loss(model_pred_float, target_float, reduction="none")
-                        else:     
-                            # TODO add a attention entropy regularization
-                            # compute the attention entropy
-
-                            entropy_regularization_strength = 1
-                            all_entropies = unet.get_entropies()
-                            # I need to concat the entropies
-                            total_entropy = torch.cat(all_entropies, dim=1)
-
-                            # I need to take the difference between the total_entropies and log(16)
-                            unscaled_entropy_loss = F.mse_loss(total_entropy, 
-                                                          torch.log(torch.tensor(video_length)).to(total_entropy.device), 
-                                                          reduction="none")
-
-                            entropy_loss = entropy_regularization_strength * unscaled_entropy_loss
-
-                            loss = video_diff_loss_6(model_pred_float, 
-                                                target_float, 
-                                                first_frame_weight=first_frame_weight) 
-                            
-                        
-                        timesteps_loss = loss.mean(dim=list(range(1, len(loss.shape)))) * mse_loss_weights
-                        timesteps_entropy_loss = entropy_loss.mean(dim=list(range(1, len(entropy_loss.shape)))) * mse_loss_weights
-                        entropy_loss = timesteps_entropy_loss.mean()
-                        loss = timesteps_loss.mean() + entropy_loss
-
                     elif use_custom_weight:
                         # make a tensor of weights from the timesteps
                         normalized_timesteps = timesteps.float() / noise_scheduler.num_train_timesteps
@@ -1429,13 +1579,74 @@ def main(
                             video_diff_loss_6(model_pred_float, 
                                              target_float, 
                                              first_frame_weight=first_frame_weight)).mean()
-
-
                     else:
-                        loss = video_diff_loss_6(model_pred_float, 
-                                             target_float, 
-                                             first_frame_weight=first_frame_weight).mean()
-                    # loss = snr_scale * reconstruction_loss
+                        mse_loss_weights = torch.ones_like(snr_scale)
+                        
+
+                    if alternate_losses: 
+                        if global_step % 2 == 0:
+                            loss = video_diff_loss_6(model_pred_float, 
+                                            target_float, 
+                                            first_frame_weight=first_frame_weight)
+
+                        else: 
+                            print("recon loss")
+                            loss = F.mse_loss(model_pred_float, target_float, reduction="none")
+                    elif pred_diff_loss:
+                        cpu_timesteps = timesteps.cpu()
+                        alphas_cumprod = noise_scheduler.alphas_cumprod.to(device=noisy_latents.device, dtype=noisy_latents.dtype)
+                        sqrt_alpha_prod = noise_scheduler.alphas_cumprod[cpu_timesteps] ** 0.5
+                        sqrt_alpha_prod = sqrt_alpha_prod.flatten()
+                        while len(sqrt_alpha_prod.shape) < len(noisy_latents.shape):
+                            sqrt_alpha_prod = sqrt_alpha_prod.unsqueeze(-1)
+
+                        sqrt_one_minus_alpha_prod = (1 - alphas_cumprod[cpu_timesteps]) ** 0.5
+                        sqrt_one_minus_alpha_prod = sqrt_one_minus_alpha_prod.flatten()
+                        while len(sqrt_one_minus_alpha_prod.shape) < len(noisy_latents.shape):
+                            sqrt_one_minus_alpha_prod = sqrt_one_minus_alpha_prod.unsqueeze(-1)
+
+                        # print("latent.device", latents.device)
+                        # print("sqrt_alpha_prod.device", sqrt_alpha_prod.device)
+                        sqrt_alpha_prod = sqrt_alpha_prod.to(device=noisy_latents.device)
+                        # log the predicted and target videos
+                        # decode the latents of the predicted
+
+                        # noisy_samples = sqrt_alpha_prod * original_samples + sqrt_one_minus_alpha_prod * noise
+
+                        pred = (noisy_latents.float() - model_pred_float * sqrt_one_minus_alpha_prod.float() ) / sqrt_alpha_prod.float() 
+
+                        anchor_frame = torch.randint(0, video_length, (1,), device=latents.device).item()
+                        loss = video_diff_loss_9(pred, latents.float(), anchor_frame_index=anchor_frame,)
+                        
+                        mse_loss_weights = 1/snr_scale
+                        loss = loss.mean(dim=list(range(1, len(loss.shape)))) * mse_loss_weights
+                        loss = loss.mean()
+
+                    elif recon_losses: 
+                        loss = F.mse_loss(model_pred_float, target_float, reduction="none")
+                    elif both_loss:
+                        loss = 0.5 * F.mse_loss(model_pred_float, target_float, reduction="none") + 0.5 * video_diff_loss(model_pred_float, target_float)
+                    else:     
+                        # TODO add a attention entropy regularization
+                        # compute the attention entropy
+                        # loss = video_diff_loss_6(model_pred_float, 
+                        #                    target_float, 
+                        #                    first_frame_weight=first_frame_weight) 
+
+                        # select a random anchor frame
+                        anchor_frame = torch.randint(0, video_length, (1,), device=latents.device).item()
+                        loss = video_diff_loss_10(model_pred_float, 
+                                                    target_float, 
+                                                    anchor_frame_index=anchor_frame,)
+                        
+                    
+                    timesteps_loss = loss.mean(dim=list(range(1, len(loss.shape)))) * mse_loss_weights
+                    if entropy_loss_scale != 0:
+                        timesteps_entropy_loss = entropy_loss.mean(dim=list(range(1, len(entropy_loss.shape)))) * mse_loss_weights
+                        entropy_loss = timesteps_entropy_loss.mean()
+                    loss = timesteps_loss.mean() + entropy_loss
+                    # loss = entropy_loss
+                    # loss = timesteps_loss.mean()
 
                 else:
                     the_loss = (model_pred.float() - target.float()) ** 2
@@ -1485,25 +1696,59 @@ def main(
                     """ <<< gradient clipping <<< """
                     optimizer.step()
 
-                # Compute statistics
-                # if actual_step % 200 == 199:
-                #    for name, param in unet.named_parameters():
-                #        if param.grad is not None:
-                #            wandb.log({f"gradients/{name}": wandb.Histogram(param.grad.cpu().detach().numpy())})
-                    
-                for param in unet.parameters():
-                    if param.grad is not None:
-                        grad_magnitudes.append(torch.norm(param.grad).item())
-                
-                if len(grad_magnitudes) > 0:
-                    print("before grad mag sum")
-                    mean_grad = sum(grad_magnitudes) / len(grad_magnitudes)
-                    print("after grad mag sum")
-                    var_grad = sum((x - mean_grad) ** 2 for x in grad_magnitudes) / len(grad_magnitudes)                    
-                else:
-                    mean_grad = -1
-                    var_grad = -1
+                grad_magnitudes = {f'up_{i}': [] for i in range(4)}
+                grad_magnitudes.update({f'down_{i}': [] for i in range(4)})
+                grad_magnitudes['mid'] = []
 
+                # Iterate over the named parameters of the U-Net model
+                for name, param in unet.named_parameters():
+                    if param.grad is not None:
+                        # Extract block type and index from the parameter name
+                        # print("Has grad ", name)
+                        if 'up_blocks' in name:
+                            # print("up_blocks")
+                            block_idx = int(name.split('.')[1])
+                            grad_magnitudes[f'up_{block_idx}'].append(torch.norm(param.grad))
+                        elif 'down_blocks' in name:
+                            block_idx = int(name.split('.')[1])
+                            grad_magnitudes[f'down_{block_idx}'].append(torch.norm(param.grad))
+                        elif 'mid_block' in name:
+                            grad_magnitudes['mid'].append(torch.norm(param.grad))
+                        else: 
+                            print("unknown block type", name)
+                    # elif "motion_modules" in name:
+                    #    print("no grad for motion modules", name)
+                    #    print("requires_grad", param.requires_grad)
+
+
+
+                all_grads = []
+
+                for key in grad_magnitudes.keys():
+                    if grad_magnitudes[key]:  # Check if the list is not empty
+                        grad_tensor = torch.stack(grad_magnitudes[key]) if grad_magnitudes[key] else torch.tensor([])
+                        all_grads.append(grad_tensor)
+                        grad_magnitudes[key] = grad_tensor
+                    else:
+                        grad_magnitudes[key] = torch.tensor([])
+
+                # If there are gradients to calculate, concatenate them all for the total mean and variance
+                grad_stats = {}
+
+                if all_grads:
+                    all_grads_tensor = torch.cat(all_grads)
+                    grad_stats["mean_gradient"] = torch.mean(all_grads_tensor)
+                    grad_stats["variance_gradient"] = torch.var(all_grads_tensor)
+
+                # Compute mean and variance for each block type using tensors
+
+                for key, grad_tensor in grad_magnitudes.items():
+                    if grad_tensor.nelement() != 0:
+                        mean_grad = torch.mean(grad_tensor)
+                        var_grad = torch.var(grad_tensor)
+                        grad_stats[f"{key}_mean"] = mean_grad.item() 
+                        grad_stats[f"{key}_variance"] = var_grad.item()
+                    
 
                 optimizer.zero_grad()
                 if learning_rate_reading_steps is None and not use_adafactor:
@@ -1520,52 +1765,52 @@ def main(
             if is_main_process and (not is_debug) and use_wandb:
                 wandb.log
 
-                data = {}
-                for the_timestep, the_loss, the_entropy_loss in zip(timesteps, timesteps_loss, timesteps_entropy_loss):
+                data = grad_stats
 
-                    if the_timestep < 100:
-                        prefix = "0_99_"
-                    elif the_timestep < 200:
-                        prefix = "100_199_"
-                    elif the_timestep < 300:
-                        prefix = "200_299_"
-                    elif the_timestep < 400:
-                        prefix = "300_399_"
-                    elif the_timestep < 500:
-                        prefix = "400_499_"
-                    elif the_timestep < 600:
-                        prefix = "500_599_"
-                    elif the_timestep < 700:
-                        prefix = "600_699_"
-                    elif the_timestep < 800:
-                        prefix = "700_799_"
-                    elif the_timestep < 900:
-                        prefix = "800_899_"
-                    elif the_timestep < 1000:
-                        prefix = "900_999_"
+                if not image_finetune:
+                    if entropy_loss_scale == 0.0:
+                        timesteps_entropy_loss = timesteps_loss
 
-                    data[f"{prefix}train_loss"] = the_loss
-                    data[f"{prefix}entropy_loss"] = the_entropy_loss
-                    data[f"{prefix}reconstruction_loss"] = reconstruction_loss
-                    data[f"{prefix}the_frame_diff_loss_noise"] = the_frame_diff_loss_noise
-                    data[f"{prefix}mean_gradient"] = mean_grad
-                    data[f"{prefix}variance_gradient"] = var_grad
+                    for the_timestep, the_loss, the_entropy_loss in zip(timesteps, timesteps_loss, timesteps_entropy_loss):
+
+                        if the_timestep < 100:
+                            prefix = "0_99_"
+                        elif the_timestep < 200:
+                            prefix = "100_199_"
+                        elif the_timestep < 300:
+                            prefix = "200_299_"
+                        elif the_timestep < 400:
+                            prefix = "300_399_"
+                        elif the_timestep < 500:
+                            prefix = "400_499_"
+                        elif the_timestep < 600:
+                            prefix = "500_599_"
+                        elif the_timestep < 700:
+                            prefix = "600_699_"
+                        elif the_timestep < 800:
+                            prefix = "700_799_"
+                        elif the_timestep < 900:
+                            prefix = "800_899_"
+                        elif the_timestep < 1000:
+                            prefix = "900_999_"
+
+                        data[f"{prefix}train_loss"] = the_loss
+                        if entropy_loss_scale != 0.0:
+                            data[f"{prefix}entropy_loss"] = the_entropy_loss
+                        data[f"{prefix}reconstruction_loss"] = reconstruction_loss
+                        data[f"{prefix}the_frame_diff_loss_noise"] = the_frame_diff_loss_noise
+
+                    
+                    data["reconstruction_loss"] = reconstruction_loss
+                    data["entropy_loss"] = entropy_loss
+                    data["the_frame_diff_loss_noise"] = the_frame_diff_loss_noise
+
                     
                 
                 data["loss"] = loss.item()
-                data["reconstruction_loss"] = reconstruction_loss
-                data["entropy_loss"] = entropy_loss
-                data["the_frame_diff_loss_noise"] = the_frame_diff_loss_noise
-                data["mean_gradient"] = mean_grad
-                data["variance_gradient"] = var_grad
                 data["lr"] = optimizer.param_groups[0]["lr"]
                 
-                
-                if len(grad_magnitudes) > 0:
-                    data[f"{prefix}max_gradient"] = max(grad_magnitudes)
-                    data[f"{prefix}min_gradient"] = min(grad_magnitudes)
-                    data["max_gradient"] = max(grad_magnitudes)
-                    data["min_gradient"] = min(grad_magnitudes)
+
 
                 # for each predicted_frequency_energy and target_frequency_energy
                 # add an entry to data
@@ -1778,12 +2023,16 @@ def main(
                 for idx, prompt in enumerate(prompts):
                     if not image_finetune:
                         window_length = train_data.sample_n_frames
+
+                        validation_pipeline.unet.load_state_dict(extract_motion_module(unet), strict=False)
+
                         sample = validation_pipeline(
                             prompt,
+                            negative_prompt = "compression artifacts, blurry, worst quality, low quality, normal quality, jpeg artifacts, signature, watermark, username, blurry, made by children, caricature, ugly, boring, sketch, lacklustre, repetitive, cropped, (long neck), body horror, out of frame, mutilated, tiled, frame, border",
                             generator    = generator,
                             video_length = train_data.sample_n_frames,
-                            height       = 256,
-                            width        = 256,
+                            height       = 512,
+                            width        = 512,
                             # window_count = window_length,
                             # wrap_around=True,
                             # alternate_direction=False,

@@ -73,5 +73,4 @@ enable_xformers_memory_efficient_attention: true
 is_debug: False
 num_workers: 32
 
-cached_latents: false
-first_frame_weight: 1.0
+cached_latents: true

@@ -18,7 +18,7 @@ from transformers import CLIPTextModel, CLIPTokenizer
 from diffusers.loaders import FromSingleFileMixin
 from diffusers.configuration_utils import FrozenDict
 from diffusers.models import AutoencoderKL
-from diffusers.pipeline_utils import DiffusionPipeline
+from diffusers import DiffusionPipeline
 from diffusers.schedulers import (
     DDIMScheduler,
     DPMSolverMultistepScheduler,
@@ -27,7 +27,10 @@ from diffusers.schedulers import (
     LMSDiscreteScheduler,
     PNDMScheduler,
 )
-from diffusers.utils import deprecate, logging, BaseOutput, randn_tensor, is_compiled_module
+from diffusers.utils import deprecate, logging, BaseOutput
+from diffusers.utils.torch_utils import (
+  is_compiled_module,
+)
 
 from einops import rearrange
 from ..utils.partition_utils import partition_sliding, partition_sliding_2, partition_wrap_around_2, partitions, partitions_wrap_around

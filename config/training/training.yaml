@@ -1,8 +1,9 @@
 image_finetune: false
 
 output_dir: "outputs"
-# pretrained_model_path: "/mnt/newdrive/automatic1111/models/Stable-diffusion/dreamshaper_8.safetensors"
-pretrained_model_path: "output_v1_5_snr"
+# pretrained_model_path: "/mnt/newdrive/models/miniSD"
+pretrained_model_path: "/mnt/newdrive/automatic1111/models/Stable-diffusion/dreamshaper_8.safetensors"
+# pretrained_model_path: "output_v1_5_snr"
 
 unet_additional_kwargs:
   in_channels: 4
@@ -21,12 +22,12 @@ unet_additional_kwargs:
     temporal_position_encoding         : true
     temporal_position_encoding_max_len : 32
     temporal_attention_dim_div         : 1
-    zero_initialize                    : true
+    zero_initialize                    : false
     upcast_attention                   : true
 
 noise_scheduler_kwargs:
   beta_end: 0.012
-  beta_schedule: scaled_linear
+  beta_schedule: linear
   beta_start: 0.00085
   clip_sample: false
   clip_sample_range: 1.0
@@ -49,8 +50,12 @@ train_data:
 validation_data:
   prompts:
     - "Close Up portrait of a woman turning in front of a lake artwork by Kawase Hasui"
-  num_inference_steps: 25
-  guidance_scale: 8.
+    - "Cute Chunky anthropomorphic Siamese cat dressed in rags walking down a rural road, mindblowing illustration by Jean-Baptiste Monge + Emily Carr + Tsubasa Nakai"
+    # - "Glowing jellyfish, calm, slow hypnotic undulations, 35mm Nature photography, award winning"
+    # - "synthwave retrowave vaporware back of a delorean driving on highway, dmc rear grill, neon lights, palm trees and sunset in background, clear, high definition, sharp"
+    # - "cowboy shot, cyberpunk jacket, camera following woman walking and smoking down street on rainy night, led sign"
+  num_inference_steps: 20
+  guidance_scale: 7.
 
 trainable_modules:
   - "motion_modules"
@@ -59,9 +64,13 @@ trainable_modules:
 # unet_checkpoint_path: "outputs/training-2023-10-25T12-47-50/checkpoints/checkpoint-epoch-5.ckpt"
 # unet_checkpoint_path: "/mnt/newdrive/viddle-animatediff/outputs/training-2023-11-03T09-00-09/checkpoints/checkpoint-epoch-4.ckpt"
 # unet_checkpoint_path: "/mnt/newdrive/viddle-animatediff/outputs/training-2023-11-03T10-24-38/checkpoints/checkpoint-epoch-1.ckpt"
+# unet_checkpoint_path: "/mnt/newdrive/viddle-animatediff/outputs/training-2023-11-09T09-28-23/checkpoints/checkpoint-epoch-3.ckpt"
+# unet_checkpoint_path: "/mnt/newdrive/viddle-animatediff/outputs/training-2023-11-09T10-01-35/checkpoints/checkpoint.ckpt"
+# unet_checkpoint_path: "outputs/training-2023-11-17T09-18-38/checkpoints/checkpoint-epoch-6.ckpt"
+unet_checkpoint_path: "outputs/training-2023-11-17T20-38-41/checkpoints/checkpoint-epoch-4.ckpt"
 
-learning_rate:    5e-7
-train_batch_size: 6
+learning_rate:    3e-7
+train_batch_size: 11
 gradient_checkpointing: True
 gradient_accumulation_steps: 1
 adam_weight_decay: 1.e-2
@@ -69,25 +78,32 @@ lr_scheduler: "constant_with_warmup"
 lr_warmup_steps: 10
 scale_lr: true
 
-max_train_epoch:     20
+max_train_epoch:     4
 max_train_steps:      -1
 checkpointing_epochs: -1
-checkpointing_steps:  250
+checkpointing_steps:  200
 
 validation_steps:       200
-validation_timestep_image_step: 200
+validation_timestep_image_step: 800
 validation_steps_tuple: []
 
 global_seed: 42
-mixed_precision_training: false
+mixed_precision_training: true
 enable_xformers_memory_efficient_attention: true
 
 is_debug: False
 num_workers: 0
-use_sqrt_snr: True
+use_sqrt_snr: False
 # motion_module_path: "/mnt/newdrive/viddle-animatediff/outputs/training-2023-11-03T11-19-12/checkpoints/checkpoint-epoch-1.ckpt"
 motion_module_path: "motion-models/mm_sd_v15_v2.ckpt"
+# motion_module_path: "/mnt/newdrive/viddle-animatediff/outputs/training-2023-11-10T09-55-36/checkpoints/checkpoint.ckpt"
+# motion_module_path: "/mnt/newdrive/viddle-animatediff/outputs/training-2023-11-11T07-57-09/checkpoints/checkpoint.ckpt"
 alternate_losses: false
 recon_losses: false
+both_loss: false
 use_adafactor: false
-log_attention_entropy: true
+pred_diff_loss: false
+log_attention_entropy: false
+first_frame_weight: 1.0
+entropy_loss_scale: 0
+use_8bit_adam: false
