@@ -1,0 +1,109 @@
+image_finetune: false
+
+output_dir: "outputs"
+pretrained_model_path: "/mnt/newdrive/automatic1111/models/Stable-diffusion/dreamshaper_8.safetensors"
+# pretrained_model_path: "output_v1_5_snr"
+
+unet_additional_kwargs:
+  in_channels: 4
+  use_motion_module              : true
+  motion_module_resolutions      : [ 1,2,4,8 ]
+  unet_use_cross_frame_attention : false
+  unet_use_temporal_attention    : false
+  motion_module_mid_block: true
+  use_inflated_groupnorm: true
+
+  motion_module_type: Vanilla
+  motion_module_kwargs:
+    num_attention_heads                : 8
+    num_transformer_block              : 1
+    attention_block_types              : [ "Temporal_Self", "Temporal_Self", ]
+    temporal_position_encoding         : true
+    temporal_position_encoding_max_len : 32
+    temporal_attention_dim_div         : 1
+    zero_initialize                    : false
+    upcast_attention                   : true
+
+noise_scheduler_kwargs:
+  beta_end: 0.012
+  beta_schedule: linear
+  beta_start: 0.00085
+  clip_sample: false
+  clip_sample_range: 1.0
+  dynamic_thresholding_ratio: 0.995
+  num_train_timesteps: 1000
+  prediction_type: epsilon
+  sample_max_value: 1.0
+  set_alpha_to_one: false
+  steps_offset: 1
+  thresholding: false
+  trained_betas: null
+
+train_data:
+  csv_path:        "data/output.csv"
+  video_folder:    "data/latent_cache"
+  sample_size:     256
+  sample_stride:   4
+  sample_n_frames: 16
+
+validation_data:
+  prompts:
+    - "Close Up portrait of a woman turning in front of a lake artwork by Kawase Hasui"
+    - "Cute Chunky anthropomorphic Siamese cat dressed in rags walking down a rural road, mindblowing illustration by Jean-Baptiste Monge + Emily Carr + Tsubasa Nakai"
+    # - "Glowing jellyfish, calm, slow hypnotic undulations, 35mm Nature photography, award winning"
+    # - "synthwave retrowave vaporware back of a delorean driving on highway, dmc rear grill, neon lights, palm trees and sunset in background, clear, high definition, sharp"
+    # - "cowboy shot, cyberpunk jacket, camera following woman walking and smoking down street on rainy night, led sign"
+  num_inference_steps: 20
+  guidance_scale: 7.
+
+trainable_modules:
+  - "down_blocks.0.motion_modules"
+  - "down_blocks.1.motion_modules"
+  - "down_blocks.2.motion_modules"
+  - "down_blocks.3.motion_modules"
+  - "mid_block.motion_modules"
+
+# unet_checkpoint_path: "output_v1_5_snr/checkpoint-300/unet/diffusion_pytorch_model.safetensors"
+# unet_checkpoint_path: "outputs/training-2023-10-25T12-47-50/checkpoints/checkpoint-epoch-5.ckpt"
+# unet_checkpoint_path: "/mnt/newdrive/viddle-animatediff/outputs/training-2023-11-03T09-00-09/checkpoints/checkpoint-epoch-4.ckpt"
+# unet_checkpoint_path: "/mnt/newdrive/viddle-animatediff/outputs/training-2023-11-03T10-24-38/checkpoints/checkpoint-epoch-1.ckpt"
+# unet_checkpoint_path: "/mnt/newdrive/viddle-animatediff/outputs/training-2023-11-09T09-28-23/checkpoints/checkpoint-epoch-3.ckpt"
+unet_checkpoint_path: "/mnt/newdrive/viddle-animatediff/outputs/training-2023-11-09T10-01-35/checkpoints/checkpoint.ckpt"
+
+learning_rate:    9e-7
+train_batch_size: 16
+gradient_checkpointing: True
+gradient_accumulation_steps: 1
+adam_weight_decay: 1.e-2
+lr_scheduler: "constant_with_warmup"
+lr_warmup_steps: 10
+scale_lr: true
+
+max_train_epoch:     2
+max_train_steps:      -1
+checkpointing_epochs: -1
+checkpointing_steps:  200
+
+validation_steps:       800
+validation_timestep_image_step: 800
+validation_steps_tuple: []
+
+global_seed: 42
+mixed_precision_training: true
+enable_xformers_memory_efficient_attention: true
+
+is_debug: False
+num_workers: 0
+use_sqrt_snr: False
+# motion_module_path: "/mnt/newdrive/viddle-animatediff/outputs/training-2023-11-03T11-19-12/checkpoints/checkpoint-epoch-1.ckpt"
+motion_module_path: "motion-models/mm_sd_v15_v2.ckpt"
+# motion_module_path: "/mnt/newdrive/viddle-animatediff/outputs/training-2023-11-10T09-55-36/checkpoints/checkpoint.ckpt"
+# motion_module_path: "/mnt/newdrive/viddle-animatediff/outputs/training-2023-11-11T07-57-09/checkpoints/checkpoint.ckpt"
+alternate_losses: false
+recon_losses: true
+both_loss: false
+use_adafactor: false
+log_attention_entropy: false
+first_frame_weight: 1.0
+entropy_loss_scale: 0
+use_8bit_adam: true

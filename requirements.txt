@@ -21,3 +21,4 @@ torch-dct
 git+https://github.com/openai/consistencydecoder.git
 webdataset
 peft
+albumentations
