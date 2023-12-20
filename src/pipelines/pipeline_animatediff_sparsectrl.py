@@ -26,7 +26,6 @@ from diffusers.schedulers import (
     PNDMScheduler,
 )
 from diffusers.utils import deprecate, logging, BaseOutput
-from consistencydecoder import ConsistencyDecoder, save_image, load_image
 from diffusers.utils import USE_PEFT_BACKEND
 
 from einops import rearrange
