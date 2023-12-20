@@ -468,7 +468,7 @@ class VersatileAttention(Attention):
             self.scale = math.sqrt(numerator / (self.inner_dim // self.heads))
 
 
-        if query.dtype == torch.float16:
+        if query.dtype == torch.float16 or query.dtype == torch.bfloat16:
             hidden_states = xformers.ops.memory_efficient_attention(
                 query, key, value, attn_bias=attention_mask, op=None, scale=self.scale
             )

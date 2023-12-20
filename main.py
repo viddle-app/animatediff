@@ -15,6 +15,7 @@ from src.utils.compute_data_statistics import make_noise
 from src.utils.image_utils import load_video_as_tensor
 
 use_ufree = False
+use_3d_vae = False
 use_type = 'regular'
 if use_type == 'overlapping':
   from src.pipelines.pipeline_animatediff_overlapping import AnimationPipeline
@@ -1560,7 +1561,7 @@ if __name__ == "__main__":
   # prompt = "taken with iphone camera BREAK medium shot selfie of a pretty young woman BREAK (ombre:1.3) blonde pink BREAK film grain, medium quality"
   # prompt = "girl posing outside a bar on a rainy day, black clothes, street, neon sign, movie production still, high quality, neo-noir"
   
-  prompt = "cowboy shot, cyberpunk jacket, camera following woman walking and smoking down street on rainy night, led sign"
+  # prompt = "cowboy shot, cyberpunk jacket, camera following woman walking and smoking down street on rainy night, led sign"
   # prompt = "A lego ninja bending down to pick a flower in the style of the lego movie. High quality render by arnold. Animal logic. 3D soft focus"
   # prompt = "Glowing jellyfish, calm, slow hypnotic undulations, 35mm Nature photography, award winning"
   # prompt = "synthwave retrowave vaporware back of a delorean driving on highway, dmc rear grill, neon lights, palm trees and sunset in background, clear, high definition, sharp"

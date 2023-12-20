@@ -1,5 +1,5 @@
-git+https://github.com/huggingface/diffusers.git@main#egg=diffusers
-torch==2.0.1
+diffusers==0.24.0
+torch
 torchvision
 transformers
 accelerate
@@ -16,7 +16,7 @@ pytorch-lightning
 tensorboard
 seaborn
 datasets
-xformers==0.0.20
+xformers
 torch-dct
 git+https://github.com/openai/consistencydecoder.git
 webdataset

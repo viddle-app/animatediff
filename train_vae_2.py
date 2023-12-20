@@ -28,11 +28,17 @@ from torchvision import transforms
 from tqdm.auto import tqdm
 
 import diffusers
-from diffusers import AutoencoderKL
+from src.models.vae import AutoencoderKL
 from diffusers.optimization import get_scheduler
 from diffusers.training_utils import EMAModel
 from diffusers.utils import check_min_version, deprecate, is_wandb_available
 from diffusers.utils.import_utils import is_xformers_available
+from decord import VideoReader
+from einops import rearrange
+import bitsandbytes as bnb
+import io
+from src.utils.util import save_videos_grid
+from collections import OrderedDict
 
 import lpips
 from PIL import Image
@@ -44,16 +50,23 @@ logger = get_logger(__name__, log_level="INFO")
 
 
 @torch.no_grad()
-def log_validation(test_dataloader, vae, accelerator, weight_dtype, epoch):
+def log_validation_bk(test_dataloader, vae, accelerator, weight_dtype, epoch):
     logger.info("Running validation... ")
 
     vae_model = accelerator.unwrap_model(vae)
     images = []
     for _, sample in enumerate(test_dataloader):
         x = sample["pixel_values"].to(weight_dtype)
+        print('x shape: ', x.shape)
+        x = rearrange(x, "b c f h w -> b f c h w")
         reconstructions = vae_model(x).sample
+        cpu_x = rearrange(sample["pixel_values"].cpu(), "b f c h w -> b c f h w")
+        # select the first frame (dim 2) of the batch
+        x_first_frame = cpu_x[:, :, 0, :, :]
+        print("x_first_frame shape: ", x_first_frame.shape)
+        reconstructions_first_frame = reconstructions[:, :, 0, :, :]
         images.append(
-            torch.cat([sample["pixel_values"].cpu(), reconstructions.cpu()], axis=0)
+            torch.cat([x_first_frame, reconstructions_first_frame.cpu()], axis=0)
         )
 
     for tracker in accelerator.trackers:
@@ -74,6 +87,35 @@ def log_validation(test_dataloader, vae, accelerator, weight_dtype, epoch):
         else:
             logger.warn(f"image logging not implemented for {tracker.gen_images}")
 
+    del vae_model
+    torch.cuda.empty_cache()
+
+@torch.no_grad()
+def log_validation(test_dataloader, vae, accelerator, weight_dtype, global_step, output_dir):
+    logger.info("Running validation... ")
+
+
+    vae_model = accelerator.unwrap_model(vae)
+    images = []
+    for idx, sample in enumerate(test_dataloader):
+        x = sample["pixel_values"].to(weight_dtype)
+        print('x shape: ', x.shape)
+        x = rearrange(x, "b c f h w -> b f c h w")
+        reconstructions = vae_model(x).sample
+        cpu_x = rearrange(sample["pixel_values"].cpu(), "b f c h w -> b c f h w")
+
+        # concat the reconstructions and the cpu_x next to each other along the w dimension
+
+        concated = torch.cat([cpu_x, reconstructions.cpu()], dim=4)
+        images.append(concated)
+
+    images = torch.cat(images, dim=0)
+    print("images shape: ", images.shape)
+
+    output_path = f"{output_dir}/samples/sample-{global_step}/{idx}.gif"
+    save_videos_grid(images, output_path, rescale=True)
+    wandb.log({"validation_images": wandb.Image(output_path)})
+        
     del vae_model
     torch.cuda.empty_cache()
 
@@ -278,6 +320,15 @@ def parse_args():
         default=1e-1,
         help="Scaling factor for the LPIPS metric",
     )
+    parser.add_argument(
+        "--resume_from_checkpoint",
+        type=str,
+        default=None,
+        help=(
+            "Whether training should be resumed from a previous checkpoint. Use a path saved by"
+            ' `--checkpointing_steps`, or `"latest"` to automatically select the last available checkpoint.'
+        ),
+    )
 
     args = parser.parse_args()
 
@@ -287,6 +338,15 @@ def parse_args():
 
     return args
 
+def extract_motion_module(unet):
+    mm_state_dict = OrderedDict()
+    state_dict = unet.state_dict()
+    state_dict = {key.replace('module.', '', 1): value for key, value in state_dict.items()}
+    for key in state_dict:
+        if "motion_module" in key:
+            mm_state_dict[key] = state_dict[key]
+
+    return mm_state_dict
 
 def main():
     args = parse_args()
@@ -322,11 +382,41 @@ def main():
             os.makedirs(args.output_dir, exist_ok=True)
 
     # Load vae
-    vae = AutoencoderKL.from_pretrained(
-        args.pretrained_model_name_or_path, subfolder="vae", revision=args.revision
+    vae = AutoencoderKL.from_pretrained_2d(
+        args.pretrained_model_name_or_path, 
+        subfolder="vae",
+        vae_additional_kwargs = {
+            "use_motion_module" : True,
+            "motion_module_resolutions"      : [ 1,2,4,8 ],
+            "motion_module_type": "Vanilla",
+            "use_inflated_groupnorm": False,
+            "motion_module_kwargs": {
+                "num_attention_heads"                : 8,
+                "num_transformer_block"              : 1,
+                "attention_block_types"              : [ "Temporal_Self", "Temporal_Self", ],
+                "temporal_position_encoding"         : True,
+                "temporal_position_encoding_max_len" : 32,
+                "temporal_attention_dim_div"         : 1,
+                "zero_initialize"                    : True,
+                "upcast_attention"                   : False,
+            } 
+        # revision=args.revision
+        }
     )
-    vae.requires_grad_(True)
-    vae_params = vae.parameters()
+    vae.requires_grad_(False)
+    
+    # with torch.autograd.profiler.profile(use_cuda=True, profile_memory=True) as prof:
+    vae_params = []
+    trainable_modules = ["motion_module"]
+    for name, param in vae.named_parameters():
+        
+        for trainable_module_name in trainable_modules:
+            if trainable_module_name in name:
+                print(name)
+                param.requires_grad = True
+                vae_params.append(param)
+        
+        # print(prof.key_averages().table(sort_by="cuda_memory_usage", row_limit=10))
 
     if args.gradient_checkpointing:
         vae.enable_gradient_checkpointing()
@@ -340,6 +430,7 @@ def main():
         )
 
     optimizer = torch.optim.AdamW(vae_params, lr=args.learning_rate)
+    # optimizer = bnb.optim.AdamW8bit(vae_params, lr=args.learning_rate)
 
     # Get the datasets: you can either provide your own training and evaluation files (see below)
     # or specify a Dataset from the hub (the dataset will be downloaded automatically from the datasets Hub).
@@ -383,30 +474,37 @@ def main():
                 args.resolution, interpolation=transforms.InterpolationMode.BILINEAR
             ),
             transforms.RandomCrop(args.resolution),
-            transforms.ToTensor(),
             transforms.Normalize([0.5], [0.5]),
         ]
     )
 
     def preprocess(examples):
-        image_filepaths = examples[image_column]
-        valid_images = []
-        valid_example_indices = []
+        with torch.no_grad():
+            image_filepaths = examples[image_column]
+            print("image_filepaths: ", image_filepaths)
+            valid_images = []
+            sample_stride=4
+            sample_n_frames=16
 
-        for idx, image_filepath in enumerate(image_filepaths):
-            try:
-                image = Image.open(image_filepath).convert("RGB")
-                valid_images.append(image)
-                valid_example_indices.append(idx)
-            except Exception as e:  # Catch all exceptions related to opening the image.
-                print(f"Skipping file {image_filepath} due to loading error: {e}")
-                continue
+            for idx, image_filepath in enumerate(image_filepaths):
+                video_reader = VideoReader(image_filepath)
+                video_length = len(video_reader)
+                
+                clip_length = min(video_length, (sample_n_frames - 1) * sample_stride + 1)
+                start_idx   = random.randint(0, video_length - clip_length)
+                batch_index = np.linspace(start_idx, start_idx + clip_length - 1, sample_n_frames, dtype=int)
+                pixel_values = torch.from_numpy(video_reader.get_batch(batch_index).asnumpy()).permute(0, 3, 1, 2).contiguous()
+                pixel_values = pixel_values / 255.
+                del video_reader
 
-        transformed_images = [train_transforms(image) for image in valid_images]
-        subset_examples = {key: [value[i] for i in valid_example_indices] for key, value in examples.items()}
-        subset_examples["pixel_values"] = transformed_images
+                valid_images.append(pixel_values)
+                    
 
-        return subset_examples
+            transformed_images = [train_transforms(image) for image in valid_images]
+            print("transformed_images: ", transformed_images[0].shape)
+            examples["pixel_values"] = transformed_images
+
+            return examples
 
     with accelerator.main_process_first():
         # Split into train/test
@@ -429,7 +527,7 @@ def main():
     )
 
     test_dataloader = torch.utils.data.DataLoader(
-        test_dataset, shuffle=True, collate_fn=collate_fn
+        test_dataset, shuffle=False, collate_fn=collate_fn
     )
 
     lr_scheduler = get_scheduler(
@@ -488,6 +586,32 @@ def main():
     global_step = 0
     first_epoch = 0
 
+        # Potentially load in the weights and states from a previous save
+    if args.resume_from_checkpoint:
+        if args.resume_from_checkpoint != "latest":
+            path = os.path.basename(args.resume_from_checkpoint)
+        else:
+            # Get the most recent checkpoint
+            dirs = os.listdir(args.output_dir)
+            dirs = [d for d in dirs if d.startswith("checkpoint")]
+            dirs = sorted(dirs, key=lambda x: int(x.split("-")[1]))
+            path = dirs[-1] if len(dirs) > 0 else None
+
+        if path is None:
+            accelerator.print(
+                f"Checkpoint '{args.resume_from_checkpoint}' does not exist. Starting a new training run."
+            )
+            args.resume_from_checkpoint = None
+        else:
+            accelerator.print(f"Resuming from checkpoint {path}")
+            accelerator.load_state(os.path.join(args.output_dir, path))
+            global_step = int(path.split("-")[1])
+
+            resume_global_step = global_step * args.gradient_accumulation_steps
+            first_epoch = global_step // num_update_steps_per_epoch
+            resume_step = resume_global_step % (num_update_steps_per_epoch * args.gradient_accumulation_steps)
+
+
     progress_bar = tqdm(
         range(global_step, args.max_train_steps),
         disable=not accelerator.is_local_main_process,
@@ -500,8 +624,15 @@ def main():
         vae.train()
         train_loss = 0.0
         for step, batch in enumerate(train_dataloader):
+            if args.resume_from_checkpoint and epoch == first_epoch and step < resume_step:
+                if step % args.gradient_accumulation_steps == 0:
+                    progress_bar.update(1)
+                continue
+            
             with accelerator.accumulate(vae):
                 target = batch["pixel_values"].to(weight_dtype)
+                target = rearrange(target, "b f c h w -> b c f h w")
+                print("target: ", target.shape)
 
                 # https://github.com/huggingface/diffusers/blob/main/src/diffusers/models/autoencoder_kl.py
                 posterior = vae.encode(target).latent_dist
@@ -510,7 +641,10 @@ def main():
 
                 kl_loss = posterior.kl().mean()
                 mse_loss = F.mse_loss(pred, target, reduction="mean")
-                lpips_loss = lpips_loss_fn(pred, target).mean()
+                # rearrange for the lpips loss
+                lips_pred = rearrange(pred, "b c f h w -> (b f) c h w")
+                lips_target = rearrange(target, "b c f h w -> (b f) c h w")
+                lpips_loss = lpips_loss_fn(lips_pred, lips_target).mean()
 
                 loss = (
                     mse_loss + args.lpips_scale * lpips_loss + args.kl_scale * kl_loss
@@ -529,6 +663,7 @@ def main():
             if accelerator.sync_gradients:
                 progress_bar.update(1)
                 global_step += 1
+                print("train_loss: ", train_loss)
                 accelerator.log({"train_loss": train_loss}, step=global_step)
                 train_loss = 0.0
 
@@ -539,6 +674,8 @@ def main():
                         )
                         accelerator.save_state(save_path)
                         logger.info(f"Saved state to {save_path}")
+            else:
+                print("not a sync_gradients step")
 
             logs = {
                 "step_loss": loss.detach().item(),
@@ -553,7 +690,12 @@ def main():
             if accelerator.is_main_process:
                 if step % args.validation_steps == 0:
                     with torch.no_grad():
-                        log_validation(test_dataloader, vae, accelerator, weight_dtype, step)
+                        log_validation(test_dataloader, 
+                                       vae, 
+                                       accelerator, 
+                                       weight_dtype, 
+                                       step,
+                                       output_dir=args.output_dir)
 
     # Create the pipeline using the trained modules and save it.
     accelerator.wait_for_everyone()

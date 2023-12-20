@@ -17,9 +17,13 @@ from torch.fft import fft
 # from .motion_module_previous_window_pe_3 import get_motion_module
 # from .motion_module_previous_window_pe_4 import get_motion_module
 
+from diffusers.utils import is_torch_version, logging
+from diffusers.models.attention_processor import Attention
+from einops import rearrange
+
 import pdb
 
-
+logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
 def get_down_block(
     down_block_type,
@@ -39,14 +43,12 @@ def get_down_block(
     only_cross_attention=False,
     upcast_attention=False,
     resnet_time_scale_shift="default",
-    
+
     unet_use_cross_frame_attention=None,
-    unet_use_temporal_attention=None,
+    unet_use_temporal_attention=False,
 
     use_inflated_groupnorm=None,
-    
     use_motion_module=None,
-    
     motion_module_type=None,
     motion_module_kwargs=None,
 ):
@@ -70,6 +72,26 @@ def get_down_block(
             motion_module_type=motion_module_type,
             motion_module_kwargs=motion_module_kwargs,
         )
+    elif down_block_type == "DownEncoderBlock3D":
+        return DownEncoderBlock3D(
+            num_layers=num_layers,
+            in_channels=in_channels,
+            out_channels=out_channels,
+            # temb_channels=temb_channels,
+            add_downsample=add_downsample,
+            resnet_eps=resnet_eps,
+            resnet_act_fn=resnet_act_fn,
+            resnet_groups=resnet_groups,
+            downsample_padding=downsample_padding,
+            resnet_time_scale_shift=resnet_time_scale_shift,
+
+            use_inflated_groupnorm=use_inflated_groupnorm,
+
+            use_motion_module=use_motion_module,
+            motion_module_type=motion_module_type,
+            motion_module_kwargs=motion_module_kwargs,
+        )
+
     elif down_block_type == "CrossAttnDownBlock3D":
         if cross_attention_dim is None:
             raise ValueError("cross_attention_dim must be specified for CrossAttnDownBlock3D")
@@ -95,7 +117,7 @@ def get_down_block(
             unet_use_temporal_attention=unet_use_temporal_attention,
 
             use_inflated_groupnorm=use_inflated_groupnorm,
-            
+
             use_motion_module=use_motion_module,
             motion_module_type=motion_module_type,
             motion_module_kwargs=motion_module_kwargs,
@@ -123,10 +145,10 @@ def get_up_block(
     resnet_time_scale_shift="default",
 
     unet_use_cross_frame_attention=None,
-    unet_use_temporal_attention=None,
+    unet_use_temporal_attention=False,
 
     use_inflated_groupnorm=None,
-    
+
     use_motion_module=None,
     motion_module_type=None,
     motion_module_kwargs=None,
@@ -138,6 +160,22 @@ def get_up_block(
             in_channels=in_channels,
             out_channels=out_channels,
             prev_output_channel=prev_output_channel,
+            temb_channels=temb_channels,
+            add_upsample=add_upsample,
+            resnet_eps=resnet_eps,
+            resnet_act_fn=resnet_act_fn,
+            resnet_groups=resnet_groups,
+            resnet_time_scale_shift=resnet_time_scale_shift,
+            use_inflated_groupnorm=use_inflated_groupnorm,
+            use_motion_module=use_motion_module,
+            motion_module_type=motion_module_type,
+            motion_module_kwargs=motion_module_kwargs,
+        )
+    elif up_block_type == "UpDecoderBlock3D":
+        return UpDecoderBlock3D(
+            num_layers=num_layers,
+            in_channels=in_channels,
+            out_channels=out_channels,
             temb_channels=temb_channels,
             add_upsample=add_upsample,
             resnet_eps=resnet_eps,
@@ -181,6 +219,154 @@ def get_up_block(
         )
     raise ValueError(f"{up_block_type} does not exist.")
 
+class UNetMidBlock3D(nn.Module):
+    """
+    A 2D UNet mid-block [`UNetMidBlock2D`] with multiple residual blocks and optional attention blocks.
+
+    Args:
+        in_channels (`int`): The number of input channels.
+        temb_channels (`int`): The number of temporal embedding channels.
+        dropout (`float`, *optional*, defaults to 0.0): The dropout rate.
+        num_layers (`int`, *optional*, defaults to 1): The number of residual blocks.
+        resnet_eps (`float`, *optional*, 1e-6 ): The epsilon value for the resnet blocks.
+        resnet_time_scale_shift (`str`, *optional*, defaults to `default`):
+            The type of normalization to apply to the time embeddings. This can help to improve the performance of the
+            model on tasks with long-range temporal dependencies.
+        resnet_act_fn (`str`, *optional*, defaults to `swish`): The activation function for the resnet blocks.
+        resnet_groups (`int`, *optional*, defaults to 32):
+            The number of groups to use in the group normalization layers of the resnet blocks.
+        attn_groups (`Optional[int]`, *optional*, defaults to None): The number of groups for the attention blocks.
+        resnet_pre_norm (`bool`, *optional*, defaults to `True`):
+            Whether to use pre-normalization for the resnet blocks.
+        add_attention (`bool`, *optional*, defaults to `True`): Whether to add attention blocks.
+        attention_head_dim (`int`, *optional*, defaults to 1):
+            Dimension of a single attention head. The number of attention heads is determined based on this value and
+            the number of input channels.
+        output_scale_factor (`float`, *optional*, defaults to 1.0): The output scale factor.
+
+    Returns:
+        `torch.FloatTensor`: The output of the last residual block, which is a tensor of shape `(batch_size,
+        in_channels, height, width)`.
+
+    """
+
+    def __init__(
+        self,
+        in_channels: int,
+        temb_channels: int,
+        dropout: float = 0.0,
+        num_layers: int = 1,
+        resnet_eps: float = 1e-6,
+        resnet_time_scale_shift: str = "default",  # default, spatial
+        resnet_act_fn: str = "swish",
+        resnet_groups: int = 32,
+        attn_groups: Optional[int] = None,
+        resnet_pre_norm: bool = True,
+        add_attention: bool = True,
+        attention_head_dim=1,
+        output_scale_factor=1.0,
+
+        unet_use_cross_frame_attention=None,
+        unet_use_temporal_attention=None,
+        use_inflated_groupnorm=None,
+        use_motion_module=None,
+        motion_module_type=None,
+        motion_module_kwargs=None,
+    ):
+        super().__init__()
+        resnet_groups = resnet_groups if resnet_groups is not None else min(in_channels // 4, 32)
+        self.add_attention = add_attention
+
+        if attn_groups is None:
+            attn_groups = resnet_groups if resnet_time_scale_shift == "default" else None
+
+        print("in_channels Mid", in_channels)
+        # there is always at least one resnet
+        resnets = [
+            ResnetBlock3D(
+                in_channels=in_channels,
+                out_channels=in_channels,
+                temb_channels=temb_channels,
+                eps=resnet_eps,
+                groups=resnet_groups,
+                dropout=dropout,
+                time_embedding_norm=resnet_time_scale_shift,
+                non_linearity=resnet_act_fn,
+                output_scale_factor=output_scale_factor,
+                pre_norm=resnet_pre_norm,
+                use_inflated_groupnorm=use_inflated_groupnorm,
+            )
+        ]
+
+        attentions = []
+        motion_modules = []
+
+        if attention_head_dim is None:
+            logger.warn(
+                f"It is not recommend to pass `attention_head_dim=None`. Defaulting `attention_head_dim` to `in_channels`: {in_channels}."
+            )
+            attention_head_dim = in_channels
+
+        for _ in range(num_layers):
+            if self.add_attention:
+                attentions.append(
+                    Attention(
+                        in_channels,
+                        heads=in_channels // attention_head_dim,
+                        dim_head=attention_head_dim,
+                        rescale_output_factor=output_scale_factor,
+                        eps=resnet_eps,
+                        norm_num_groups=attn_groups,
+                        spatial_norm_dim=temb_channels if resnet_time_scale_shift == "spatial" else None,
+                        residual_connection=True,
+                        bias=True,
+                        upcast_softmax=True,
+                        _from_deprecated_attn_block=True,
+                    )
+                )
+            else:
+                attentions.append(None)
+
+            motion_modules.append(
+                get_motion_module(
+                    in_channels=in_channels,
+                    motion_module_type=motion_module_type,
+                    motion_module_kwargs=motion_module_kwargs,
+                ) if use_motion_module else None
+            )
+
+            resnets.append(
+                ResnetBlock3D(
+                    in_channels=in_channels,
+                    out_channels=in_channels,
+                    temb_channels=temb_channels,
+                    eps=resnet_eps,
+                    groups=resnet_groups,
+                    dropout=dropout,
+                    time_embedding_norm=resnet_time_scale_shift,
+                    non_linearity=resnet_act_fn,
+                    output_scale_factor=output_scale_factor,
+                    pre_norm=resnet_pre_norm,
+                    use_inflated_groupnorm=use_inflated_groupnorm,
+                )
+            )
+
+        self.attentions = nn.ModuleList(attentions)
+        self.resnets = nn.ModuleList(resnets)
+        self.motion_modules = nn.ModuleList(motion_modules)
+
+    def forward(self, hidden_states, temb=None):
+        hidden_states = self.resnets[0](hidden_states, temb)
+        for motion_module, attn, resnet in zip(self.motion_modules, self.attentions, self.resnets[1:]):
+            if attn is not None:
+                video_length = hidden_states.shape[2]
+                hidden_states = rearrange(hidden_states, "b c f h w -> (b f) c h w")
+                hidden_states = attn(hidden_states, temb=temb)
+                hidden_states = rearrange(hidden_states, "(b f) c h w -> b c f h w", f=video_length)
+            hidden_states = resnet(hidden_states, temb)
+            hidden_states = motion_module(hidden_states, temb, encoder_hidden_states=None) if motion_module is not None else hidden_states
+
+        return hidden_states
 
 class UNetMidBlock3DCrossAttn(nn.Module):
     def __init__(
@@ -202,12 +388,9 @@ class UNetMidBlock3DCrossAttn(nn.Module):
         upcast_attention=False,
 
         unet_use_cross_frame_attention=None,
-        unet_use_temporal_attention=None,
-
+        unet_use_temporal_attention=False,
         use_inflated_groupnorm=None,
-
         use_motion_module=None,
-        
         motion_module_type=None,
         motion_module_kwargs=None,
     ):
@@ -257,7 +440,7 @@ class UNetMidBlock3DCrossAttn(nn.Module):
             motion_modules.append(
                 get_motion_module(
                     in_channels=in_channels,
-                    motion_module_type=motion_module_type, 
+                    motion_module_type=motion_module_type,
                     motion_module_kwargs=motion_module_kwargs,
                 ) if use_motion_module else None
             )
@@ -288,7 +471,7 @@ class UNetMidBlock3DCrossAttn(nn.Module):
                 if hasattr(m, 'set_save_attention_entropy'):
                     print("set_save_attention_entropy in midblock motion module")
                     m.set_save_attention_entropy(save_attention_entropy)
-    
+
     def clear_attention_entropy(self):
         for m in self.motion_modules:
             if m is not None:
@@ -306,9 +489,9 @@ class UNetMidBlock3DCrossAttn(nn.Module):
                     entropies.append(the_avg)
                     min_attention_entropy = min(min_attention_entropy, the_min)
                     max_attention_entropy = max(max_attention_entropy, the_max)
-        
+
         return entropies, min_attention_entropy, max_attention_entropy
-    
+
     def get_entropies(self):
         all_entropies = []
 
@@ -316,7 +499,7 @@ class UNetMidBlock3DCrossAttn(nn.Module):
             if m is not None:
                 if hasattr(m, 'get_entropies'):
                     all_entropies += m.get_entropies()
-        
+
         return all_entropies
 
     def clear_last_encoder_hidden_states(self):
@@ -343,17 +526,17 @@ class UNetMidBlock3DCrossAttn(nn.Module):
                 if hasattr(m, 'set_forward_direction'):
                     m.set_forward_direction(forward_direction)
 
-    def forward(self, 
-                hidden_states, 
-                temb=None, 
-                encoder_hidden_states=None, 
+    def forward(self,
+                hidden_states,
+                temb=None,
+                encoder_hidden_states=None,
                 attention_mask: Optional[torch.FloatTensor] = None,
                 cross_attention_kwargs: Optional[Dict[str, Any]] = None,
                 encoder_attention_mask: Optional[torch.FloatTensor] = None,):
         # TODO add gradient checkpointing
         hidden_states = self.resnets[0](hidden_states, temb)
         for attn, resnet, motion_module in zip(self.attentions, self.resnets[1:], self.motion_modules):
-            hidden_states = attn(hidden_states, 
+            hidden_states = attn(hidden_states,
                                  encoder_hidden_states=encoder_hidden_states,
                                  cross_attention_kwargs=cross_attention_kwargs,
                                  attention_mask=attention_mask,
@@ -393,7 +576,7 @@ class CrossAttnDownBlock3D(nn.Module):
         unet_use_temporal_attention=None,
 
         use_inflated_groupnorm=None,
-        
+
         use_motion_module=None,
 
         motion_module_type=None,
@@ -445,11 +628,11 @@ class CrossAttnDownBlock3D(nn.Module):
             motion_modules.append(
                 get_motion_module(
                     in_channels=out_channels,
-                    motion_module_type=motion_module_type, 
+                    motion_module_type=motion_module_type,
                     motion_module_kwargs=motion_module_kwargs,
                 ) if use_motion_module else None
             )
-            
+
         self.attentions = nn.ModuleList(attentions)
         self.resnets = nn.ModuleList(resnets)
         self.motion_modules = nn.ModuleList(motion_modules)
@@ -466,7 +649,7 @@ class CrossAttnDownBlock3D(nn.Module):
             self.downsamplers = None
 
         self.gradient_checkpointing = False
-    
+
     def set_save_attention_entropy(self, save_attention_entropy):
         for m in self.motion_modules:
             if m is not None:
@@ -490,7 +673,7 @@ class CrossAttnDownBlock3D(nn.Module):
                     entropies.append(the_avg)
                     min_attention_entropy = min(the_min, min_attention_entropy)
                     max_attention_entropy = max(the_max, max_attention_entropy)
-        
+
         return entropies, min_attention_entropy, max_attention_entropy
 
     def get_entropies(self):
@@ -527,10 +710,10 @@ class CrossAttnDownBlock3D(nn.Module):
                 if hasattr(m, 'set_forward_direction'):
                     m.set_forward_direction(forward_direction)
 
-    def forward(self, 
-                hidden_states, 
-                temb=None, 
-                encoder_hidden_states=None, 
+    def forward(self,
+                hidden_states,
+                temb=None,
+                encoder_hidden_states=None,
                 attention_mask=None,
                 cross_attention_kwargs: Optional[Dict[str, Any]] = None,
                 encoder_attention_mask: Optional[torch.FloatTensor] = None,
@@ -556,24 +739,24 @@ class CrossAttnDownBlock3D(nn.Module):
                 )[0]
                 if motion_module is not None:
                     hidden_states = hidden_states.requires_grad_()
-                    hidden_states = torch.utils.checkpoint.checkpoint(create_custom_forward(motion_module), 
-                                                                      hidden_states, 
-                                                                      temb, 
+                    hidden_states = torch.utils.checkpoint.checkpoint(create_custom_forward(motion_module),
+                                                                      hidden_states,
+                                                                      temb,
                                                                       encoder_hidden_states)
-                
+
             else:
                 hidden_states = resnet(hidden_states, temb)
-                hidden_states = attn(hidden_states, 
+                hidden_states = attn(hidden_states,
                                      encoder_hidden_states=encoder_hidden_states,
                                      cross_attention_kwargs=cross_attention_kwargs,
                                      attention_mask=attention_mask,
                                      encoder_attention_mask=encoder_attention_mask,
                                      return_dict=False,
                                      )[0]
-                
+
                 # add motion module
-                hidden_states = motion_module(hidden_states, 
-                                              temb, 
+                hidden_states = motion_module(hidden_states,
+                                              temb,
                                               encoder_hidden_states=encoder_hidden_states) if motion_module is not None else hidden_states
 
             output_states += (hidden_states,)
@@ -605,7 +788,6 @@ class DownBlock3D(nn.Module):
         downsample_padding=1,
 
         use_inflated_groupnorm=None,
-        
         use_motion_module=None,
         motion_module_type=None,
         motion_module_kwargs=None,
@@ -634,11 +816,11 @@ class DownBlock3D(nn.Module):
             motion_modules.append(
                 get_motion_module(
                     in_channels=out_channels,
-                    motion_module_type=motion_module_type, 
+                    motion_module_type=motion_module_type,
                     motion_module_kwargs=motion_module_kwargs,
                 ) if use_motion_module else None
             )
-            
+
         self.resnets = nn.ModuleList(resnets)
         self.motion_modules = nn.ModuleList(motion_modules)
 
@@ -654,13 +836,13 @@ class DownBlock3D(nn.Module):
             self.downsamplers = None
 
         self.gradient_checkpointing = False
-    
+
     def set_save_attention_entropy(self, save_attention_entropy):
         for m in self.motion_modules:
             if m is not None:
                 if hasattr(m, 'set_save_attention_entropy'):
                     m.set_save_attention_entropy(save_attention_entropy)
-    
+
     def clear_attention_entropy(self):
         for m in self.motion_modules:
             if m is not None:
@@ -678,7 +860,7 @@ class DownBlock3D(nn.Module):
                     entropies.append(the_avg)
                     min_attention_entropy = min(the_min, min_attention_entropy)
                     max_attention_entropy = max(the_max, max_attention_entropy)
-        
+
         return entropies, min_attention_entropy, max_attention_entropy
 
     def get_entropies(self):
@@ -745,6 +927,81 @@ class DownBlock3D(nn.Module):
 
         return hidden_states, output_states
 
+class DownEncoderBlock3D(nn.Module):
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        dropout: float = 0.0,
+        num_layers: int = 1,
+        resnet_eps: float = 1e-6,
+        resnet_time_scale_shift: str = "default",
+        resnet_act_fn: str = "swish",
+        resnet_groups: int = 32,
+        resnet_pre_norm: bool = True,
+        output_scale_factor=1.0,
+        add_downsample=True,
+        downsample_padding=1,
+
+        use_inflated_groupnorm=None,
+        use_motion_module=None,
+        motion_module_type=None,
+        motion_module_kwargs=None,
+    ):
+        super().__init__()
+        resnets = []
+        motion_modules = []
+
+        for i in range(num_layers):
+            in_channels = in_channels if i == 0 else out_channels
+            resnets.append(
+                ResnetBlock3D(
+                    in_channels=in_channels,
+                    out_channels=out_channels,
+                    temb_channels=None,
+                    eps=resnet_eps,
+                    groups=resnet_groups,
+                    dropout=dropout,
+                    time_embedding_norm=resnet_time_scale_shift,
+                    non_linearity=resnet_act_fn,
+                    output_scale_factor=output_scale_factor,
+                    pre_norm=resnet_pre_norm,
+                    use_inflated_groupnorm=use_inflated_groupnorm,
+                )
+            )
+            motion_modules.append(
+                get_motion_module(
+                    in_channels=out_channels,
+                    motion_module_type=motion_module_type,
+                    motion_module_kwargs=motion_module_kwargs,
+                ) if use_motion_module else None
+            )
+
+        self.resnets = nn.ModuleList(resnets)
+        self.motion_modules = nn.ModuleList(motion_modules)
+
+        if add_downsample:
+            self.downsamplers = nn.ModuleList(
+                [
+                    Downsample3D(
+                        out_channels, use_conv=True, out_channels=out_channels, padding=downsample_padding, name="op"
+                    )
+                ]
+            )
+        else:
+            self.downsamplers = None
+
+    def forward(self, hidden_states, scale: float = 1.0):
+        for resnet, motion_module in zip(self.resnets, self.motion_modules):
+            hidden_states = resnet(hidden_states, temb=None, scale=scale)
+
+            hidden_states = motion_module(hidden_states, None, encoder_hidden_states=None) if motion_module is not None else hidden_states
+
+        if self.downsamplers is not None:
+            for downsampler in self.downsamplers:
+                hidden_states = downsampler(hidden_states)
+
+        return hidden_states
 
 class CrossAttnUpBlock3D(nn.Module):
     def __init__(
@@ -773,7 +1030,7 @@ class CrossAttnUpBlock3D(nn.Module):
 
         unet_use_cross_frame_attention=None,
         unet_use_temporal_attention=None,
-        
+
         use_motion_module=None,
 
         motion_module_type=None,
@@ -827,11 +1084,11 @@ class CrossAttnUpBlock3D(nn.Module):
             motion_modules.append(
                 get_motion_module(
                     in_channels=out_channels,
-                    motion_module_type=motion_module_type, 
+                    motion_module_type=motion_module_type,
                     motion_module_kwargs=motion_module_kwargs,
                 ) if use_motion_module else None
             )
-            
+
         self.attentions = nn.ModuleList(attentions)
         self.resnets = nn.ModuleList(resnets)
         self.motion_modules = nn.ModuleList(motion_modules)
@@ -877,7 +1134,7 @@ class CrossAttnUpBlock3D(nn.Module):
                     min_attention_entropy = min(the_min, min_attention_entropy)
                     max_attention_entropy = max(the_max, max_attention_entropy)
 
-        
+
         return entropies, min_attention_entropy, max_attention_entropy
 
     def clear_last_encoder_hidden_states(self):
@@ -938,11 +1195,11 @@ class CrossAttnUpBlock3D(nn.Module):
                 )[0]
                 if motion_module is not None:
                     hidden_states = torch.utils.checkpoint.checkpoint(create_custom_forward(motion_module), hidden_states.requires_grad_(), temb, encoder_hidden_states)
-            
+
             else:
                 hidden_states = resnet(hidden_states, temb)
                 hidden_states = attn(hidden_states, encoder_hidden_states=encoder_hidden_states).sample
-                
+
                 # add motion module
                 hidden_states = motion_module(hidden_states, temb, encoder_hidden_states=encoder_hidden_states) if motion_module is not None else hidden_states
 
@@ -1001,7 +1258,7 @@ class UpBlock3D(nn.Module):
             motion_modules.append(
                 get_motion_module(
                     in_channels=out_channels,
-                    motion_module_type=motion_module_type, 
+                    motion_module_type=motion_module_type,
                     motion_module_kwargs=motion_module_kwargs,
                 ) if use_motion_module else None
             )
@@ -1021,7 +1278,7 @@ class UpBlock3D(nn.Module):
             if m is not None:
                 if hasattr(m, 'set_save_attention_entropy'):
                     m.set_save_attention_entropy(save_attention_entropy)
-    
+
     def clear_attention_entropy(self):
         for m in self.motion_modules:
             if m is not None:
@@ -1049,7 +1306,7 @@ class UpBlock3D(nn.Module):
                     entropies.append(the_avg)
                     min_attention_entropy = min(the_min, min_attention_entropy)
                     max_attention_entropy = max(the_max, max_attention_entropy)
-        
+
         return entropies, min_attention_entropy, max_attention_entropy
 
     def clear_last_encoder_hidden_states(self):
@@ -1076,11 +1333,11 @@ class UpBlock3D(nn.Module):
                 if hasattr(m, 'set_forward_direction'):
                     m.set_forward_direction(forward_direction)
 
-    def forward(self, 
-                hidden_states, 
-                res_hidden_states_tuple, 
-                temb=None, 
-                upsample_size=None, 
+    def forward(self,
+                hidden_states,
+                res_hidden_states_tuple,
+                temb=None,
+                upsample_size=None,
                 encoder_hidden_states=None,
                 ):
         for resnet, motion_module in zip(self.resnets, self.motion_modules):
@@ -1107,5 +1364,78 @@ class UpBlock3D(nn.Module):
         if self.upsamplers is not None:
             for upsampler in self.upsamplers:
                 hidden_states = upsampler(hidden_states, upsample_size)
+
+        return hidden_states
+
+class UpDecoderBlock3D(nn.Module):
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        resolution_idx: int = None,
+        dropout: float = 0.0,
+        num_layers: int = 1,
+        resnet_eps: float = 1e-6,
+        resnet_time_scale_shift: str = "default",  # default, spatial
+        resnet_act_fn: str = "swish",
+        resnet_groups: int = 32,
+        resnet_pre_norm: bool = True,
+        output_scale_factor=1.0,
+        add_upsample=True,
+        temb_channels=None,
+
+        use_inflated_groupnorm=None,
+        use_motion_module=None,
+        motion_module_type=None,
+        motion_module_kwargs=None,
+    ):
+        super().__init__()
+        resnets = []
+        motion_modules = []
+
+        for i in range(num_layers):
+            input_channels = in_channels if i == 0 else out_channels
+
+            resnets.append(
+                ResnetBlock3D(
+                    in_channels=input_channels,
+                    out_channels=out_channels,
+                    temb_channels=temb_channels,
+                    eps=resnet_eps,
+                    groups=resnet_groups,
+                    dropout=dropout,
+                    time_embedding_norm=resnet_time_scale_shift,
+                    non_linearity=resnet_act_fn,
+                    output_scale_factor=output_scale_factor,
+                    pre_norm=resnet_pre_norm,
+                    use_inflated_groupnorm=use_inflated_groupnorm,
+                )
+            )
+            motion_modules.append(
+                get_motion_module(
+                    in_channels=out_channels,
+                    motion_module_type=motion_module_type,
+                    motion_module_kwargs=motion_module_kwargs,
+                ) if use_motion_module else None
+            )
+
+        self.resnets = nn.ModuleList(resnets)
+        self.motion_modules = nn.ModuleList(motion_modules)
+
+        if add_upsample:
+            self.upsamplers = nn.ModuleList([Upsample3D(out_channels, use_conv=True, out_channels=out_channels)])
+        else:
+            self.upsamplers = None
+
+        self.resolution_idx = resolution_idx
+
+    def forward(self, hidden_states, temb=None, scale: float = 1.0):
+        for resnet, motion_module in zip(self.resnets, self.motion_modules):
+            hidden_states = resnet(hidden_states, temb=temb, scale=scale)
+            hidden_states = motion_module(hidden_states, temb, encoder_hidden_states=None) if motion_module is not None else hidden_states
+
+        if self.upsamplers is not None:
+            for upsampler in self.upsamplers:
+                hidden_states = upsampler(hidden_states)
 
         return hidden_states

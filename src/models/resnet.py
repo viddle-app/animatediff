@@ -5,6 +5,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from einops import rearrange
+from diffusers.models.lora import LoRACompatibleConv, LoRACompatibleLinear
 
 class InflatedGroupNorm(nn.GroupNorm):
     def forward(self, x):
@@ -16,7 +17,7 @@ class InflatedGroupNorm(nn.GroupNorm):
 
         return x
 
-class InflatedConv3d(nn.Conv2d):
+class InflatedConv3d(LoRACompatibleConv):
     def forward(self, x):
         video_length = x.shape[2]
 
@@ -97,7 +98,8 @@ class Downsample3D(nn.Module):
     def forward(self, hidden_states):
         assert hidden_states.shape[1] == self.channels
         if self.use_conv and self.padding == 0:
-            raise NotImplementedError
+            pad = (0, 1, 0, 1)
+            hidden_states = F.pad(hidden_states, pad, mode="constant", value=0)
 
         assert hidden_states.shape[1] == self.channels
         hidden_states = self.conv(hidden_states)
@@ -153,7 +155,8 @@ class ResnetBlock3D(nn.Module):
             else:
                 raise ValueError(f"unknown time_embedding_norm : {self.time_embedding_norm} ")
 
-            self.time_emb_proj = torch.nn.Linear(temb_channels, time_emb_proj_out_channels)
+            # self.time_emb_proj = torch.nn.Linear(temb_channels, time_emb_proj_out_channels)
+            self.time_emb_proj = LoRACompatibleLinear(temb_channels, time_emb_proj_out_channels)
         else:
             self.time_emb_proj = None
 
@@ -177,7 +180,7 @@ class ResnetBlock3D(nn.Module):
         if self.use_in_shortcut:
             self.conv_shortcut = InflatedConv3d(in_channels, out_channels, kernel_size=1, stride=1, padding=0)
 
-    def forward(self, input_tensor, temb):
+    def forward(self, input_tensor, temb, scale=1.0):
         hidden_states = input_tensor
 
         hidden_states = self.norm1(hidden_states)

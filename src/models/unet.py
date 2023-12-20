@@ -11,12 +11,13 @@ import pdb
 import torch
 import torch.nn as nn
 import torch.utils.checkpoint
-
+from collections import OrderedDict, defaultdict
 from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.models.modeling_utils import ModelMixin
 from diffusers.models.attention_processor import AttentionProcessor, AttnProcessor
-from diffusers.utils import BaseOutput, logging
+from diffusers.utils import BaseOutput, logging, is_accelerate_available, USE_PEFT_BACKEND, set_weights_and_activate_adapters
 from diffusers.models.embeddings import TimestepEmbedding, Timesteps
+from diffusers.models.modeling_utils import _LOW_CPU_MEM_USAGE_DEFAULT, load_model_dict_into_meta
 from .unet_blocks import (
     CrossAttnDownBlock3D,
     CrossAttnUpBlock3D,
@@ -29,7 +30,12 @@ from .unet_blocks import (
 from .resnet import InflatedConv3d, InflatedGroupNorm
 from safetensors.torch import load_file
 import sys
+from accelerate import init_empty_weights
 
+
+
+TEXT_ENCODER_NAME = "text_encoder"
+UNET_NAME = "unet"
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
@@ -40,6 +46,8 @@ class UNet3DConditionOutput(BaseOutput):
 
 
 class UNet3DConditionModel(ModelMixin, ConfigMixin):
+    text_encoder_name = TEXT_ENCODER_NAME
+    unet_name = UNET_NAME
     _supports_gradient_checkpointing = True
 
     @register_to_config
@@ -50,7 +58,7 @@ class UNet3DConditionModel(ModelMixin, ConfigMixin):
         out_channels: int = 4,
         center_input_sample: bool = False,
         flip_sin_to_cos: bool = True,
-        freq_shift: int = 0,      
+        freq_shift: int = 0,
         down_block_types: Tuple[str] = (
             "CrossAttnDownBlock3D",
             "CrossAttnDownBlock3D",
@@ -80,9 +88,11 @@ class UNet3DConditionModel(ModelMixin, ConfigMixin):
         num_class_embeds: Optional[int] = None,
         upcast_attention: bool = False,
         resnet_time_scale_shift: str = "default",
+        timestep_post_act: Optional[str] = None,
+        time_cond_proj_dim: Optional[int] = None,
 
         use_inflated_groupnorm=False,
-        
+
         # Additional
         use_motion_module              = False,
         motion_module_resolutions      = ( 1,2,4,8 ),
@@ -91,7 +101,7 @@ class UNet3DConditionModel(ModelMixin, ConfigMixin):
         motion_module_type             = None,
         motion_module_kwargs           = {},
         unet_use_cross_frame_attention = None,
-        unet_use_temporal_attention    = None,
+        unet_use_temporal_attention    = False,
     ):
         super().__init__()
 
@@ -105,7 +115,13 @@ class UNet3DConditionModel(ModelMixin, ConfigMixin):
         self.time_proj = Timesteps(block_out_channels[0], flip_sin_to_cos, freq_shift)
         timestep_input_dim = block_out_channels[0]
 
-        self.time_embedding = TimestepEmbedding(timestep_input_dim, time_embed_dim)
+        self.time_embedding = TimestepEmbedding(
+            timestep_input_dim,
+            time_embed_dim,
+            act_fn=act_fn,
+            post_act_fn=timestep_post_act,
+            cond_proj_dim=time_cond_proj_dim,
+        )
 
         # class embedding
         if class_embed_type is None and num_class_embeds is not None:
@@ -158,7 +174,7 @@ class UNet3DConditionModel(ModelMixin, ConfigMixin):
                 unet_use_temporal_attention=unet_use_temporal_attention,
 
                 use_inflated_groupnorm=use_inflated_groupnorm,
-                
+
                 use_motion_module=use_motion_module and (res in motion_module_resolutions) and (not motion_module_decoder_only),
                 motion_module_type=motion_module_type,
                 motion_module_kwargs=motion_module_kwargs,
@@ -185,14 +201,14 @@ class UNet3DConditionModel(ModelMixin, ConfigMixin):
                 unet_use_temporal_attention=unet_use_temporal_attention,
 
                 use_inflated_groupnorm=use_inflated_groupnorm,
-                
+
                 use_motion_module=use_motion_module and motion_module_mid_block,
                 motion_module_type=motion_module_type,
                 motion_module_kwargs=motion_module_kwargs,
             )
         else:
             raise ValueError(f"unknown mid_block_type : {mid_block_type}")
-        
+
         # count how many layers upsample the videos
         self.num_upsamplers = 0
 
@@ -255,6 +271,138 @@ class UNet3DConditionModel(ModelMixin, ConfigMixin):
         self.conv_act = nn.SiLU()
         self.conv_out = InflatedConv3d(block_out_channels[0], out_channels, kernel_size=3, padding=1)
 
+    def set_adapters(
+        self,
+        adapter_names: Union[List[str], str],
+        weights: Optional[Union[List[float], float]] = None,
+    ):
+        """
+        Set the currently active adapters for use in the UNet.
+
+        Args:
+            adapter_names (`List[str]` or `str`):
+                The names of the adapters to use.
+            adapter_weights (`Union[List[float], float]`, *optional*):
+                The adapter(s) weights to use with the UNet. If `None`, the weights are set to `1.0` for all the
+                adapters.
+
+        Example:
+
+        ```py
+        from diffusers import AutoPipelineForText2Image
+        import torch
+
+        pipeline = AutoPipelineForText2Image.from_pretrained(
+            "stabilityai/stable-diffusion-xl-base-1.0", torch_dtype=torch.float16
+        ).to("cuda")
+        pipeline.load_lora_weights(
+            "jbilcke-hf/sdxl-cinematic-1", weight_name="pytorch_lora_weights.safetensors", adapter_name="cinematic"
+        )
+        pipeline.load_lora_weights("nerijs/pixel-art-xl", weight_name="pixel-art-xl.safetensors", adapter_name="pixel")
+        pipeline.set_adapters(["cinematic", "pixel"], adapter_weights=[0.5, 0.5])
+        ```
+        """
+        if not USE_PEFT_BACKEND:
+            raise ValueError("PEFT backend is required for `set_adapters()`.")
+
+        adapter_names = [adapter_names] if isinstance(adapter_names, str) else adapter_names
+
+        if weights is None:
+            weights = [1.0] * len(adapter_names)
+        elif isinstance(weights, float):
+            weights = [weights] * len(adapter_names)
+
+        if len(adapter_names) != len(weights):
+            raise ValueError(
+                f"Length of adapter names {len(adapter_names)} is not equal to the length of their weights {len(weights)}."
+            )
+
+        set_weights_and_activate_adapters(self, adapter_names, weights)
+
+
+
+    def disable_lora(self):
+        """
+        Disable the UNet's active LoRA layers.
+
+        Example:
+
+        ```py
+        from diffusers import AutoPipelineForText2Image
+        import torch
+
+        pipeline = AutoPipelineForText2Image.from_pretrained(
+            "stabilityai/stable-diffusion-xl-base-1.0", torch_dtype=torch.float16
+        ).to("cuda")
+        pipeline.load_lora_weights(
+            "jbilcke-hf/sdxl-cinematic-1", weight_name="pytorch_lora_weights.safetensors", adapter_name="cinematic"
+        )
+        pipeline.disable_lora()
+        ```
+        """
+        if not USE_PEFT_BACKEND:
+            raise ValueError("PEFT backend is required for this method.")
+        set_adapter_layers(self, enabled=False)
+
+    def enable_lora(self):
+        """
+        Enable the UNet's active LoRA layers.
+
+        Example:
+
+        ```py
+        from diffusers import AutoPipelineForText2Image
+        import torch
+
+        pipeline = AutoPipelineForText2Image.from_pretrained(
+            "stabilityai/stable-diffusion-xl-base-1.0", torch_dtype=torch.float16
+        ).to("cuda")
+        pipeline.load_lora_weights(
+            "jbilcke-hf/sdxl-cinematic-1", weight_name="pytorch_lora_weights.safetensors", adapter_name="cinematic"
+        )
+        pipeline.enable_lora()
+        ```
+        """
+        if not USE_PEFT_BACKEND:
+            raise ValueError("PEFT backend is required for this method.")
+        set_adapter_layers(self, enabled=True)
+
+    def delete_adapters(self, adapter_names: Union[List[str], str]):
+        """
+        Delete an adapter's LoRA layers from the UNet.
+
+        Args:
+            adapter_names (`Union[List[str], str]`):
+                The names (single string or list of strings) of the adapter to delete.
+
+        Example:
+
+        ```py
+        from diffusers import AutoPipelineForText2Image
+        import torch
+
+        pipeline = AutoPipelineForText2Image.from_pretrained(
+            "stabilityai/stable-diffusion-xl-base-1.0", torch_dtype=torch.float16
+        ).to("cuda")
+        pipeline.load_lora_weights(
+            "jbilcke-hf/sdxl-cinematic-1", weight_name="pytorch_lora_weights.safetensors", adapter_names="cinematic"
+        )
+        pipeline.delete_adapters("cinematic")
+        ```
+        """
+        if not USE_PEFT_BACKEND:
+            raise ValueError("PEFT backend is required for this method.")
+
+        if isinstance(adapter_names, str):
+            adapter_names = [adapter_names]
+
+        for adapter_name in adapter_names:
+            delete_adapter_layers(self, adapter_name)
+
+            # Pop also the corresponding adapter from the config
+            if hasattr(self, "peft_config"):
+                self.peft_config.pop(adapter_name, None)
+
     def set_save_attention_entropy(self, save_attention_entropy):
         for m in self.down_blocks:
             if m is not None:
@@ -291,13 +439,13 @@ class UNet3DConditionModel(ModelMixin, ConfigMixin):
                 max_attention_entropy.append(the_max)
 
         return entropies, min_attention_entropy, max_attention_entropy
-    
+
     def get_mid_attention_entropy(self):
         if self.mid_block is not None:
             return self.mid_block.get_attention_entropy()
         else:
             return [], sys.float_info.max, sys.float_info.min
-        
+
     def get_up_attention_entropy(self):
         entropies = []
         min_attention_entropy = []
@@ -369,7 +517,7 @@ class UNet3DConditionModel(ModelMixin, ConfigMixin):
         for m in self.up_blocks:
             if m is not None:
                 m.reset_call_index()
-    
+
     def set_forward_direction(self, forward_direction):
         # set forward_direction
         # on all up_blocks, down_blocks and mid_block
@@ -556,11 +704,325 @@ class UNet3DConditionModel(ModelMixin, ConfigMixin):
         if isinstance(module, (CrossAttnDownBlock3D, DownBlock3D, CrossAttnUpBlock3D, UpBlock3D)):
             module.gradient_checkpointing = value
 
+    def load_attn_procs(self, pretrained_model_name_or_path_or_dict: Union[str, Dict[str, torch.Tensor]], **kwargs):
+        r"""
+        Load pretrained attention processor layers into [`UNet2DConditionModel`]. Attention processor layers have to be
+        defined in
+        [`attention_processor.py`](https://github.com/huggingface/diffusers/blob/main/src/diffusers/models/attention_processor.py)
+        and be a `torch.nn.Module` class.
+
+        Parameters:
+            pretrained_model_name_or_path_or_dict (`str` or `os.PathLike` or `dict`):
+                Can be either:
+
+                    - A string, the model id (for example `google/ddpm-celebahq-256`) of a pretrained model hosted on
+                      the Hub.
+                    - A path to a directory (for example `./my_model_directory`) containing the model weights saved
+                      with [`ModelMixin.save_pretrained`].
+                    - A [torch state
+                      dict](https://pytorch.org/tutorials/beginner/saving_loading_models.html#what-is-a-state-dict).
+
+            cache_dir (`Union[str, os.PathLike]`, *optional*):
+                Path to a directory where a downloaded pretrained model configuration is cached if the standard cache
+                is not used.
+            force_download (`bool`, *optional*, defaults to `False`):
+                Whether or not to force the (re-)download of the model weights and configuration files, overriding the
+                cached versions if they exist.
+            resume_download (`bool`, *optional*, defaults to `False`):
+                Whether or not to resume downloading the model weights and configuration files. If set to `False`, any
+                incompletely downloaded files are deleted.
+            proxies (`Dict[str, str]`, *optional*):
+                A dictionary of proxy servers to use by protocol or endpoint, for example, `{'http': 'foo.bar:3128',
+                'http://hostname': 'foo.bar:4012'}`. The proxies are used on each request.
+            local_files_only (`bool`, *optional*, defaults to `False`):
+                Whether to only load local model weights and configuration files or not. If set to `True`, the model
+                won't be downloaded from the Hub.
+            token (`str` or *bool*, *optional*):
+                The token to use as HTTP bearer authorization for remote files. If `True`, the token generated from
+                `diffusers-cli login` (stored in `~/.huggingface`) is used.
+            low_cpu_mem_usage (`bool`, *optional*, defaults to `True` if torch version >= 1.9.0 else `False`):
+                Speed up model loading only loading the pretrained weights and not initializing the weights. This also
+                tries to not use more than 1x model size in CPU memory (including peak memory) while loading the model.
+                Only supported for PyTorch >= 1.9.0. If you are using an older version of PyTorch, setting this
+                argument to `True` will raise an error.
+            revision (`str`, *optional*, defaults to `"main"`):
+                The specific model version to use. It can be a branch name, a tag name, a commit id, or any identifier
+                allowed by Git.
+            subfolder (`str`, *optional*, defaults to `""`):
+                The subfolder location of a model file within a larger model repository on the Hub or locally.
+            mirror (`str`, *optional*):
+                Mirror source to resolve accessibility issues if you’re downloading a model in China. We do not
+                guarantee the timeliness or safety of the source, and you should refer to the mirror site for more
+                information.
+
+        Example:
+
+        ```py
+        from diffusers import AutoPipelineForText2Image
+        import torch
+
+        pipeline = AutoPipelineForText2Image.from_pretrained(
+            "stabilityai/stable-diffusion-xl-base-1.0", torch_dtype=torch.float16
+        ).to("cuda")
+        pipeline.unet.load_attn_procs(
+            "jbilcke-hf/sdxl-cinematic-1", weight_name="pytorch_lora_weights.safetensors", adapter_name="cinematic"
+        )
+        ```
+        """
+        from diffusers.models.attention_processor import CustomDiffusionAttnProcessor
+        from diffusers.models.lora import LoRACompatibleConv, LoRACompatibleLinear, LoRAConv2dLayer, LoRALinearLayer
+
+        cache_dir = kwargs.pop("cache_dir", None)
+        force_download = kwargs.pop("force_download", False)
+        resume_download = kwargs.pop("resume_download", False)
+        proxies = kwargs.pop("proxies", None)
+        local_files_only = kwargs.pop("local_files_only", None)
+        token = kwargs.pop("token", None)
+        revision = kwargs.pop("revision", None)
+        subfolder = kwargs.pop("subfolder", None)
+        weight_name = kwargs.pop("weight_name", None)
+        use_safetensors = kwargs.pop("use_safetensors", None)
+        low_cpu_mem_usage = kwargs.pop("low_cpu_mem_usage", _LOW_CPU_MEM_USAGE_DEFAULT)
+        # This value has the same meaning as the `--network_alpha` option in the kohya-ss trainer script.
+        # See https://github.com/darkstorm2150/sd-scripts/blob/main/docs/train_network_README-en.md#execute-learning
+        network_alphas = kwargs.pop("network_alphas", None)
+
+        _pipeline = kwargs.pop("_pipeline", None)
+
+        is_network_alphas_none = network_alphas is None
+
+        allow_pickle = False
+
+        if use_safetensors is None:
+            use_safetensors = True
+            allow_pickle = True
+
+        user_agent = {
+            "file_type": "attn_procs_weights",
+            "framework": "pytorch",
+        }
+
+        if low_cpu_mem_usage and not is_accelerate_available():
+            low_cpu_mem_usage = False
+            logger.warning(
+                "Cannot initialize model with low cpu memory usage because `accelerate` was not found in the"
+                " environment. Defaulting to `low_cpu_mem_usage=False`. It is strongly recommended to install"
+                " `accelerate` for faster and less memory-intense model loading. You can do so with: \n```\npip"
+                " install accelerate\n```\n."
+            )
+
+        model_file = None
+        if not isinstance(pretrained_model_name_or_path_or_dict, dict):
+            # Let's first try to load .safetensors weights
+            if (use_safetensors and weight_name is None) or (
+                weight_name is not None and weight_name.endswith(".safetensors")
+            ):
+                try:
+                    model_file = _get_model_file(
+                        pretrained_model_name_or_path_or_dict,
+                        weights_name=weight_name or LORA_WEIGHT_NAME_SAFE,
+                        cache_dir=cache_dir,
+                        force_download=force_download,
+                        resume_download=resume_download,
+                        proxies=proxies,
+                        local_files_only=local_files_only,
+                        token=token,
+                        revision=revision,
+                        subfolder=subfolder,
+                        user_agent=user_agent,
+                    )
+                    state_dict = safetensors.torch.load_file(model_file, device="cpu")
+                except IOError as e:
+                    if not allow_pickle:
+                        raise e
+                    # try loading non-safetensors weights
+                    pass
+            if model_file is None:
+                model_file = _get_model_file(
+                    pretrained_model_name_or_path_or_dict,
+                    weights_name=weight_name or LORA_WEIGHT_NAME,
+                    cache_dir=cache_dir,
+                    force_download=force_download,
+                    resume_download=resume_download,
+                    proxies=proxies,
+                    local_files_only=local_files_only,
+                    token=token,
+                    revision=revision,
+                    subfolder=subfolder,
+                    user_agent=user_agent,
+                )
+                state_dict = torch.load(model_file, map_location="cpu")
+        else:
+            state_dict = pretrained_model_name_or_path_or_dict
+
+        # fill attn processors
+        lora_layers_list = []
+
+        is_lora = all(("lora" in k or k.endswith(".alpha")) for k in state_dict.keys()) and not USE_PEFT_BACKEND
+        is_custom_diffusion = any("custom_diffusion" in k for k in state_dict.keys())
+
+        if is_lora:
+            # correct keys
+            state_dict, network_alphas = self.convert_state_dict_legacy_attn_format(state_dict, network_alphas)
+
+            if network_alphas is not None:
+                network_alphas_keys = list(network_alphas.keys())
+                used_network_alphas_keys = set()
+
+            lora_grouped_dict = defaultdict(dict)
+            mapped_network_alphas = {}
+
+            all_keys = list(state_dict.keys())
+            for key in all_keys:
+                value = state_dict.pop(key)
+                attn_processor_key, sub_key = ".".join(key.split(".")[:-3]), ".".join(key.split(".")[-3:])
+                lora_grouped_dict[attn_processor_key][sub_key] = value
+
+                # Create another `mapped_network_alphas` dictionary so that we can properly map them.
+                if network_alphas is not None:
+                    for k in network_alphas_keys:
+                        if k.replace(".alpha", "") in key:
+                            mapped_network_alphas.update({attn_processor_key: network_alphas.get(k)})
+                            used_network_alphas_keys.add(k)
+
+            if not is_network_alphas_none:
+                if len(set(network_alphas_keys) - used_network_alphas_keys) > 0:
+                    raise ValueError(
+                        f"The `network_alphas` has to be empty at this point but has the following keys \n\n {', '.join(network_alphas.keys())}"
+                    )
+
+            if len(state_dict) > 0:
+                raise ValueError(
+                    f"The `state_dict` has to be empty at this point but has the following keys \n\n {', '.join(state_dict.keys())}"
+                )
+
+            for key, value_dict in lora_grouped_dict.items():
+                attn_processor = self
+                for sub_key in key.split("."):
+                    attn_processor = getattr(attn_processor, sub_key)
+
+                # Process non-attention layers, which don't have to_{k,v,q,out_proj}_lora layers
+                # or add_{k,v,q,out_proj}_proj_lora layers.
+                rank = value_dict["lora.down.weight"].shape[0]
+
+                if isinstance(attn_processor, LoRACompatibleConv):
+                    in_features = attn_processor.in_channels
+                    out_features = attn_processor.out_channels
+                    kernel_size = attn_processor.kernel_size
+
+                    ctx = init_empty_weights if low_cpu_mem_usage else nullcontext
+                    with ctx():
+                        lora = LoRAConv2dLayer(
+                            in_features=in_features,
+                            out_features=out_features,
+                            rank=rank,
+                            kernel_size=kernel_size,
+                            stride=attn_processor.stride,
+                            padding=attn_processor.padding,
+                            network_alpha=mapped_network_alphas.get(key),
+                        )
+                elif isinstance(attn_processor, LoRACompatibleLinear):
+                    ctx = init_empty_weights if low_cpu_mem_usage else nullcontext
+                    with ctx():
+                        lora = LoRALinearLayer(
+                            attn_processor.in_features,
+                            attn_processor.out_features,
+                            rank,
+                            mapped_network_alphas.get(key),
+                        )
+                else:
+                    raise ValueError(f"Module {key} is not a LoRACompatibleConv or LoRACompatibleLinear module.")
+
+                value_dict = {k.replace("lora.", ""): v for k, v in value_dict.items()}
+                lora_layers_list.append((attn_processor, lora))
+
+                if low_cpu_mem_usage:
+                    device = next(iter(value_dict.values())).device
+                    dtype = next(iter(value_dict.values())).dtype
+                    load_model_dict_into_meta(lora, value_dict, device=device, dtype=dtype)
+                else:
+                    lora.load_state_dict(value_dict)
+
+        elif is_custom_diffusion:
+            attn_processors = {}
+            custom_diffusion_grouped_dict = defaultdict(dict)
+            for key, value in state_dict.items():
+                if len(value) == 0:
+                    custom_diffusion_grouped_dict[key] = {}
+                else:
+                    if "to_out" in key:
+                        attn_processor_key, sub_key = ".".join(key.split(".")[:-3]), ".".join(key.split(".")[-3:])
+                    else:
+                        attn_processor_key, sub_key = ".".join(key.split(".")[:-2]), ".".join(key.split(".")[-2:])
+                    custom_diffusion_grouped_dict[attn_processor_key][sub_key] = value
+
+            for key, value_dict in custom_diffusion_grouped_dict.items():
+                if len(value_dict) == 0:
+                    attn_processors[key] = CustomDiffusionAttnProcessor(
+                        train_kv=False, train_q_out=False, hidden_size=None, cross_attention_dim=None
+                    )
+                else:
+                    cross_attention_dim = value_dict["to_k_custom_diffusion.weight"].shape[1]
+                    hidden_size = value_dict["to_k_custom_diffusion.weight"].shape[0]
+                    train_q_out = True if "to_q_custom_diffusion.weight" in value_dict else False
+                    attn_processors[key] = CustomDiffusionAttnProcessor(
+                        train_kv=True,
+                        train_q_out=train_q_out,
+                        hidden_size=hidden_size,
+                        cross_attention_dim=cross_attention_dim,
+                    )
+                    attn_processors[key].load_state_dict(value_dict)
+        elif USE_PEFT_BACKEND:
+            # In that case we have nothing to do as loading the adapter weights is already handled above by `set_peft_model_state_dict`
+            # on the Unet
+            pass
+        else:
+            raise ValueError(
+                f"{model_file} does not seem to be in the correct format expected by LoRA or Custom Diffusion training."
+            )
+
+        # <Unsafe code
+        # We can be sure that the following works as it just sets attention processors, lora layers and puts all in the same dtype
+        # Now we remove any existing hooks to
+        is_model_cpu_offload = False
+        is_sequential_cpu_offload = False
+
+        # For PEFT backend the Unet is already offloaded at this stage as it is handled inside `lora_lora_weights_into_unet`
+        if not USE_PEFT_BACKEND:
+            if _pipeline is not None:
+                for _, component in _pipeline.components.items():
+                    if isinstance(component, nn.Module) and hasattr(component, "_hf_hook"):
+                        is_model_cpu_offload = isinstance(getattr(component, "_hf_hook"), CpuOffload)
+                        is_sequential_cpu_offload = isinstance(getattr(component, "_hf_hook"), AlignDevicesHook)
+
+                        logger.info(
+                            "Accelerate hooks detected. Since you have called `load_lora_weights()`, the previous hooks will be first removed. Then the LoRA parameters will be loaded and the hooks will be applied again."
+                        )
+                        remove_hook_from_module(component, recurse=is_sequential_cpu_offload)
+
+            # only custom diffusion needs to set attn processors
+            if is_custom_diffusion:
+                self.set_attn_processor(attn_processors)
+
+            # set lora layers
+            for target_module, lora_layer in lora_layers_list:
+                target_module.set_lora_layer(lora_layer)
+
+            self.to(dtype=self.dtype, device=self.device)
+
+            # Offload back.
+            if is_model_cpu_offload:
+                _pipeline.enable_model_cpu_offload()
+            elif is_sequential_cpu_offload:
+                _pipeline.enable_sequential_cpu_offload()
+            # Unsafe code />
+
     def forward(
         self,
         sample: torch.FloatTensor,
         timestep: Union[torch.Tensor, float, int],
         encoder_hidden_states: torch.Tensor,
+        timestep_cond: Optional[torch.Tensor] = None,
         class_labels: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         down_block_additional_residuals: Optional[Tuple[torch.Tensor]] = None,
@@ -568,6 +1030,7 @@ class UNet3DConditionModel(ModelMixin, ConfigMixin):
         cross_attention_kwargs: Optional[Dict[str, Any]] = None,
         encoder_attention_mask: Optional[torch.Tensor] = None,
         return_dict: bool = True,
+
     ) -> Union[UNet3DConditionOutput, Tuple]:
         r"""
         Args:
@@ -636,7 +1099,7 @@ class UNet3DConditionModel(ModelMixin, ConfigMixin):
         # but time_embedding might actually be running in fp16. so we need to cast here.
         # there might be better ways to encapsulate this.
         t_emb = t_emb.to(dtype=self.dtype)
-        emb = self.time_embedding(t_emb)
+        emb = self.time_embedding(t_emb, timestep_cond)
 
         if self.class_embedding is not None:
             if class_labels is None:
@@ -690,7 +1153,7 @@ class UNet3DConditionModel(ModelMixin, ConfigMixin):
                 attention_mask=attention_mask,
                 cross_attention_kwargs=cross_attention_kwargs,
             )
-            
+
         if mid_block_additional_residual is not None:
             sample = sample + mid_block_additional_residual
 
@@ -773,10 +1236,10 @@ class UNet3DConditionModel(ModelMixin, ConfigMixin):
         m, u = model.load_state_dict(state_dict, strict=False)
         print(f"### missing keys: {len(m)}; \n### unexpected keys: {len(u)};")
         # print(f"### missing keys:\n{m}\n### unexpected keys:\n{u}\n")
-        
+
         params = [p.numel() if "temporal" in n else 0 for n, p in model.named_parameters()]
         print(f"### Temporal Module Parameters: {sum(params) / 1e6} M")
-        
+
         return model
 
     @classmethod
@@ -801,12 +1264,39 @@ class UNet3DConditionModel(ModelMixin, ConfigMixin):
         config["mid_block_type"] = "UNetMidBlock3DCrossAttn"
 
         model = cls.from_config(config, **unet_additional_kwargs)
-        
+
         m, u = model.load_state_dict(state_dict, strict=False)
         print(f"### missing keys: {len(m)}; \n### unexpected keys: {len(u)};")
         print(f"### missing keys:\n{m[:10]}\n### unexpected keys:\n{u}\n")
-        
+
         params = [p.numel() if "temporal" in n else 0 for n, p in model.named_parameters()]
         print(f"### Temporal Module Parameters: {sum(params) / 1e6} M")
 
         return model
+
+    def convert_state_dict_legacy_attn_format(self, state_dict, network_alphas):
+        is_new_lora_format = all(
+            key.startswith(self.unet_name) or key.startswith(self.text_encoder_name) for key in state_dict.keys()
+        )
+        if is_new_lora_format:
+            # Strip the `"unet"` prefix.
+            is_text_encoder_present = any(key.startswith(self.text_encoder_name) for key in state_dict.keys())
+            if is_text_encoder_present:
+                warn_message = "The state_dict contains LoRA params corresponding to the text encoder which are not being used here. To use both UNet and text encoder related LoRA params, use [`pipe.load_lora_weights()`](https://huggingface.co/docs/diffusers/main/en/api/loaders#diffusers.loaders.LoraLoaderMixin.load_lora_weights)."
+                logger.warn(warn_message)
+            unet_keys = [k for k in state_dict.keys() if k.startswith(self.unet_name)]
+            state_dict = {k.replace(f"{self.unet_name}.", ""): v for k, v in state_dict.items() if k in unet_keys}
+
+        # change processor format to 'pure' LoRACompatibleLinear format
+        if any("processor" in k.split(".") for k in state_dict.keys()):
+
+            def format_to_lora_compatible(key):
+                if "processor" not in key.split("."):
+                    return key
+                return key.replace(".processor", "").replace("to_out_lora", "to_out.0.lora").replace("_lora", ".lora")
+
+            state_dict = {format_to_lora_compatible(k): v for k, v in state_dict.items()}
+
+            if network_alphas is not None:
+                network_alphas = {format_to_lora_compatible(k): v for k, v in network_alphas.items()}
+        return state_dict, network_alphas

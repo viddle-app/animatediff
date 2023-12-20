@@ -27,11 +27,32 @@ from diffusers.schedulers import (
 )
 from diffusers.utils import deprecate, logging, BaseOutput
 from consistencydecoder import ConsistencyDecoder, save_image, load_image
+from diffusers.utils import USE_PEFT_BACKEND
 
 from einops import rearrange
 
 from ..models.unet import UNet3DConditionModel
+from ..models.sparse_controlnet import SparseControlNetModel
 
+from diffusers.models.modeling_utils import _LOW_CPU_MEM_USAGE_DEFAULT, load_model_dict_into_meta
+from diffusers.utils import (
+    USE_PEFT_BACKEND,
+    _get_model_file,
+    convert_state_dict_to_diffusers,
+    convert_state_dict_to_peft,
+    convert_unet_state_dict_to_peft,
+    delete_adapter_layers,
+    deprecate,
+    get_adapter_name,
+    get_peft_kwargs,
+    is_accelerate_available,
+    is_transformers_available,
+    logging,
+    recurse_remove_peft_layers,
+    scale_lora_layers,
+    set_adapter_layers,
+    set_weights_and_activate_adapters,
+)
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
@@ -43,6 +64,117 @@ class AnimationPipelineOutput(BaseOutput):
 
 class AnimationPipeline(DiffusionPipeline, FromSingleFileMixin, LoraLoaderMixin):
     _optional_components = []
+
+    @classmethod
+    def load_lora_into_unet(
+        cls, state_dict, network_alphas, unet, low_cpu_mem_usage=None, adapter_name=None, _pipeline=None
+    ):
+        """
+        This will load the LoRA layers specified in `state_dict` into `unet`.
+
+        Parameters:
+            state_dict (`dict`):
+                A standard state dict containing the lora layer parameters. The keys can either be indexed directly
+                into the unet or prefixed with an additional `unet` which can be used to distinguish between text
+                encoder lora layers.
+            network_alphas (`Dict[str, float]`):
+                See `LoRALinearLayer` for more details.
+            unet (`UNet2DConditionModel`):
+                The UNet model to load the LoRA layers into.
+            low_cpu_mem_usage (`bool`, *optional*, defaults to `True` if torch version >= 1.9.0 else `False`):
+                Speed up model loading only loading the pretrained weights and not initializing the weights. This also
+                tries to not use more than 1x model size in CPU memory (including peak memory) while loading the model.
+                Only supported for PyTorch >= 1.9.0. If you are using an older version of PyTorch, setting this
+                argument to `True` will raise an error.
+            adapter_name (`str`, *optional*):
+                Adapter name to be used for referencing the loaded adapter model. If not specified, it will use
+                `default_{i}` where i is the total number of adapters being loaded.
+        """
+        low_cpu_mem_usage = low_cpu_mem_usage if low_cpu_mem_usage is not None else _LOW_CPU_MEM_USAGE_DEFAULT
+        # If the serialization format is new (introduced in https://github.com/huggingface/diffusers/pull/2918),
+        # then the `state_dict` keys should have `cls.unet_name` and/or `cls.text_encoder_name` as
+        # their prefixes.
+        keys = list(state_dict.keys())
+
+        if all(key.startswith("unet.unet") for key in keys):
+            deprecation_message = "Keys starting with 'unet.unet' are deprecated."
+            deprecate("unet.unet keys", "0.27", deprecation_message)
+
+        if all(key.startswith(cls.unet_name) or key.startswith(cls.text_encoder_name) for key in keys):
+            # Load the layers corresponding to UNet.
+            logger.info(f"Loading {cls.unet_name}.")
+
+            unet_keys = [k for k in keys if k.startswith(cls.unet_name)]
+            state_dict = {k.replace(f"{cls.unet_name}.", ""): v for k, v in state_dict.items() if k in unet_keys}
+
+            if network_alphas is not None:
+                alpha_keys = [k for k in network_alphas.keys() if k.startswith(cls.unet_name)]
+                network_alphas = {
+                    k.replace(f"{cls.unet_name}.", ""): v for k, v in network_alphas.items() if k in alpha_keys
+                }
+
+        else:
+            # Otherwise, we're dealing with the old format. This means the `state_dict` should only
+            # contain the module names of the `unet` as its keys WITHOUT any prefix.
+            if not USE_PEFT_BACKEND:
+                warn_message = "You have saved the LoRA weights using the old format. To convert the old LoRA weights to the new format, you can first load them in a dictionary and then create a new dictionary like the following: `new_state_dict = {f'unet.{module_name}': params for module_name, params in old_state_dict.items()}`."
+                logger.warn(warn_message)
+
+        if USE_PEFT_BACKEND and len(state_dict.keys()) > 0:
+            from peft import LoraConfig, inject_adapter_in_model, set_peft_model_state_dict
+
+            if adapter_name in getattr(unet, "peft_config", {}):
+                raise ValueError(
+                    f"Adapter name {adapter_name} already in use in the Unet - please select a new adapter name."
+                )
+
+            state_dict = convert_unet_state_dict_to_peft(state_dict)
+
+            if network_alphas is not None:
+                # The alphas state dict have the same structure as Unet, thus we convert it to peft format using
+                # `convert_unet_state_dict_to_peft` method.
+                network_alphas = convert_unet_state_dict_to_peft(network_alphas)
+
+            rank = {}
+            for key, val in state_dict.items():
+                if "lora_B" in key:
+                    rank[key] = val.shape[1]
+
+            lora_config_kwargs = get_peft_kwargs(rank, network_alphas, state_dict, is_unet=True)
+            lora_config = LoraConfig(**lora_config_kwargs)
+
+            print("lora_config", lora_config)
+
+            # adapter_name
+            if adapter_name is None:
+                adapter_name = get_adapter_name(unet)
+
+            # In case the pipeline has been already offloaded to CPU - temporarily remove the hooks
+            # otherwise loading LoRA weights will lead to an error
+            is_model_cpu_offload, is_sequential_cpu_offload = cls._optionally_disable_offloading(_pipeline)
+
+            inject_adapter_in_model(lora_config, unet, adapter_name=adapter_name)
+            incompatible_keys = set_peft_model_state_dict(unet, state_dict, adapter_name)
+
+            if incompatible_keys is not None:
+                # check only for unexpected keys
+                unexpected_keys = getattr(incompatible_keys, "unexpected_keys", None)
+                if unexpected_keys:
+                    logger.warning(
+                        f"Loading adapter weights from state_dict led to unexpected keys not found in the model: "
+                        f" {unexpected_keys}. "
+                    )
+
+            # Offload back.
+            if is_model_cpu_offload:
+                _pipeline.enable_model_cpu_offload()
+            elif is_sequential_cpu_offload:
+                _pipeline.enable_sequential_cpu_offload()
+            # Unsafe code />
+
+        unet.load_attn_procs(
+            state_dict, network_alphas=network_alphas, low_cpu_mem_usage=low_cpu_mem_usage, _pipeline=_pipeline
+        )
 
     def __init__(
         self,
@@ -58,6 +190,7 @@ class AnimationPipeline(DiffusionPipeline, FromSingleFileMixin, LoraLoaderMixin)
             EulerAncestralDiscreteScheduler,
             DPMSolverMultistepScheduler,
         ],
+        controlnet: Union[SparseControlNetModel, None] = None,
     ):
         super().__init__()
 
@@ -115,6 +248,7 @@ class AnimationPipeline(DiffusionPipeline, FromSingleFileMixin, LoraLoaderMixin)
             tokenizer=tokenizer,
             unet=unet,
             scheduler=scheduler,
+            controlnet=controlnet,
         )
         self.vae_scale_factor = 2 ** (len(self.vae.config.block_out_channels) - 1)
         # self.consistency_decoder = ConsistencyDecoder(device="cuda:0") # Model size: 2.49 GB
@@ -335,6 +469,11 @@ class AnimationPipeline(DiffusionPipeline, FromSingleFileMixin, LoraLoaderMixin)
         return_dict: bool = True,
         callback: Optional[Callable[[int, int, torch.FloatTensor], None]] = None,
         callback_steps: Optional[int] = 1,
+
+        # support controlnet
+        controlnet_images: torch.FloatTensor = None,
+        controlnet_image_index: list = [0],
+        controlnet_conditioning_scale: Union[float, List[float]] = 1.0,
         **kwargs,
     ):
         # Default height and width to unet
@@ -396,11 +535,49 @@ class AnimationPipeline(DiffusionPipeline, FromSingleFileMixin, LoraLoaderMixin)
                 latent_model_input = torch.cat([latents] * 2) if do_classifier_free_guidance else latents
                 latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
 
+
+                down_block_additional_residuals = mid_block_additional_residual = None
+                if (getattr(self, "controlnet", None) != None) and (controlnet_images != None):
+                    assert controlnet_images.dim() == 5
+
+                    controlnet_noisy_latents = latent_model_input
+                    controlnet_prompt_embeds = text_embeddings
+
+                    controlnet_images = controlnet_images.to(latents.device)
+
+                    controlnet_cond_shape    = list(controlnet_images.shape)
+                    controlnet_cond_shape[2] = video_length
+                    controlnet_cond = torch.zeros(controlnet_cond_shape).to(latents.device, dtype=latents_dtype)
+
+                    controlnet_conditioning_mask_shape    = list(controlnet_cond.shape)
+                    controlnet_conditioning_mask_shape[1] = 1
+                    controlnet_conditioning_mask          = torch.zeros(controlnet_conditioning_mask_shape).to(latents.device, dtype=latents_dtype)
+
+                    assert controlnet_images.shape[2] >= len(controlnet_image_index)
+                    controlnet_cond[:,:,controlnet_image_index] = controlnet_images[:,:,:len(controlnet_image_index)]
+                    controlnet_conditioning_mask[:,:,controlnet_image_index] = 1
+
+                    print("controlnet_cond", controlnet_cond.dtype)
+                    print("controlnet_conditioning_mask", controlnet_conditioning_mask.dtype)
+                    print("controlnet_noisy_latents", controlnet_noisy_latents.dtype)
+                    print("controlnet_prompt_embeds", controlnet_prompt_embeds.dtype)
+
+                    down_block_additional_residuals, mid_block_additional_residual = self.controlnet(
+                        controlnet_noisy_latents, t,
+                        encoder_hidden_states=controlnet_prompt_embeds,
+                        controlnet_cond=controlnet_cond,
+                        conditioning_mask=controlnet_conditioning_mask,
+                        conditioning_scale=controlnet_conditioning_scale,
+                        guess_mode=False, return_dict=False,
+                    )
+
                 # predict the noise residual
                 noise_pred = self.unet(latent_model_input,
-                                       t,
-                                       encoder_hidden_states=text_embeddings
-                                       ).sample.to(dtype=latents_dtype)
+                    t,
+                    encoder_hidden_states=text_embeddings,
+                    down_block_additional_residuals = down_block_additional_residuals,
+                    mid_block_additional_residual   = mid_block_additional_residual,
+                ).sample.to(dtype=latents_dtype)
                 # perform guidance
                 if do_classifier_free_guidance:
                     noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
