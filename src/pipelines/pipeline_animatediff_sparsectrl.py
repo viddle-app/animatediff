@@ -142,8 +142,6 @@ class AnimationPipeline(DiffusionPipeline, FromSingleFileMixin, LoraLoaderMixin)
             lora_config_kwargs = get_peft_kwargs(rank, network_alphas, state_dict, is_unet=True)
             lora_config = LoraConfig(**lora_config_kwargs)
 
-            print("lora_config", lora_config)
-
             # adapter_name
             if adapter_name is None:
                 adapter_name = get_adapter_name(unet)
@@ -555,11 +553,6 @@ class AnimationPipeline(DiffusionPipeline, FromSingleFileMixin, LoraLoaderMixin)
                     assert controlnet_images.shape[2] >= len(controlnet_image_index)
                     controlnet_cond[:,:,controlnet_image_index] = controlnet_images[:,:,:len(controlnet_image_index)]
                     controlnet_conditioning_mask[:,:,controlnet_image_index] = 1
-
-                    print("controlnet_cond", controlnet_cond.dtype)
-                    print("controlnet_conditioning_mask", controlnet_conditioning_mask.dtype)
-                    print("controlnet_noisy_latents", controlnet_noisy_latents.dtype)
-                    print("controlnet_prompt_embeds", controlnet_prompt_embeds.dtype)
 
                     down_block_additional_residuals, mid_block_additional_residual = self.controlnet(
                         controlnet_noisy_latents, t,
