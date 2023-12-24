@@ -1,0 +1,1 @@
+MASTER_ADDR=127.0.0.1 MASTER_PORT=6666 RANK=0 WORLD_SIZE=1 python train_frame_init_image.py --wandb --config config/training/init_frame_training.yaml
